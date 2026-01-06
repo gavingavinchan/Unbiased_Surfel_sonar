@@ -1,9 +1,208 @@
-*.pyc
-.vscode
-output
-build
+# =========================
+# Python
+# =========================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Distribution / packaging
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Virtual environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+.python-version
+
+# =========================
+# Jupyter Notebook
+# =========================
+.ipynb_checkpoints
+*/.ipynb_checkpoints/*
+*.ipynb_checkpoints
+
+# =========================
+# Testing / Coverage
+# =========================
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+cover/
+
+# =========================
+# Type checking
+# =========================
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pytype/
+
+# =========================
+# IDEs and Editors
+# =========================
+# VSCode
+.vscode/
+*.code-workspace
+
+# PyCharm / JetBrains
+.idea/
+*.iml
+*.ipr
+*.iws
+
+# Sublime Text
+*.sublime-project
+*.sublime-workspace
+
+# Vim
+*.swp
+*.swo
+*.swn
+*~
+
+# Emacs
+*~
+\#*\#
+/.emacs.desktop
+/.emacs.desktop.lock
+*.elc
+auto-save-list
+tramp
+.\#*
+
+# Spyder
+.spyderproject
+.spyproject
+
+# =========================
+# OS Generated Files
+# =========================
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+
+# Windows
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+*.stackdump
+[Dd]esktop.ini
+$RECYCLE.BIN/
+*.lnk
+
+# Linux
+*~
+.fuse_hidden*
+.directory
+.Trash-*
+.nfs*
+
+# =========================
+# ML / Deep Learning
+# =========================
+# Weights & Biases
+wandb/
+*.wandb
+
+# TensorBoard
+runs/
+logs/
+tensorboard/
+
+# Model checkpoints
+*.pt
+*.pth
+*.ckpt
+*.h5
+*.hdf5
+*.pkl
+*.pickle
+checkpoints/
+
+# Datasets (common patterns)
+data/
+datasets/
+*.tar
+*.tar.gz
+*.zip
+
+# CUDA
+*.cubin
+*.fatbin
+
+# =========================
+# Project Specific
+# =========================
+# Output directories
+output/
+output_*/
+eval/
+results/
+
+# 3D files
 *.ply
-eval
-**/tmp
+*.obj
+*.mtl
+*.off
 
+# Temporary files
+**/tmp/
+*.tmp
+*.temp
+*.bak
 
+# Log files
+*.log
+
+# Environment / secrets
+.env
+.env.*
+*.env
+secrets.yaml
+secrets.json
+
+# Conda
+.conda/
