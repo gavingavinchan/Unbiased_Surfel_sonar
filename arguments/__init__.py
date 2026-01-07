@@ -56,6 +56,9 @@ class ModelParams(ParamGroup):
         self.data_device = "cuda"
         self.eval = False
         self.render_items = ['RGB', 'Alpha', 'Normal', 'Depth', 'Edge', 'Curvature']
+        # Sonar mode parameters
+        self.sonar_mode = False
+        self.sonar_images = "sonar"
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):

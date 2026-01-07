@@ -46,7 +46,12 @@ class Scene:
         self.test_cameras = {}
  
         if os.path.exists(os.path.join(args.source_path, "sparse")):
-            scene_info = sceneLoadTypeCallbacks["Colmap"](args.source_path, args.images, args.eval)
+            # Check for sonar mode parameters
+            sonar_mode = getattr(args, 'sonar_mode', False)
+            sonar_images = getattr(args, 'sonar_images', 'sonar')
+            scene_info = sceneLoadTypeCallbacks["Colmap"](
+                args.source_path, args.images, args.eval,
+                sonar_mode=sonar_mode, sonar_images=sonar_images)
         elif os.path.exists(os.path.join(args.source_path, "transforms_train.json")):
             print("Found transforms_train.json file, assuming Blender data set!")
             scene_info = sceneLoadTypeCallbacks["Blender"](args.source_path, args.white_background, args.eval)
