@@ -81,6 +81,29 @@ This document tracks all modifications made to Unbiased_Surfel to support sonar 
 
 ---
 
+### Camera-to-Sonar Extrinsic Transform (TODO)
+
+**Current State**: Sonar poses are directly interpolated from camera poses (assumes co-located)
+
+**Why This Is Wrong**:
+- Sonar is mounted **10cm above** the camera
+- Sonar is **pitched down 5 degrees** relative to camera
+
+**Extrinsic Transform (camera → sonar)**:
+```
+Translation: (0, -0.1, 0) in camera frame  # 10cm up (Y-down convention)
+Rotation: 5° pitch down around X-axis
+```
+
+**Future Fix**: Apply this transform in `interpolate_sonar_poses.py` after interpolating camera poses:
+```python
+# After interpolating camera pose (R_cam, t_cam):
+T_cam_to_sonar = compute_extrinsic(translation=[0, -0.1, 0], pitch_deg=-5)
+T_sonar = T_cam @ T_cam_to_sonar
+```
+
+---
+
 ## Dataset Details
 
 **Sonar Dataset Location**: `~/ros2_ws/outputs/session_2025-12-08_16-35-13_sonar_data_for_2dgs/`
