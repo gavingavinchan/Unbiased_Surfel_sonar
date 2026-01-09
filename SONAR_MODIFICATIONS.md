@@ -47,7 +47,72 @@ This document tracks all modifications made to Unbiased_Surfel to support sonar 
 
 ---
 
-### 2. Sonar Mode Toggle (Implemented)
+### 2. Sonar Forward and Backward Projection (Implemented)
+
+**Files**: `gaussian_renderer/__init__.py`, `utils/point_utils.py`, `utils/sonar_utils.py`
+
+**What it does**:
+- **Forward projection**: Renders 3D surfels to sonar image using polar geometry
+  - Transforms surfel positions to sonar frame
+  - Converts to polar coordinates (azimuth, elevation, range)
+  - Maps to pixel coordinates (azimuth → column, range → row)
+  - Applies Lambertian intensity model based on surfel normal vs sonar direction
+  
+- **Backward projection**: Converts sonar range image to 3D world points
+  - Converts pixel coordinates to polar (azimuth, range)
+  - Converts polar to Cartesian in sonar frame
+  - Transforms to world coordinates using (scaled) pose
+
+**Sonar Image Coordinate Convention** (Sonoptix Echo):
+```
+         ← positive azimuth    negative azimuth →
+              +60°      0°      -60°
+               |        |        |
+    row 0   ───┬────────┬────────┬───  range_min (closest)
+               │        │        │
+               │   SONAR IMAGE   │
+               │   256 x 200     │
+               │        │        │
+    row 199 ───┴────────┴────────┴───  range_max (farthest)
+              col 0   col 128  col 255
+
+Convention: +X direction (forward) = negative azimuth
+            +Y direction (right)  = maps to right side of image (high col)
+```
+
+**Key Design Decisions**:
+
+| Decision | Choice | Reasoning |
+|----------|--------|-----------|
+| Elevation handling | Sum all surfels within 20° arc | Sonar integrates acoustic returns over elevation beam spread |
+| Occlusion model | Block only along exact same ray | Different elevations both contribute due to beam spread |
+| Intensity model | Lambertian: I = max(0, n·d) | Simple approximation; surfels facing sonar are brighter |
+| Implementation | Splatting (surfel → pixel) | Consistent with 2DGS; maintains differentiability |
+
+---
+
+### 3. Learnable Scale Factor (Implemented)
+
+**Files**: `utils/sonar_utils.py`, `train.py`
+
+**What it does**:
+- Learns a single scale factor `s` to align COLMAP's arbitrary-scale poses with sonar's metric range
+- Applied to pose translations: `scaled_translation = s * colmap_translation`
+- Optimized jointly with surfels using Adam optimizer
+
+**Reasoning**:
+- COLMAP SfM produces poses with arbitrary scale (classic monocular ambiguity)
+- Sonar measures physical range in meters
+- A single global scale factor is sufficient to align them
+
+**Implementation Details**:
+- Uses log-parameterization internally: `scale = exp(log_scale)`
+- This ensures scale stays positive and has stable gradients
+- Logged to TensorBoard: `sonar/scale_factor` and `sonar/scale_factor_grad`
+
+---
+
+### 4. Sonar Mode Toggle (Implemented)
 
 **Files**: `arguments/__init__.py`, `scene/dataset_readers.py`, `scene/__init__.py`
 
@@ -64,30 +129,31 @@ This document tracks all modifications made to Unbiased_Surfel to support sonar 
 
 ## Known Limitations / Future Work
 
-### Sonar Intrinsics (TODO)
+### Sonar Intrinsics (IMPLEMENTED)
 
-**Current State**: Using camera intrinsics for sonar frames
+**Current State**: ✅ Fully implemented with proper sonar polar geometry
 
-**Why This Is Wrong**:
-- Sonar has different field of view, resolution (256x200), and imaging geometry
-- Acoustic imaging != optical imaging (range-azimuth vs pinhole projection)
-
-**Why We're Keeping It For Now**:
-- Want to verify pipeline works end-to-end first
-- Intrinsics can be corrected once basic functionality confirmed
-- Incremental approach reduces debugging complexity
-
-**Future Fix**: Define proper sonar intrinsics or create sonar-specific camera model
+**Implementation**:
+- Sonar projection uses polar coordinates (azimuth, range) instead of pinhole (x, y, depth)
+- `render_sonar()` function in `gaussian_renderer/__init__.py` handles forward projection
+- `sonar_ranges_to_points()` in `utils/point_utils.py` handles backward projection
+- Sonar parameters configurable via CLI flags:
+  - `--sonar_azimuth_fov`: Horizontal FOV in degrees (default: 120°)
+  - `--sonar_elevation_fov`: Elevation beam spread (default: 20°)
+  - `--sonar_range_min`: Minimum range in meters (default: 0.2m)
+  - `--sonar_range_max`: Maximum range in meters (default: 3.0m)
 
 ---
 
-### Camera-to-Sonar Extrinsic Transform (TODO)
+### Camera-to-Sonar Extrinsic Transform (IMPLEMENTED)
 
-**Current State**: Sonar poses are directly interpolated from camera poses (assumes co-located)
+**Current State**: ✅ Fully implemented via `SonarExtrinsic` class
 
-**Why This Is Wrong**:
+**Implementation**:
 - Sonar is mounted **10cm above** the camera
 - Sonar is **pitched down 5 degrees** relative to camera
+- `SonarExtrinsic` class in `utils/sonar_utils.py` handles the transformation
+- Transform automatically applied during rendering when `--sonar_mode` is enabled
 
 **Extrinsic Transform (camera → sonar)**:
 ```
@@ -95,12 +161,44 @@ Translation: (0, -0.1, 0) in camera frame  # 10cm up (Y-down convention)
 Rotation: 5° pitch down around X-axis
 ```
 
-**Future Fix**: Apply this transform in `interpolate_sonar_poses.py` after interpolating camera poses:
-```python
-# After interpolating camera pose (R_cam, t_cam):
-T_cam_to_sonar = compute_extrinsic(translation=[0, -0.1, 0], pitch_deg=-5)
-T_sonar = T_cam @ T_cam_to_sonar
-```
+---
+
+### Learnable Scale Factor (IMPLEMENTED)
+
+**Problem**: COLMAP produces poses with arbitrary scale (structure-from-motion ambiguity). Sonar measures ranges in real meters.
+
+**Solution**: `SonarScaleFactor` class learns a single scalar during training:
+- Applied to pose translations: `scaled_t = scale * colmap_t`
+- Uses log-parameterization for numerical stability and positivity
+- Logged to TensorBoard for monitoring convergence
+
+**Configuration**:
+- `--sonar_scale_init`: Initial scale factor (default: 1.0)
+- `--sonar_scale_lr`: Learning rate for scale factor (default: 0.01)
+
+---
+
+### 4. Top Row Masking (Implemented)
+
+**Files Modified**:
+- `gaussian_renderer/__init__.py` - Masks rendered output
+- `train.py` - Masks ground truth before loss computation
+
+**What it does**:
+- Zeros out the top 10 rows (closest range bins) of both rendered and ground truth images
+- Applied consistently in training and rendering
+
+**Reasoning**:
+- The closest range bins in sonar images often contain:
+  - Direct path reflections/artifacts from the sonar housing
+  - Saturation from nearby strong reflectors
+  - Invalid data at minimum range (before pulse settles)
+- These artifacts don't represent actual scene geometry
+- Masking prevents the model from trying to fit these artifacts
+
+**Configuration**:
+- Currently hardcoded to 10 rows
+- TODO: Make configurable via `--sonar_mask_top_rows` parameter
 
 ---
 
@@ -182,6 +280,15 @@ Note: The dataset should have:
 
 | Date | Modification | Author |
 |------|--------------|--------|
+| 2026-01-09 | Added top 10 row masking for sonar images (closest range bins often have artifacts) | - |
+| 2026-01-09 | Implemented full sonar projection pipeline: forward (surfel→pixel) and backward (pixel→3D) with polar geometry | - |
+| 2026-01-09 | Added learnable scale factor (SonarScaleFactor) to align COLMAP arbitrary scale with sonar metric range | - |
+| 2026-01-09 | Added camera-to-sonar extrinsic transform (SonarExtrinsic): 10cm offset, 5deg pitch down | - |
+| 2026-01-09 | Added sonar calibration parameters to arguments/__init__.py (Sonoptix Echo: 256x200, 120° HFOV, 20° elev) | - |
+| 2026-01-09 | Added TensorBoard logging for scale factor convergence monitoring | - |
+| 2026-01-09 | Created utils/sonar_utils.py with SonarScaleFactor, SonarConfig, SonarExtrinsic classes | - |
+| 2026-01-09 | Added render_sonar() function to gaussian_renderer for polar coordinate splatting | - |
+| 2026-01-09 | Added sonar_ranges_to_points() and sonar_points_to_normals() to utils/point_utils.py | - |
 | 2026-01-08 | Added mathematical derivation of ray-surfel intersection to architecture_diagram.md | - |
 | 2026-01-06 | Added --max_frames option to interpolation script for random sampling (laptop-friendly) | - |
 | 2026-01-06 | Implemented pose interpolation script with SLERP and ±100ms filtering | - |

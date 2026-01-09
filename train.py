@@ -23,10 +23,11 @@ import uuid
 from argparse import ArgumentParser, Namespace
 
 from utils.loss_utils import l1_loss, ssim
-from gaussian_renderer import render, network_gui
+from gaussian_renderer import render, render_sonar, network_gui
 from scene import Scene, GaussianModel
 from utils.general_utils import safe_state
 from utils.image_utils import psnr, render_net_image
+from utils.sonar_utils import SonarScaleFactor, SonarConfig, SonarExtrinsic, build_sonar_config
 from arguments import ModelParams, PipelineParams, OptimizationParams
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -55,6 +56,25 @@ def training(dataset: ModelParams,
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
+    # Sonar mode setup
+    sonar_scale_factor = None
+    sonar_config = None
+    sonar_optimizer = None
+    sonar_extrinsic = None
+    if dataset.sonar_mode:
+        print("Sonar mode enabled - initializing sonar scale factor and config")
+        sonar_config = build_sonar_config(dataset)
+        sonar_scale_factor = SonarScaleFactor(init_value=dataset.sonar_scale_init).cuda()
+        sonar_extrinsic = SonarExtrinsic(device="cuda")
+        sonar_optimizer = torch.optim.Adam(
+            sonar_scale_factor.parameters(), 
+            lr=dataset.sonar_scale_lr
+        )
+        print(f"  Initial scale factor: {sonar_scale_factor.get_scale_value():.4f}")
+        # print(f"  log_scale param: {sonar_scale_factor._log_scale.item():.4f}")
+        print(f"  Scale factor learning rate: {dataset.sonar_scale_lr}")
+        print(f"  Camera-to-sonar extrinsic: 10cm offset, 5deg pitch down")
+
     iter_start = torch.cuda.Event(enable_timing = True)
     iter_end = torch.cuda.Event(enable_timing = True)
 
@@ -81,35 +101,64 @@ def training(dataset: ModelParams,
             viewpoint_stack = scene.getTrainCameras().copy()
         viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
         
-        render_pkg = render(viewpoint_cam, gaussians, pipe, background)
+        # Render scene (different path for sonar vs camera)
+        if dataset.sonar_mode and sonar_config is not None:
+            render_pkg = render_sonar(
+                viewpoint_cam, gaussians, background,
+                sonar_config=sonar_config,
+                scale_factor=sonar_scale_factor,
+                sonar_extrinsic=sonar_extrinsic
+            )
+        else:
+            render_pkg = render(viewpoint_cam, gaussians, pipe, background)
+        
         image                  = render_pkg["render"]
         viewspace_point_tensor = render_pkg["viewspace_points"]
         visibility_filter      = render_pkg["visibility_filter"]
         radii                  = render_pkg["radii"]
         converge               = render_pkg["converge"]
 
-        # Gamma corrected Image
-        gt_image = viewpoint_cam.original_image.cuda().pow(dataset.gamma)
-        gt_image.pow(dataset.gamma)
+        # Gamma corrected Image (only for camera mode)
+        gt_image = viewpoint_cam.original_image.cuda()
+        if not dataset.sonar_mode:
+            gt_image = gt_image.pow(dataset.gamma)
+        else:
+            # Mask out top rows for sonar (closest range bins often have artifacts)
+            # TODO: Make this configurable via dataset.sonar_mask_top_rows
+            mask_top_rows = 10
+            if mask_top_rows > 0:
+                gt_image = gt_image.clone()  # Don't modify original
+                gt_image[:, :mask_top_rows, :] = 0
 
         ssim_value = ssim(image, gt_image)
         Ll1 = l1_loss(image, gt_image)
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
 
         # regularization
-        lambda_normal = opt.lambda_normal if iteration > 7000 else 0.0
-        lambda_dist = opt.lambda_dist if iteration > 3000 else 0.0
+        # Disable normal loss for sonar mode (surf_normal can have nans from empty regions)
+        if dataset.sonar_mode:
+            lambda_normal = 0.0
+            lambda_dist = 0.0
+        else:
+            lambda_normal = opt.lambda_normal if iteration > 7000 else 0.0
+            lambda_dist = opt.lambda_dist if iteration > 3000 else 0.0
 
         # Converge Loss
         lambda_converge = opt.lambda_converge if iteration > 10000 else 0.00
         converge_loss = lambda_converge * converge.mean()
 
-        rend_dist   = render_pkg["rend_dist"]  
-        rend_normal = render_pkg['rend_normal']
-        surf_normal = render_pkg['surf_normal']
-        normal_error = (1 - (rend_normal * surf_normal).sum(dim=0))[None]
-        normal_loss = lambda_normal * (normal_error).mean()
-        dist_loss = lambda_dist * (rend_dist).mean()
+        # Normal and dist losses (skip for sonar mode to avoid nan from surf_normal)
+        if dataset.sonar_mode:
+            # Skip normal/dist regularization for sonar - surf_normal can have nans
+            normal_loss = torch.tensor(0.0, device=image.device)
+            dist_loss = torch.tensor(0.0, device=image.device)
+        else:
+            rend_dist   = render_pkg["rend_dist"]  
+            rend_normal = render_pkg['rend_normal']
+            surf_normal = render_pkg['surf_normal']
+            normal_error = (1 - (rend_normal * surf_normal).sum(dim=0))[None]
+            normal_loss = lambda_normal * (normal_error).mean()
+            dist_loss = lambda_dist * (rend_dist).mean()
 
         # loss
         total_loss = loss + dist_loss + normal_loss + converge_loss
@@ -133,6 +182,9 @@ def training(dataset: ModelParams,
                     "converge": f"{ema_converge_for_log:.{5}f}",
                     "Points": f"{len(gaussians.get_xyz)}"  
                 }
+                # Add scale factor to progress bar in sonar mode
+                if dataset.sonar_mode and sonar_scale_factor is not None:
+                    loss_dict["scale"] = f"{sonar_scale_factor.get_scale_value():.{4}f}"
                 progress_bar.set_postfix(loss_dict)
 
                 progress_bar.update(10)
@@ -144,17 +196,49 @@ def training(dataset: ModelParams,
             if tb_writer is not None:
                 tb_writer.add_scalar('train_loss_patches/dist_loss', ema_dist_for_log, iteration)
                 tb_writer.add_scalar('train_loss_patches/normal_loss', ema_normal_for_log, iteration)
+                
+                # Sonar-specific TensorBoard logging
+                if dataset.sonar_mode and sonar_scale_factor is not None:
+                    # Log scale factor value (should converge to a stable number)
+                    scale_val = sonar_scale_factor.get_scale_value()
+                    tb_writer.add_scalar('sonar/scale_factor', scale_val, iteration)
+                    
+                    # Log scale factor gradient magnitude (should decrease as it converges)
+                    scale_grad = sonar_scale_factor.get_log_scale_grad()
+                    tb_writer.add_scalar('sonar/scale_factor_grad', abs(scale_grad), iteration)
+                    
+                    # Log rendered vs GT range statistics periodically
+                    if iteration % 100 == 0:
+                        surf_range = render_pkg.get('surf_depth')  # This is range for sonar
+                        if surf_range is not None:
+                            # Get valid mask from GT image
+                            gt_valid = gt_image > dataset.sonar_intensity_threshold
+                            if gt_valid.any():
+                                # Mean rendered range for valid pixels
+                                rendered_range = surf_range[gt_valid].mean().item()
+                                tb_writer.add_scalar('sonar/rendered_mean_range', rendered_range, iteration)
 
-            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end),
-                            testing_iterations, scene, render, (pipe, background), dataset)
+            # Select appropriate render function for training report
+            if dataset.sonar_mode and sonar_config is not None:
+                # Create a wrapper that matches the expected signature for render()
+                def sonar_render_wrapper(viewpoint, gaussians, pipe, bg):
+                    return render_sonar(viewpoint, gaussians, bg, sonar_config, sonar_scale_factor, sonar_extrinsic)
+                training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end),
+                                testing_iterations, scene, sonar_render_wrapper, (pipe, background), dataset)
+            else:
+                training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end),
+                                testing_iterations, scene, render, (pipe, background), dataset)
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
 
             # Densification
+            # Note: In sonar mode, gradients may not flow through the Python splatting
             if iteration < opt.densify_until_iter:
-                gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
-                gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
+                # Only update stats if we have valid radii and gradients
+                if radii.any() and viewspace_point_tensor.grad is not None:
+                    gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
+                    gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
 
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
@@ -167,6 +251,11 @@ def training(dataset: ModelParams,
             if iteration < opt.iterations:
                 gaussians.optimizer.step()
                 gaussians.optimizer.zero_grad(set_to_none = True)
+                
+                # Sonar scale factor optimizer step
+                if sonar_optimizer is not None:
+                    sonar_optimizer.step()
+                    sonar_optimizer.zero_grad(set_to_none=True)
 
             # Maximum size limit
             if iteration >= opt.densify_until_iter:

@@ -59,6 +59,15 @@ class ModelParams(ParamGroup):
         # Sonar mode parameters
         self.sonar_mode = False
         self.sonar_images = "sonar"
+        # Sonar calibration (Sonoptix Echo defaults)
+        self.sonar_azimuth_fov = 120.0      # degrees (total horizontal FOV)
+        self.sonar_elevation_fov = 20.0     # degrees (total elevation spread)
+        self.sonar_range_min = 0.2          # meters (20 cm)
+        self.sonar_range_max = 3.0          # meters (3 m)
+        self.sonar_intensity_threshold = 0.01  # for valid mask (intensity > threshold)
+        # Scale factor parameters (to align COLMAP arbitrary scale with sonar metric range)
+        self.sonar_scale_init = 1.0         # initial scale factor value
+        self.sonar_scale_lr = 0.01          # learning rate for scale factor
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):
