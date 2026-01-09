@@ -182,6 +182,7 @@ Note: The dataset should have:
 
 | Date | Modification | Author |
 |------|--------------|--------|
+| 2026-01-08 | Added mathematical derivation of ray-surfel intersection to architecture_diagram.md | - |
 | 2026-01-06 | Added --max_frames option to interpolation script for random sampling (laptop-friendly) | - |
 | 2026-01-06 | Implemented pose interpolation script with SLERP and ±100ms filtering | - |
 | 2026-01-06 | Added --sonar_mode and --sonar_images CLI flags | - |

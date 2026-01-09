@@ -301,10 +301,10 @@ flowchart TB
 ### Camera Pose Transformation Pipeline:
 
 1. **COLMAP Output (Camera Extrinsics)**:
-   - **qvec**: Quaternion `[qw, qx, qy, qz]` encoding the **world→camera** rotation \(R_{w2c}\)
-   - **tvec**: Translation vector `[tx, ty, tz]` is the **world→camera** translation \(t_{w2c}\)
-   - COLMAP convention: \(X_{cam} = R_{w2c} X_{world} + t_{w2c}\)
-   - Camera center in world coords: \(C_{world} = -R_{w2c}^T t_{w2c}\)
+   - **qvec**: Quaternion `[qw, qx, qy, qz]` encoding the **world→camera** rotation $R_{w2c}$
+   - **tvec**: Translation vector `[tx, ty, tz]` is the **world→camera** translation $t_{w2c}$
+   - COLMAP convention: $X_{cam} = R_{w2c} X_{world} + t_{w2c}$
+   - Camera center in world coords: $C_{world} = -R_{w2c}^T t_{w2c}$
 
 2. **COLMAP Loader Processing** (`scene/colmap_loader.py`):
    - `read_extrinsics_binary()` or `read_extrinsics_text()` reads qvec and tvec
@@ -314,9 +314,9 @@ flowchart TB
 3. **Dataset Reader Conversion** (`scene/dataset_readers.py`):
    - `readColmapCameras()` processes each camera (line 68-105)
    - **Key transformation**: `R = np.transpose(qvec2rotmat(extr.qvec))` (line 82)
-     - `qvec2rotmat(extr.qvec)` yields \(R_{w2c}\)
-     - Transpose converts to \(R_{c2w} = R_{w2c}^T\)
-   - `T = np.array(extr.tvec)` stores \(t_{w2c}\) as-is (line 83)
+     - `qvec2rotmat(extr.qvec)` yields $R_{w2c}$
+     - Transpose converts to $R_{c2w} = R_{w2c}^T$
+   - `T = np.array(extr.tvec)` stores $t_{w2c}$ as-is (line 83)
    - Creates `CameraInfo(R=R_c2w, T=t_w2c, ...)` (line 101-102)
 
 4. **Camera Object Construction** (`scene/cameras.py`):
@@ -324,7 +324,7 @@ flowchart TB
    - **Builds transformation matrices**:
      - `world_view_transform = getWorld2View2(R, T, trans, scale)` (line 59)
        - In this repo, `loadCam()` does **not** pass `trans`/`scale`, so defaults are used (`trans=[0,0,0]`, `scale=1`)
-       - Effective world→camera is built as \(R_{w2c} = R^T\) and \(t_{w2c} = T\)
+       - Effective world→camera is built as $R_{w2c} = R^T$ and $t_{w2c} = T$
      - `projection_matrix = getProjectionMatrix(znear, zfar, fovX, fovY)` (line 60)
        - Perspective projection: camera space → clip space
      - `full_proj_transform = world_view_transform @ projection_matrix` (line 61)
@@ -517,3 +517,264 @@ flowchart TB
 ### What this means in practice:
 
 - The `depthmap` passed into `depths_to_points(view, depthmap)` is **`surf_depth`** coming from `gaussian_renderer.render()` (unless you add new callsites).
+
+---
+
+## Mathematical Derivation: Ray-Surfel Intersection in 2D Gaussian Splatting
+
+> This section explains how a ray cast through a pixel intersects with a 2D Gaussian surfel primitive.
+
+### 1. The 2D Gaussian Surfel Primitive
+
+Unlike 3D Gaussian Splatting (which uses ellipsoids), **2D Gaussian Splatting (2DGS)** represents each primitive as a **surfel** — a flat, oriented disk embedded in 3D space. Think of it like a small patch on a surface (similar to panel methods in hydrodynamics or boundary element methods).
+
+Each surfel is defined by:
+
+| Parameter | Symbol | Description |
+|-----------|--------|-------------|
+| Center | $\mathbf{p}_c \in \mathbb{R}^3$ | Position in world frame |
+| Tangent vectors | $\mathbf{t}_u, \mathbf{t}_v \in \mathbb{R}^3$ | Local axes on the surfel plane |
+| Normal | $\mathbf{n} = \mathbf{t}_u \times \mathbf{t}_v$ | Perpendicular to the surfel |
+| Scales | $s_u, s_v \in \mathbb{R}^+$ | Extent of the Gaussian in each tangent direction |
+
+Any point on the surfel plane can be written as:
+
+$$
+\mathbf{p}(u, v) = \mathbf{p}_c + u \cdot s_u \mathbf{t}_u + v \cdot s_v \mathbf{t}_v
+$$
+
+where $(u, v)$ are **local coordinates** on the surfel plane.
+
+### 2. The 2D Gaussian Function
+
+The Gaussian "intensity" at a point $(u, v)$ on the surfel is:
+
+$$
+G(u, v) = \exp\left( -\frac{1}{2} \left( u^2 + v^2 \right) \right)
+$$
+
+This is a **standard 2D Gaussian with unit variance** ($\sigma = 1$), centered at $(0, 0)$.
+
+**Why unit variance?** The actual size of the Gaussian in world space is controlled by the scale parameters $s_u$ and $s_v$, not by $\sigma$. The transformation from world coordinates to local surfel coordinates already incorporates the scaling:
+
+$$
+u = \frac{\text{(distance from center along } \mathbf{t}_u \text{)}}{s_u}
+$$
+
+So if a point is at distance $s_u$ from the center, then $u = 1$ and $G(1, 0) = e^{-0.5} \approx 0.606$. At distance $3s_u$ (the "3-sigma" boundary): $u = 3$ and $G(3, 0) \approx 0.011$.
+
+### 3. The Rendering Problem: Where Does a Ray Hit the Surfel?
+
+#### 3.1 Camera Model
+
+A pinhole camera at position $\mathbf{o} \in \mathbb{R}^3$ (camera origin) casts a ray through each pixel $(p_x, p_y)$. The ray is:
+
+$$
+\mathbf{r}(t) = \mathbf{o} + t \cdot \mathbf{d}
+$$
+
+where $\mathbf{d}$ is the ray direction (computed from pixel coordinates and camera intrinsics), and $t \geq 0$ is the distance along the ray.
+
+#### 3.2 The Surfel Plane Equation
+
+The surfel lies on a plane. Using the center $\mathbf{p}_c$ and normal $\mathbf{n}$, any point $\mathbf{p}$ on the plane satisfies:
+
+$$
+(\mathbf{p} - \mathbf{p}_c) \cdot \mathbf{n} = 0
+$$
+
+#### 3.3 Ray-Plane Intersection (Classical Approach)
+
+Substituting the ray equation into the plane equation:
+
+$$
+(\mathbf{o} + t\mathbf{d} - \mathbf{p}_c) \cdot \mathbf{n} = 0
+$$
+
+Solving for $t$:
+
+$$
+t^* = \frac{(\mathbf{p}_c - \mathbf{o}) \cdot \mathbf{n}}{\mathbf{d} \cdot \mathbf{n}}
+$$
+
+The intersection point in 3D is $\mathbf{p}^* = \mathbf{o} + t^* \mathbf{d}$.
+
+To get the **local coordinates** $(u, v)$ on the surfel, we project onto the tangent vectors:
+
+$$
+u = \frac{(\mathbf{p}^* - \mathbf{p}_c) \cdot \mathbf{t}_u}{s_u \|\mathbf{t}_u\|^2}, \quad
+v = \frac{(\mathbf{p}^* - \mathbf{p}_c) \cdot \mathbf{t}_v}{s_v \|\mathbf{t}_v\|^2}
+$$
+
+### 4. The Efficient Approach: Homogeneous Coordinates
+
+The above classical approach requires multiple operations per ray-surfel pair. 2DGS uses a clever **homogeneous coordinate** formulation that's more efficient for GPU rasterization.
+
+#### 4.1 The Transformation Matrix $\mathbf{T}$
+
+We precompute a $3 \times 3$ matrix $\mathbf{T}$ for each surfel that encodes the **surfel-to-pixel mapping**. Let:
+
+- $\mathbf{W}$ = World-to-camera transformation (4×4)
+- $\mathbf{P}$ = Projection matrix (4×4, perspective)
+- $\mathbf{N}$ = NDC-to-pixel mapping (3×4)
+
+The surfel's local frame in homogeneous coordinates is:
+
+$$
+\mathbf{M}_{\text{splat}} = 
+\begin{bmatrix}
+s_u \mathbf{t}_u & s_v \mathbf{t}_v & \mathbf{p}_c \\
+0 & 0 & 1
+\end{bmatrix}
+\in \mathbb{R}^{4 \times 3}
+$$
+
+The columns represent: scaled tangent $u$, scaled tangent $v$, and center (in homogeneous coords).
+
+The transformation matrix is:
+
+$$
+\mathbf{T} = \mathbf{M}_{\text{splat}}^\top \cdot \mathbf{W} \cdot \mathbf{P} \cdot \mathbf{N} \in \mathbb{R}^{3 \times 3}
+$$
+
+Denote the **rows** of $\mathbf{T}$ as $\mathbf{T}_u$, $\mathbf{T}_v$, $\mathbf{T}_w \in \mathbb{R}^3$.
+
+#### 4.2 Ray-Surfel Intersection via Cross Product
+
+For a pixel at $(p_x, p_y)$, define two **implicit planes** in homogeneous coordinates:
+
+$$
+\mathbf{h}_1 = p_x \cdot \mathbf{T}_w - \mathbf{T}_u
+$$
+
+$$
+\mathbf{h}_2 = p_y \cdot \mathbf{T}_w - \mathbf{T}_v
+$$
+
+**Geometric interpretation**: 
+- $\mathbf{h}_1$ represents all points in the scene that project to the same $x$-coordinate as $p_x$
+- $\mathbf{h}_2$ represents all points that project to the same $y$-coordinate as $p_y$
+
+The **intersection** of these two planes with the surfel plane is the ray-surfel intersection point. In homogeneous coordinates:
+
+$$
+\tilde{\mathbf{s}} = \mathbf{h}_1 \times \mathbf{h}_2 = (s_x, s_y, s_w)
+$$
+
+Converting to local surfel coordinates:
+
+$$
+(u, v) = \left( \frac{s_x}{s_w}, \frac{s_y}{s_w} \right)
+$$
+
+If $s_w = 0$, the ray is parallel to the surfel (no intersection).
+
+#### 4.3 Depth Computation
+
+The depth (distance along the camera's $z$-axis) at the intersection is:
+
+$$
+z = u \cdot T_{w,x} + v \cdot T_{w,y} + T_{w,z}
+$$
+
+where $\mathbf{T}_w = (T_{w,x}, T_{w,y}, T_{w,z})$.
+
+### 5. Anti-Aliasing: The Low-Pass Filter
+
+At grazing angles (ray nearly parallel to surfel), the projected Gaussian becomes very elongated, causing aliasing. 2DGS uses a **minimum** of two distance metrics:
+
+**3D distance** (on the surfel plane):
+
+$$
+\rho_{3D} = u^2 + v^2
+$$
+
+**2D distance** (in pixel space):
+
+$$
+\rho_{2D} = \frac{2}{f^2} \left[ (c_x - p_x)^2 + (c_y - p_y)^2 \right]
+$$
+
+where $(c_x, c_y)$ is the projected surfel center.
+
+The **effective distance** used for the Gaussian:
+
+$$
+\rho = \min(\rho_{3D}, \rho_{2D})
+$$
+
+This acts as a low-pass filter, preventing extreme values at grazing angles.
+
+### 6. Alpha Blending: The Rendering Equation
+
+Each surfel has an opacity $\alpha_0 \in [0, 1]$. The per-pixel contribution is:
+
+$$
+\alpha = \alpha_0 \cdot G(u, v) = \alpha_0 \cdot \exp\left( -\frac{\rho}{2} \right)
+$$
+
+For multiple overlapping surfels (sorted by depth), the color at a pixel is computed via **front-to-back alpha blending**:
+
+$$
+C = \sum_{i=1}^{N} c_i \cdot \alpha_i \cdot T_i
+$$
+
+where:
+- $c_i$ = color of surfel $i$
+- $\alpha_i$ = alpha of surfel $i$
+- $T_i = \prod_{j=1}^{i-1} (1 - \alpha_j)$ = transmittance (how much light passes through all surfels in front)
+
+This is the same volumetric rendering equation used in NeRF, but with discrete primitives.
+
+### 7. Summary: The Full Pipeline
+
+<!-- Mermaid Diagram: Ray-Surfel Intersection Pipeline -->
+```mermaid
+flowchart TB
+    subgraph Preprocessing["Preprocessing (Per Surfel)"]
+        P1["Build local frame: L = R(q) · S(s_u, s_v)"] --> P2["Compute T = M_splat^T · W · P · N"]
+        P2 --> P3["Compute bounding box & assign to tiles"]
+    end
+    
+    subgraph Rasterization["Rasterization (Per Pixel)"]
+        R1["For each overlapping surfel (depth-sorted):"] --> R2["Compute h₁ = p_x·T_w - T_u"]
+        R2 --> R3["Compute h₂ = p_y·T_w - T_v"]
+        R3 --> R4["Intersection: (u,v) = cross(h₁,h₂) / s_w"]
+        R4 --> R5["Distance: ρ = min(u² + v², ρ_2D)"]
+        R5 --> R6["Alpha: α = α₀ · exp(-ρ/2)"]
+        R6 --> R7["Blend: C += c·α·T, T *= (1-α)"]
+        R7 --> R8{"T < ε?"}
+        R8 -->|Yes| R9["Early termination"]
+        R8 -->|No| R1
+    end
+    
+    P3 --> R1
+    
+    style R4 fill:#ffeb3b
+    style R6 fill:#4caf50
+    style R7 fill:#2196f3
+```
+
+### 8. Key Equations Summary
+
+| Quantity | Formula |
+|----------|---------|
+| Local coordinates | $(u, v) = \left( \frac{(\mathbf{h}_1 \times \mathbf{h}_2)_x}{(\mathbf{h}_1 \times \mathbf{h}_2)_z}, \frac{(\mathbf{h}_1 \times \mathbf{h}_2)_y}{(\mathbf{h}_1 \times \mathbf{h}_2)_z} \right)$ |
+| Gaussian value | $G = \exp\left( -\frac{1}{2}(u^2 + v^2) \right)$ |
+| Alpha | $\alpha = \alpha_0 \cdot G$ |
+| Depth | $z = u \cdot T_{w,x} + v \cdot T_{w,y} + T_{w,z}$ |
+| Pixel color | $C = \sum_i c_i \alpha_i \prod_{j<i}(1-\alpha_j)$ |
+
+### 9. Physical Intuition (Engineering Analogy)
+
+Think of each surfel as a **small planar element** (like in panel methods for potential flow or boundary element methods in acoustics):
+
+| Concept in 2DGS | Engineering Analogy |
+|-----------------|---------------------|
+| Surfel | Panel/facet on a discretized surface |
+| Gaussian weight $G(u,v)$ | Influence function (decays from center) |
+| Normal $\mathbf{n}$ | Panel orientation |
+| Alpha blending | Superposition of contributions |
+| Depth sorting | Accounting for occlusion/shadowing |
+
+The key advantage of 2DGS over 3DGS for **depth estimation** is that the ray-surfel intersection gives you a **precise depth value** at the intersection point, rather than an ambiguous "depth to the center of an ellipsoid."
