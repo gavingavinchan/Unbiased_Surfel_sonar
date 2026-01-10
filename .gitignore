@@ -176,6 +176,13 @@ datasets/
 # =========================
 # Project Specific
 # =========================
+# Local-only files
+CLAUDE.md
+.cursor/
+debug_multiframe.py
+pdf/
+submodules/simple-knn/
+
 # Output directories
 output/
 output_*/
