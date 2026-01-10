@@ -196,8 +196,10 @@ def render_sonar(viewpoint_camera, pc: GaussianModel, bg_color: torch.Tensor,
         w2v = w2c  # Use camera pose directly (assumes poses are already sonar poses)
     
     # Extract rotation and translation from world-to-view transform
-    R_w2v = w2v[:3, :3]  # rotation
-    t_w2v = w2v[:3, 3]   # translation
+    # Note: world_view_transform is stored TRANSPOSED (row-major for OpenGL)
+    # Rotation is in top-left 3x3, but translation is in ROW 3 (not column 3)
+    R_w2v = w2v[:3, :3]  # rotation (same either way for orthogonal matrix)
+    t_w2v = w2v[3, :3]   # translation is in row 3, not column 3!
     
     # Apply scale factor to translation
     if scale_factor is not None:

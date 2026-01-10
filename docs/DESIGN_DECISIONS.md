@@ -96,6 +96,62 @@ for iter in range(finetune_iters):
 
 ---
 
+## Bug Fix 001: Scale Factor Not Affecting Rendered Output
+
+**Date**: 2025-01-10
+
+**Status**: Fixed
+
+### Problem Discovered
+
+Scale factor gradient was always zero during training. Investigation revealed:
+
+1. Scale sensitivity test showed loss IDENTICAL for all scale values (0.5 to 2.0)
+2. Root cause: `t_w2v = w2v[:3, 3]` returned `[0, 0, 0]`
+3. The `world_view_transform` matrix is stored **TRANSPOSED** (OpenGL convention)
+
+### Matrix Format Discovery
+
+```
+world_view_transform stored as:
+[[ R00  R01  R02  0 ]   ← R row 0
+ [ R10  R11  R12  0 ]   ← R row 1
+ [ R20  R21  R22  0 ]   ← R row 2
+ [ Tx   Ty   Tz   1 ]]  ← Translation is in ROW 3!
+```
+
+- Translation is in `w2v[3, :3]` (row 3), NOT `w2v[:3, 3]` (column 3)
+- `viewpoint.T` matches row 3 values
+- Column 3 is always `[0, 0, 0, 1]^T`
+
+### Fix Applied
+
+In `gaussian_renderer/__init__.py`, line ~200:
+
+```python
+# BEFORE (wrong):
+t_w2v = w2v[:3, 3]   # Returns [0, 0, 0]
+
+# AFTER (correct):
+t_w2v = w2v[3, :3]   # Returns actual translation [Tx, Ty, Tz]
+```
+
+### Diagnostic Code Added
+
+Scale sensitivity test in `debug_multiframe.py`:
+- Tests loss at scale values [0.5, 0.8, 0.9, 1.0, 1.1, 1.2, 2.0]
+- Prints camera transform matrix and translation values
+- Confirms scale affects output after fix
+
+### Lesson Learned
+
+Always verify tensor values when debugging gradient flow issues. Zero gradient can mean:
+1. Gradient is mathematically zero (like this case - multiplying by zero)
+2. Computation graph is broken
+3. Local minimum reached
+
+---
+
 ## Decision 002: [Template for Future Decisions]
 
 **Date**: YYYY-MM-DD

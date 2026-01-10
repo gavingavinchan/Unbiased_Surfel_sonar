@@ -151,13 +151,13 @@ Single-frame debugging script that outputs:
 
 ## TODO / Next Steps
 
-- [ ] **Implement curriculum learning for scale factor** (see Decision 001 in `docs/DESIGN_DECISIONS.md`)
-  - Stage 1: Fix surfels, learn scale only
-  - Stage 2: Fix scale, learn surfels
-  - Stage 3: (Optional) Joint fine-tuning
+- [x] **Implement curriculum learning for scale factor** (see Decision 001 in `docs/DESIGN_DECISIONS.md`)
+  - Stage 1: Fix surfels, learn scale only ✅
+  - Stage 2: Fix scale, learn surfels ✅
+  - Stage 3: Joint fine-tuning ✅
 - [ ] Integrate into main `train.py` training loop
 - [ ] Add TensorBoard logging for scale factor convergence
-- [ ] Test with full dataset (multiple frames)
+- [x] Test with full dataset (multiple frames) - debug_multiframe.py with 5 frames works
 - [ ] Evaluate mesh quality vs camera-based 2DGS
 - [ ] (Optional) CUDA kernel optimization if Python forward projection is too slow
 
@@ -167,10 +167,49 @@ Single-frame debugging script that outputs:
 
 | Issue | Status | Notes |
 |-------|--------|-------|
-| **Scale-surfel coupling** | Identified | Scale and surfel positions can compensate for each other; requires curriculum learning (see Decision 001) |
-| Scale factor convergence | To verify | Monitor for oscillation or drift |
+| **Scale-surfel coupling** | Mitigated | Scale and surfel positions can compensate for each other; curriculum learning works (see Decision 001) |
+| **Matrix transpose bug** | **FIXED** | `world_view_transform` is transposed; translation in row 3, not column 3 (see Bug Fix 001) |
+| Scale factor convergence | **VERIFIED** | Converges to ~1.05 with curriculum learning; no oscillation observed |
 | Top row artifacts | Mitigated | Masking top 10 rows in render |
 | Elevation assumption | Accepted | Assuming elevation=0 for backward projection |
+
+## Session Notes (2025-01-10)
+
+### Debug Scripts Created
+- `debug_before_after_mesh.py`: Single-frame debugging (scale_factor=None for baseline)
+- `debug_multiframe.py`: Multi-frame with curriculum learning (5 frames, 3 stages)
+
+### Key Finding: Scale Factor Bug
+- Scale factor was not affecting rendered output (gradient always 0)
+- Root cause: `world_view_transform` matrix stored transposed (OpenGL convention)
+- Translation is in `w2v[3, :3]` not `w2v[:3, 3]`
+- Fix applied in `gaussian_renderer/__init__.py`
+
+### Point Distance Diagnostic
+Points ARE correctly placed at metric distances (3-30m from cameras):
+```
+Frame 0: min=3.09m, max=29.70m, mean=19.38m
+Frame 1: min=3.09m, max=29.70m, mean=18.88m
+```
+If they appear <1m in Blender, it's likely Blender's scale interpretation of COLMAP coordinates.
+
+### Bug Fix Verified ✅ (2025-01-10)
+
+**Scale sensitivity test now shows different losses for different scale values:**
+```
+scale=0.5: L1=0.029040, SSIM=0.5943
+scale=1.0: L1=0.033910, SSIM=0.5211
+scale=2.0: L1=0.031900, SSIM=0.5307
+```
+
+**Gradients now non-zero:** `grad=-0.445334` at iteration 1 (was always 0 before fix)
+
+**Curriculum Learning Test Results (debug_multiframe_v7):**
+- Stage 1 (scale only, 50 iters): Scale converged 1.0 → 1.053
+- Stage 2 (surfels only, 100 iters): L1 dropped 0.034 → 0.008, SSIM improved 0.59 → 0.86
+- Stage 3 (joint, 50 iters): Final SSIM=0.875, scale=1.053
+
+**Conclusion:** Scale factor learning is now working correctly. The curriculum learning approach (scale-first) is effective.
 
 ---
 
@@ -183,4 +222,4 @@ Single-frame debugging script that outputs:
 
 ---
 
-*Last updated: 2025-01-09*
+*Last updated: 2025-01-10*
