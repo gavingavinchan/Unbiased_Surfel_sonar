@@ -232,30 +232,32 @@ def render_sonar(viewpoint_camera, pc: GaussianModel, bg_color: torch.Tensor,
     # p_sonar = R @ p_world + t_scaled
     points_sonar = (means3D @ R_w2v.T) + t_w2v_scaled  # [N, 3]
     
-    # Compute polar coordinates in sonar frame
-    # Sonar frame: +X = forward, +Y = right, +Z = down
-    x = points_sonar[:, 0]  # forward
-    y = points_sonar[:, 1]  # right  
-    z = points_sonar[:, 2]  # down
+    # Compute polar coordinates in CAMERA frame (OpenCV convention)
+    # Camera frame: +X = right, +Y = down, +Z = forward
+    right = points_sonar[:, 0]   # +X in camera frame
+    down = points_sonar[:, 1]    # +Y in camera frame  
+    forward = points_sonar[:, 2] # +Z in camera frame
     
-    # Compute azimuth (angle from forward direction in XY plane)
-    # Convention: +X direction = negative azimuth, +Y direction = positive azimuth flipped
-    # So we negate: azimuth = -atan2(y, x)
-    # This means: right (+Y) → negative azimuth, left (-Y) → positive azimuth
-    azimuth = -torch.atan2(y, x)  # [N]
+    # Compute azimuth (angle from forward direction in horizontal plane)
+    # azimuth = atan2(right, forward)
+    # Convention: positive azimuth = left side of image, negative azimuth = right side
+    # This matches backward projection: col=0 → +azimuth, col=W → -azimuth
+    # So we negate: -atan2(right, forward) gives +azimuth for left (-right), -azimuth for right (+right)
+    azimuth = -torch.atan2(right, forward)  # [N]
     
     # Compute range (3D distance from sonar origin)
-    range_vals = torch.sqrt(x**2 + y**2 + z**2)  # [N]
+    range_vals = torch.sqrt(right**2 + down**2 + forward**2)  # [N]
     
-    # Compute elevation (angle from XY plane)
-    xy_dist = torch.sqrt(x**2 + y**2)
-    elevation = torch.atan2(z, xy_dist)  # [N]
+    # Compute elevation (angle from horizontal XZ plane)
+    # Positive elevation = below horizontal (down), negative = above
+    horiz_dist = torch.sqrt(right**2 + forward**2)
+    elevation = torch.atan2(down, horiz_dist)  # [N]
     
     # Check which surfels are within sonar FOV
     valid_azimuth = torch.abs(azimuth) <= sonar_config.half_azimuth_rad
     valid_elevation = torch.abs(elevation) <= sonar_config.half_elevation_rad
     valid_range = (range_vals >= sonar_config.range_min) & (range_vals <= sonar_config.range_max)
-    in_fov = valid_azimuth & valid_elevation & valid_range & (x > 0)  # x > 0: in front of sonar
+    in_fov = valid_azimuth & valid_elevation & valid_range & (forward > 0)  # forward > 0: in front of sonar
     
     # Convert polar to pixel coordinates for valid surfels
     # Column: maps azimuth to [0, width] with flipped direction
@@ -381,11 +383,13 @@ def render_sonar(viewpoint_camera, pc: GaussianModel, bg_color: torch.Tensor,
     rendered_image = torch.clamp(rendered_image, 0, 1)
     
     # Mask out top rows (closest range bins often have artifacts)
-    # TODO: Make this configurable via sonar_config.mask_top_rows
+    # Use differentiable masking instead of in-place assignment to preserve gradients
     mask_top_rows = 10
     if mask_top_rows > 0:
-        rendered_image[:, :mask_top_rows, :] = 0
-        range_image[:, :mask_top_rows, :] = 0
+        mask = torch.ones_like(rendered_image)
+        mask[:, :mask_top_rows, :] = 0
+        rendered_image = rendered_image * mask
+        range_image = range_image * mask
     
     # Expand to 3 channels for compatibility with RGB loss functions
     rendered_image = rendered_image.expand(3, -1, -1)  # [3, H, W]

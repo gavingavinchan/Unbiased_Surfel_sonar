@@ -314,3 +314,161 @@ class SonarExtrinsic(nn.Module):
         """
         T_s2c = torch.inverse(self.T_cam_to_sonar)
         return T_s2c @ sonar_pose_w2s
+
+
+# =============================================================================
+# Sonar-Based Point Cloud Generation
+# =============================================================================
+
+def sonar_frame_to_points(camera, sonar_config, intensity_threshold=0.05, mask_top_rows=10):
+    """
+    Generate 3D points from a single sonar frame via backward projection.
+    
+    For each valid sonar pixel (intensity > threshold):
+    - Convert (col, row) -> (azimuth, range)
+    - Assume elevation = 0 (center of beam)
+    - Convert to 3D in sonar frame: x = r*cos(az), y = -r*sin(az), z = 0
+    - Transform to world frame using camera pose
+    
+    Args:
+        camera: Camera object with R, T, and original_image
+        sonar_config: SonarConfig with FOV and range parameters
+        intensity_threshold: Minimum intensity to consider valid (0-1)
+        mask_top_rows: Skip top N rows (closest range, often artifacts)
+        
+    Returns:
+        points: [N, 3] numpy array of 3D points in world coordinates
+        colors: [N, 3] numpy array of RGB colors (grayscale from intensity)
+    """
+    import numpy as np
+    
+    # Get sonar image
+    image = camera.original_image  # [3, H, W] or [1, H, W]
+    if image.shape[0] == 3:
+        intensity = image[0]  # Take first channel
+    else:
+        intensity = image.squeeze(0)
+    
+    # Convert to numpy
+    if hasattr(intensity, 'numpy'):
+        intensity = intensity.numpy()
+    
+    H, W = intensity.shape
+    
+    # Create mask for valid pixels
+    valid_mask = intensity > intensity_threshold
+    
+    # Mask out top rows (artifacts at close range)
+    if mask_top_rows > 0:
+        valid_mask[:mask_top_rows, :] = False
+    
+    # Get indices of valid pixels
+    rows, cols = np.where(valid_mask)
+    
+    if len(rows) == 0:
+        return np.zeros((0, 3)), np.zeros((0, 3))
+    
+    # Convert pixel coords to polar (azimuth, range)
+    # Azimuth: center column = 0, left = positive, right = negative
+    half_az_rad = math.radians(sonar_config.azimuth_fov / 2)
+    azimuth = -(cols - W / 2) / (W / 2) * half_az_rad  # radians
+    
+    # Range: top row = range_min, bottom row = range_max
+    range_vals = sonar_config.range_min + (rows / H) * (sonar_config.range_max - sonar_config.range_min)
+    
+    # Convert to 3D in sonar/camera frame
+    # Assuming elevation = 0 (center of beam)
+    # Camera frame: +Z forward, +X right, +Y down
+    # Azimuth convention: right side of image = negative azimuth, left = positive
+    # So: x = -r * sin(az) to get positive x for right side (negative azimuth)
+    x_cam = -range_vals * np.sin(azimuth)  # lateral (flipped to match +X = right)
+    y_cam = np.zeros_like(range_vals)      # elevation = 0
+    z_cam = range_vals * np.cos(azimuth)   # forward (depth)
+    
+    points_cam = np.stack([x_cam, y_cam, z_cam], axis=1)  # [N, 3]
+    
+    # Transform to world coordinates
+    # Camera pose: R is world-to-camera rotation, T is world-to-camera translation
+    # point_world = R^T @ (point_cam - T) ... wait, that's not right
+    # Actually: point_cam = R @ point_world + T
+    # So: point_world = R^T @ point_cam - R^T @ T = R^T @ (point_cam - T)
+    # But T is not subtracted from point_cam, it's: point_world = R^T @ point_cam + camera_center
+    # where camera_center = -R^T @ T
+    
+    R_w2c = camera.R  # [3, 3]
+    T_w2c = camera.T  # [3]
+    R_c2w = R_w2c.T
+    camera_center = -R_c2w @ T_w2c
+    
+    # Transform points: point_world = R_c2w @ point_cam + camera_center
+    points_world = (R_c2w @ points_cam.T).T + camera_center  # [N, 3]
+    
+    # Get colors from intensity (grayscale -> RGB)
+    intensities = intensity[rows, cols]
+    colors = np.stack([intensities, intensities, intensities], axis=1)  # [N, 3]
+    
+    return points_world, colors
+
+
+def sonar_frames_to_point_cloud(cameras, sonar_config, intensity_threshold=0.05, 
+                                 mask_top_rows=10, max_points_per_frame=5000,
+                                 voxel_downsample=None):
+    """
+    Generate combined 3D point cloud from multiple sonar frames.
+    
+    Args:
+        cameras: List of camera objects with poses and images
+        sonar_config: SonarConfig with FOV and range parameters
+        intensity_threshold: Minimum intensity to consider valid (0-1)
+        mask_top_rows: Skip top N rows (artifacts at close range)
+        max_points_per_frame: Randomly sample if more points than this (None = no limit)
+        voxel_downsample: Voxel size for downsampling final cloud (None = no downsample)
+        
+    Returns:
+        points: [N, 3] numpy array of 3D points in world coordinates
+        colors: [N, 3] numpy array of RGB colors
+    """
+    import numpy as np
+    
+    all_points = []
+    all_colors = []
+    
+    for i, cam in enumerate(cameras):
+        points, colors = sonar_frame_to_points(
+            cam, sonar_config, 
+            intensity_threshold=intensity_threshold,
+            mask_top_rows=mask_top_rows
+        )
+        
+        if len(points) == 0:
+            continue
+        
+        # Optionally limit points per frame
+        if max_points_per_frame is not None and len(points) > max_points_per_frame:
+            indices = np.random.choice(len(points), max_points_per_frame, replace=False)
+            points = points[indices]
+            colors = colors[indices]
+        
+        all_points.append(points)
+        all_colors.append(colors)
+    
+    if len(all_points) == 0:
+        return np.zeros((0, 3)), np.zeros((0, 3))
+    
+    points = np.concatenate(all_points, axis=0)
+    colors = np.concatenate(all_colors, axis=0)
+    
+    # Optionally voxel downsample
+    if voxel_downsample is not None:
+        try:
+            import open3d as o3d
+            pcd = o3d.geometry.PointCloud()
+            pcd.points = o3d.utility.Vector3dVector(points)
+            pcd.colors = o3d.utility.Vector3dVector(colors)
+            pcd = pcd.voxel_down_sample(voxel_size=voxel_downsample)
+            points = np.asarray(pcd.points)
+            colors = np.asarray(pcd.colors)
+        except ImportError:
+            pass  # Skip downsampling if open3d not available
+    
+    return points, colors
