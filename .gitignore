@@ -179,7 +179,6 @@ datasets/
 # Local-only files
 CLAUDE.md
 .cursor/
-debug_multiframe.py
 pdf/
 submodules/simple-knn/
 

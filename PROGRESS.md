@@ -177,7 +177,7 @@ Single-frame debugging script that outputs:
 
 ### Debug Scripts Created
 - `debug_before_after_mesh.py`: Single-frame debugging (scale_factor=None for baseline)
-- `debug_multiframe.py`: Multi-frame with curriculum learning (5 frames, 3 stages)
+- `debug_multiframe.py`: Multi-frame with curriculum learning (5 frames, 3 stages), raw-frame comparisons, and `scale_and_loss.png` plotting; Stage 1 set to 1000 iters for convergence checks
 
 ### Key Finding: Scale Factor Bug
 - Scale factor was not affecting rendered output (gradient always 0)
