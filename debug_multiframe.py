@@ -42,6 +42,134 @@ import open3d as o3d
 from PIL import Image
 
 
+def is_in_sonar_fov(xyz, camera, sonar_config, scale_factor, return_details=False):
+    """
+    Check if 3D points are within the sonar FOV of a given camera.
+
+    Uses the EXACT same transform as render_sonar to ensure consistency.
+
+    Args:
+        xyz: [N, 3] tensor of 3D points in world coordinates
+        camera: Camera object with world_view_transform
+        sonar_config: SonarConfig with FOV and range parameters
+        scale_factor: SonarScaleFactor for pose scaling
+        return_details: If True, return dict with per-constraint masks
+
+    Returns:
+        [N] boolean tensor: True if point is within FOV
+        (or dict if return_details=True)
+    """
+    N = xyz.shape[0]
+    if N == 0:
+        empty = torch.zeros(0, dtype=torch.bool, device=xyz.device)
+        if return_details:
+            return {"in_fov": empty, "in_azimuth": empty, "in_elevation": empty,
+                    "in_range": empty, "in_front": empty}
+        return empty
+
+    # Match render_sonar's transform EXACTLY
+    w2v = camera.world_view_transform.cuda()  # [4, 4]
+
+    # Extract R and t (translation is in row 3, not column 3!)
+    R_w2v = w2v[:3, :3]
+    t_w2v = w2v[3, :3]
+
+    # Apply scale factor to translation
+    scale = scale_factor.scale
+    t_w2v_scaled = scale * t_w2v
+
+    # Transform points to sonar frame: p_sonar = p_world @ R.T + t_scaled
+    # This matches render_sonar exactly
+    points_sonar = (xyz @ R_w2v.T) + t_w2v_scaled  # [N, 3]
+
+    # Camera/sonar frame: +X = right, +Y = down, +Z = forward
+    right = points_sonar[:, 0]
+    down = points_sonar[:, 1]
+    forward = points_sonar[:, 2]
+
+    # Compute azimuth (matches render_sonar: -atan2(right, forward))
+    # We use abs() so sign doesn't matter for FOV check
+    azimuth = torch.atan2(right, forward)  # [N]
+
+    # Compute range (3D distance from sonar origin)
+    range_vals = torch.sqrt(right**2 + down**2 + forward**2)  # [N]
+
+    # Compute elevation (matches render_sonar: atan2(down, horiz_dist))
+    horiz_dist = torch.sqrt(right**2 + forward**2)
+    elevation = torch.atan2(down, horiz_dist)  # [N]
+
+    # Check FOV constraints
+    half_az_rad = math.radians(sonar_config.azimuth_fov / 2)
+    half_el_rad = math.radians(sonar_config.elevation_fov / 2)
+
+    in_azimuth = torch.abs(azimuth) <= half_az_rad
+    in_elevation = torch.abs(elevation) <= half_el_rad
+    in_range = (range_vals >= sonar_config.range_min) & (range_vals <= sonar_config.range_max)
+    in_front = forward > 0  # Must be in front of sonar
+
+    in_fov = in_azimuth & in_elevation & in_range & in_front
+
+    if return_details:
+        return {
+            "in_fov": in_fov,
+            "in_azimuth": in_azimuth,
+            "in_elevation": in_elevation,
+            "in_range": in_range,
+            "in_front": in_front,
+            "range_vals": range_vals,
+            "azimuth_deg": torch.rad2deg(azimuth),
+            "elevation_deg": torch.rad2deg(elevation),
+        }
+    return in_fov
+
+
+def prune_outside_fov(gaussians, training_frames, sonar_config, scale_factor, require_all=False):
+    """
+    Prune Gaussians that are outside the FOV of training cameras.
+
+    Args:
+        gaussians: GaussianModel instance
+        training_frames: List of camera objects
+        sonar_config: SonarConfig
+        scale_factor: SonarScaleFactor
+        require_all: If True, prune if outside ALL cameras' FOV
+                     If False, keep if visible from ANY camera (default)
+
+    Returns:
+        Number of points pruned
+    """
+    xyz = gaussians.get_xyz  # [N, 3]
+    N = xyz.shape[0]
+
+    if N == 0:
+        return 0
+
+    # Check visibility from each training frame
+    visible_masks = []
+    for cam in training_frames:
+        in_fov = is_in_sonar_fov(xyz, cam, sonar_config, scale_factor)
+        visible_masks.append(in_fov)
+
+    # Stack masks: [num_cameras, N]
+    all_masks = torch.stack(visible_masks, dim=0)
+
+    if require_all:
+        # Prune if outside ALL cameras (very aggressive)
+        visible_from_any = all_masks.any(dim=0)  # [N]
+        prune_mask = ~visible_from_any
+    else:
+        # Keep if visible from at least one camera (conservative)
+        visible_from_any = all_masks.any(dim=0)  # [N]
+        prune_mask = ~visible_from_any
+
+    num_to_prune = prune_mask.sum().item()
+
+    if num_to_prune > 0:
+        gaussians.prune_points(prune_mask)
+
+    return num_to_prune
+
+
 def create_pose_pyramid_wireframe(position, rotation_matrix, depth=0.5,
                                    azimuth_fov=120.0, elevation_fov=20.0, color=[1.0, 0.0, 0.0]):
     """Create a wireframe pyramid for a single pose."""
@@ -287,6 +415,9 @@ STAGE1_ITERATIONS = 0   # Learn scale only (surfels frozen) - DISABLED, using kn
 STAGE2_ITERATIONS = 3000  # Learn surfels only (scale frozen)
 STAGE3_ITERATIONS = 50   # Joint fine-tuning
 
+# FOV-aware pruning: remove surfels that drift outside all training cameras' FOV
+FOV_PRUNE_INTERVAL = 100  # Prune every N iterations (0 to disable)
+
 # Create unique output folder
 def get_next_output_dir(base_path):
     """Find next available output directory with incrementing version."""
@@ -306,6 +437,7 @@ print("=" * 60)
 print(f"Seed: {SEED}")
 print(f"Num training frames: {NUM_TRAINING_FRAMES}")
 print(f"Curriculum: Stage1={STAGE1_ITERATIONS} (scale), Stage2={STAGE2_ITERATIONS} (surfels), Stage3={STAGE3_ITERATIONS} (joint)")
+print(f"FOV pruning interval: {FOV_PRUNE_INTERVAL} iterations")
 print(f"Output: {OUTPUT_DIR}")
 print("=" * 60)
 
@@ -488,6 +620,21 @@ print(f"Cameras extent (radius): {cameras_extent:.3f}")
 gaussians = GaussianModel(dataset_args.sh_degree)
 gaussians.create_from_pcd(basic_pcd, cameras_extent)
 print(f"Gaussian count: {len(gaussians.get_xyz)}")
+
+# Diagnostic: Check initial FOV visibility with temporary scale factor
+print("\nDiagnostic: Initial surfel FOV visibility")
+temp_scale = SonarScaleFactor(init_value=0.65).cuda()  # Use calibrated scale
+for i, cam in enumerate(training_frames):
+    details = is_in_sonar_fov(gaussians.get_xyz, cam, sonar_config, temp_scale, return_details=True)
+    in_fov = details["in_fov"]
+    print(f"  Frame {i}: {in_fov.sum().item()}/{len(gaussians.get_xyz)} surfels in FOV")
+    print(f"    - in_front: {details['in_front'].sum().item()}")
+    print(f"    - in_azimuth: {details['in_azimuth'].sum().item()} (±{sonar_config.azimuth_fov/2:.0f}°)")
+    print(f"    - in_elevation: {details['in_elevation'].sum().item()} (±{sonar_config.elevation_fov/2:.0f}°)")
+    print(f"    - in_range: {details['in_range'].sum().item()} ({sonar_config.range_min:.1f}-{sonar_config.range_max:.1f}m)")
+    # Show range distribution
+    r = details["range_vals"]
+    print(f"    - range stats: min={r.min().item():.2f}m, max={r.max().item():.2f}m, mean={r.mean().item():.2f}m")
 
 # =============================================================================
 # Mesh Before Training
@@ -736,13 +883,19 @@ if STAGE2_ITERATIONS > 0:
             gaussians.optimizer.zero_grad(set_to_none=True)
             gaussians.update_learning_rate(iteration)
 
+            # FOV-aware pruning: remove surfels that drifted outside all training FOVs
+            if FOV_PRUNE_INTERVAL > 0 and iteration % FOV_PRUNE_INTERVAL == 0:
+                num_pruned = prune_outside_fov(gaussians, training_frames, sonar_config, sonar_scale_factor)
+                if num_pruned > 0:
+                    print(f"  [FOV prune] Removed {num_pruned} surfels outside FOV, {len(gaussians.get_xyz)} remaining")
+
         scale_value = sonar_scale_factor.get_scale_value()
         record_metrics(loss.item(), scale_value, "stage2")
 
         if iteration % 10 == 0 or iteration == 1:
-            print(f"  Iter {iteration:3d}: L1={Ll1.item():.6f}, SSIM={ssim_val.item():.4f}, scale={scale_value:.4f}")
+            print(f"  Iter {iteration:3d}: L1={Ll1.item():.6f}, SSIM={ssim_val.item():.4f}, scale={scale_value:.4f}, pts={len(gaussians.get_xyz)}")
 
-    print(f"Stage 2 complete.")
+    print(f"Stage 2 complete. Surfels: {len(gaussians.get_xyz)}")
 
     # Extract mesh after Stage 2
     extract_and_save_mesh(
@@ -793,13 +946,49 @@ if STAGE3_ITERATIONS > 0:
             # Scale frozen - no optimizer step
             gaussians.update_learning_rate(STAGE2_ITERATIONS + iteration)
 
+            # FOV-aware pruning
+            if FOV_PRUNE_INTERVAL > 0 and iteration % FOV_PRUNE_INTERVAL == 0:
+                num_pruned = prune_outside_fov(gaussians, training_frames, sonar_config, sonar_scale_factor)
+                if num_pruned > 0:
+                    print(f"  [FOV prune] Removed {num_pruned} surfels outside FOV, {len(gaussians.get_xyz)} remaining")
+
         scale_value = sonar_scale_factor.get_scale_value()
         record_metrics(loss.item(), scale_value, "stage3")
 
         if iteration % 10 == 0 or iteration == 1:
-            print(f"  Iter {iteration:3d}: L1={Ll1.item():.6f}, SSIM={ssim_val.item():.4f}, scale={scale_value:.4f}")
+            print(f"  Iter {iteration:3d}: L1={Ll1.item():.6f}, SSIM={ssim_val.item():.4f}, scale={scale_value:.4f}, pts={len(gaussians.get_xyz)}")
 
-    print(f"Stage 3 complete.")
+    print(f"Stage 3 complete. Surfels: {len(gaussians.get_xyz)}")
+
+    # Final FOV diagnostic and forced prune before mesh extraction
+    print("\n  Final FOV check before mesh extraction:")
+    for i, cam in enumerate(training_frames):
+        details = is_in_sonar_fov(gaussians.get_xyz, cam, sonar_config, sonar_scale_factor, return_details=True)
+        in_fov = details["in_fov"]
+        print(f"    Frame {i}: {in_fov.sum().item()}/{len(gaussians.get_xyz)} in FOV")
+        if not in_fov.all():
+            # Show stats for out-of-FOV surfels
+            out_mask = ~in_fov
+            r = details["range_vals"][out_mask]
+            az = details["azimuth_deg"][out_mask]
+            el = details["elevation_deg"][out_mask]
+            if len(r) > 0:
+                print(f"      Out-of-FOV: range=[{r.min().item():.2f}, {r.max().item():.2f}]m, "
+                      f"az=[{az.min().item():.1f}, {az.max().item():.1f}]°, "
+                      f"el=[{el.min().item():.1f}, {el.max().item():.1f}]°")
+
+    # Force final prune
+    num_pruned = prune_outside_fov(gaussians, training_frames, sonar_config, sonar_scale_factor)
+    if num_pruned > 0:
+        print(f"  [Final prune] Removed {num_pruned} surfels, {len(gaussians.get_xyz)} remaining")
+
+    # Save final surfel positions as point cloud (for verification)
+    final_xyz = gaussians.get_xyz.detach().cpu().numpy()
+    final_pcd = o3d.geometry.PointCloud()
+    final_pcd.points = o3d.utility.Vector3dVector(final_xyz)
+    final_pcd_path = os.path.join(OUTPUT_DIR, "surfels_after_training.ply")
+    o3d.io.write_point_cloud(final_pcd_path, final_pcd)
+    print(f"  Saved surfel positions: {final_pcd_path} ({len(final_xyz)} points)")
 
     # Extract mesh after Stage 3
     extract_and_save_mesh(
