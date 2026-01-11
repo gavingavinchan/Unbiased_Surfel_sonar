@@ -286,8 +286,8 @@ sonar_config = SonarConfig(
     image_width=128,
     azimuth_fov=120.0,
     elevation_fov=20.0,
-    range_min=0.1,
-    range_max=30.0,
+    range_min=0.2,
+    range_max=3.0,
     intensity_threshold=0.01,
     device="cuda"
 )
@@ -306,8 +306,8 @@ dataset_args = Namespace(
     sonar_images="sonar",
     sonar_azimuth_fov=120.0,
     sonar_elevation_fov=20.0,
-    sonar_range_min=0.1,
-    sonar_range_max=30.0,
+    sonar_range_min=0.2,
+    sonar_range_max=3.0,
     sonar_intensity_threshold=0.01,
     gamma=2.2,
 )
@@ -348,8 +348,8 @@ sonar_config = SonarConfig(
     image_width=sample_cam.image_width,
     azimuth_fov=120.0,
     elevation_fov=20.0,
-    range_min=0.1,
-    range_max=30.0,
+    range_min=0.2,
+    range_max=3.0,
     intensity_threshold=0.01,
     device="cuda"
 )
