@@ -84,6 +84,36 @@ def brighten_image(img_np, percentile=99, gamma=0.5):
     return img_bright
 
 
+# Intensity threshold: pixels below this value (0-255 scale) are treated as black
+INTENSITY_THRESHOLD = 10  # out of 255
+
+
+def preprocess_gt_image(image_tensor, mask_top_rows=10, intensity_threshold=INTENSITY_THRESHOLD):
+    """
+    Preprocess ground truth sonar image for training/comparison.
+
+    Args:
+        image_tensor: [C, H, W] tensor in 0-1 range
+        mask_top_rows: Number of top rows to mask (close range artifacts)
+        intensity_threshold: Pixel values below this (0-255 scale) are set to 0
+
+    Returns:
+        Preprocessed image tensor
+    """
+    gt = image_tensor.cuda().clone()
+
+    # Mask top rows (close range artifacts)
+    if mask_top_rows > 0:
+        gt[:, :mask_top_rows, :] = 0
+
+    # Threshold low intensity pixels (noise filtering)
+    # Convert threshold from 0-255 to 0-1 range
+    threshold_normalized = intensity_threshold / 255.0
+    gt[gt < threshold_normalized] = 0
+
+    return gt
+
+
 def extract_and_save_mesh(gaussians, mesh_cameras, pipe_args, bg_color,
                           output_dir, filename, depth_trunc=None, voxel_size=None, sdf_trunc=None):
     """Helper to extract and save mesh at a checkpoint."""
@@ -131,8 +161,7 @@ def save_comparison_images(training_frames, gaussians, background, sonar_config,
     """Save GT vs rendered comparison images for all training frames at a given stage."""
     print(f"\n  Saving comparison images for {stage_name}...")
     for i, cam in enumerate(training_frames):
-        gt_image = cam.original_image.cuda().clone()
-        gt_image[:, :10, :] = 0
+        gt_image = preprocess_gt_image(cam.original_image)
 
         with torch.no_grad():
             render_pkg = render_sonar(
@@ -250,12 +279,12 @@ torch.cuda.manual_seed_all(SEED)
 # =============================================================================
 DATASET_PATH = "/home/gavin/ros2_ws/outputs/session_2025-12-08_16-35-13_sonar_data_for_2dgs"
 OUTPUT_DIR_BASE = "./output/debug_multiframe"
-NUM_TRAINING_FRAMES = 5  # Number of frames to use for training
+NUM_TRAINING_FRAMES = 1  # Number of frames to use for training (TODO: increase to 500 for full run)
 PYRAMID_DEPTH = 0.5
 
 # Curriculum learning parameters
-STAGE1_ITERATIONS = 1000   # Learn scale only (surfels frozen)
-STAGE2_ITERATIONS = 100  # Learn surfels only (scale frozen)
+STAGE1_ITERATIONS = 0   # Learn scale only (surfels frozen) - DISABLED, using known scale=0.65
+STAGE2_ITERATIONS = 3000  # Learn surfels only (scale frozen)
 STAGE3_ITERATIONS = 50   # Joint fine-tuning
 
 # Create unique output folder
@@ -398,7 +427,7 @@ all_normals = []
 for i, cam in enumerate(training_frames):
     points, colors = sonar_frame_to_points(
         cam, sonar_config,
-        intensity_threshold=0.01,
+        intensity_threshold=INTENSITY_THRESHOLD / 255.0,  # Same threshold as training
         mask_top_rows=10
     )
 
@@ -524,7 +553,9 @@ gaussians.training_setup(Namespace(
 ))
 
 # Scale factor module
-sonar_scale_factor = SonarScaleFactor(init_value=1.0).cuda()
+# Known scale factor from calibration cube in COLMAP (true value ~0.66)
+# TODO: Fix scale factor learning - currently not converging to correct value
+sonar_scale_factor = SonarScaleFactor(init_value=0.65).cuda()
 
 # Separate optimizer for scale factor
 scale_optimizer = torch.optim.Adam([
@@ -542,8 +573,7 @@ print("=" * 60)
 
 test_scales = [0.5, 0.8, 0.9, 1.0, 1.1, 1.2, 2.0]
 viewpoint_test = training_frames[0]
-gt_test = viewpoint_test.original_image.cuda().clone()
-gt_test[:, :10, :] = 0
+gt_test = preprocess_gt_image(viewpoint_test.original_image)
 
 print("Testing loss at different scale values:")
 
@@ -593,9 +623,8 @@ if STAGE1_ITERATIONS > 0:
         frame_idx = (iteration - 1) % len(training_frames)
         viewpoint_cam = training_frames[frame_idx]
 
-        # Get ground truth
-        gt_image = viewpoint_cam.original_image.cuda().clone()
-        gt_image[:, :10, :] = 0  # Mask top rows
+        # Get ground truth (with intensity thresholding)
+        gt_image = preprocess_gt_image(viewpoint_cam.original_image)
 
         # Forward projection WITH scale factor
         render_pkg = render_sonar(
@@ -681,9 +710,8 @@ if STAGE2_ITERATIONS > 0:
         frame_idx = (iteration - 1) % len(training_frames)
         viewpoint_cam = training_frames[frame_idx]
 
-        # Get ground truth
-        gt_image = viewpoint_cam.original_image.cuda().clone()
-        gt_image[:, :10, :] = 0
+        # Get ground truth (with intensity thresholding)
+        gt_image = preprocess_gt_image(viewpoint_cam.original_image)
 
         # Forward projection with frozen scale
         render_pkg = render_sonar(
@@ -735,18 +763,15 @@ if STAGE3_ITERATIONS > 0:
     print(f"STAGE 3: Joint fine-tuning ({STAGE3_ITERATIONS} iterations)")
     print("=" * 60)
 
-    # Unfreeze scale with reduced LR
-    sonar_scale_factor._log_scale.requires_grad = True
-    scale_optimizer = torch.optim.Adam([
-        {'params': [sonar_scale_factor._log_scale], 'lr': 0.001, 'name': 'sonar_scale'}  # 10x lower LR
-    ])
+    # Keep scale frozen (using known calibrated value)
+    # TODO: Re-enable scale learning once scale factor convergence is fixed
+    sonar_scale_factor._log_scale.requires_grad = False
 
     for iteration in range(1, STAGE3_ITERATIONS + 1):
         frame_idx = (iteration - 1) % len(training_frames)
         viewpoint_cam = training_frames[frame_idx]
 
-        gt_image = viewpoint_cam.original_image.cuda().clone()
-        gt_image[:, :10, :] = 0
+        gt_image = preprocess_gt_image(viewpoint_cam.original_image)
 
         render_pkg = render_sonar(
             viewpoint_cam, gaussians, background,
@@ -765,8 +790,7 @@ if STAGE3_ITERATIONS > 0:
         with torch.no_grad():
             gaussians.optimizer.step()
             gaussians.optimizer.zero_grad(set_to_none=True)
-            scale_optimizer.step()
-            scale_optimizer.zero_grad(set_to_none=True)
+            # Scale frozen - no optimizer step
             gaussians.update_learning_rate(STAGE2_ITERATIONS + iteration)
 
         scale_value = sonar_scale_factor.get_scale_value()

@@ -155,6 +155,7 @@ Single-frame debugging script that outputs:
   - Stage 1: Fix surfels, learn scale only ✅
   - Stage 2: Fix scale, learn surfels ✅
   - Stage 3: Joint fine-tuning ✅
+- [ ] **Fix scale factor learning** - converges to ~1.0 but correct value is 0.66 (calibration cube). Currently using frozen scale=0.65.
 - [ ] Integrate into main `train.py` training loop
 - [ ] Add TensorBoard logging for scale factor convergence
 - [x] Test with full dataset (multiple frames) - debug_multiframe.py with 5 frames works
@@ -169,7 +170,7 @@ Single-frame debugging script that outputs:
 |-------|--------|-------|
 | **Scale-surfel coupling** | Mitigated | Scale and surfel positions can compensate for each other; curriculum learning works (see Decision 001) |
 | **Matrix transpose bug** | **FIXED** | `world_view_transform` is transposed; translation in row 3, not column 3 (see Bug Fix 001) |
-| Scale factor convergence | **VERIFIED** | Converges to ~1.05 with curriculum learning; no oscillation observed |
+| **Scale factor learning** | **TODO** | Learning converges to ~1.0 but correct value is 0.66 (from calibration cube). Currently frozen at 0.65. Need to investigate why learning doesn't converge to correct value. |
 | Top row artifacts | Mitigated | Masking top 10 rows in render |
 | Elevation assumption | Accepted | Assuming elevation=0 for backward projection |
 
