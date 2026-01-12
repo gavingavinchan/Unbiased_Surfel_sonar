@@ -157,6 +157,39 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
 # Sonar Forward Projection (Polar Geometry)
 # =============================================================================
 
+def compute_fov_margin(range_vals, azimuth, elevation, sonar_config):
+    """
+    Compute distance from each point to nearest FOV boundary.
+
+    Used for size-aware FOV checking: a surfel is fully inside FOV only if
+    its center is inside AND margin > surfel_radius.
+
+    Args:
+        range_vals: [N] distance from sonar origin
+        azimuth: [N] horizontal angle (radians)
+        elevation: [N] vertical angle (radians)
+        sonar_config: SonarConfig with FOV limits
+
+    Returns:
+        [N] margin in world units (meters)
+    """
+    # Angular margins (convert to linear distance at current range)
+    # This approximation is accurate for small angles
+    az_margin = (sonar_config.half_azimuth_rad - torch.abs(azimuth)) * range_vals
+    el_margin = (sonar_config.half_elevation_rad - torch.abs(elevation)) * range_vals
+
+    # Range margins
+    range_margin_near = range_vals - sonar_config.range_min
+    range_margin_far = sonar_config.range_max - range_vals
+
+    # Minimum margin across all constraints
+    margin = torch.min(torch.stack([
+        az_margin, el_margin, range_margin_near, range_margin_far
+    ], dim=0), dim=0).values
+
+    return margin
+
+
 def render_sonar(viewpoint_camera, pc: GaussianModel, bg_color: torch.Tensor, 
                  sonar_config, scale_factor=None, sonar_extrinsic=None, scaling_modifier=1.0):
     """
@@ -255,11 +288,22 @@ def render_sonar(viewpoint_camera, pc: GaussianModel, bg_color: torch.Tensor,
     horiz_dist = torch.sqrt(right**2 + forward**2)
     elevation = torch.atan2(down, horiz_dist)  # [N]
     
-    # Check which surfels are within sonar FOV
+    # Check which surfels are within sonar FOV (center-based check)
     valid_azimuth = torch.abs(azimuth) <= sonar_config.half_azimuth_rad
     valid_elevation = torch.abs(elevation) <= sonar_config.half_elevation_rad
     valid_range = (range_vals >= sonar_config.range_min) & (range_vals <= sonar_config.range_max)
-    in_fov = valid_azimuth & valid_elevation & valid_range & (forward > 0)  # forward > 0: in front of sonar
+    center_in_fov = valid_azimuth & valid_elevation & valid_range & (forward > 0)
+
+    # Size-aware FOV check: surfel must be FULLY inside FOV (center + size extent)
+    # Get surfel radius (max of scaling dimensions)
+    scaling = pc.get_scaling  # [N, 2]
+    surfel_radius = scaling.max(dim=1).values  # [N]
+
+    # Compute margin to nearest FOV boundary
+    margin = compute_fov_margin(range_vals, azimuth, elevation, sonar_config)
+
+    # Surfel is fully inside if center in FOV AND margin > surfel radius
+    in_fov = center_in_fov & (margin > surfel_radius)
     
     # Convert polar to pixel coordinates for valid surfels
     # Column: maps azimuth to [0, width] with flipped direction

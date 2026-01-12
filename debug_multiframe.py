@@ -123,7 +123,96 @@ def is_in_sonar_fov(xyz, camera, sonar_config, scale_factor, return_details=Fals
     return in_fov
 
 
-def prune_outside_fov(gaussians, training_frames, sonar_config, scale_factor, require_all=False):
+def compute_fov_margin_debug(range_vals, azimuth, elevation, sonar_config):
+    """
+    Compute distance from each point to nearest FOV boundary.
+
+    Args:
+        range_vals: [N] distance from sonar origin
+        azimuth: [N] horizontal angle (radians)
+        elevation: [N] vertical angle (radians)
+        sonar_config: SonarConfig with FOV limits
+
+    Returns:
+        [N] margin in world units (meters)
+    """
+    half_az_rad = math.radians(sonar_config.azimuth_fov / 2)
+    half_el_rad = math.radians(sonar_config.elevation_fov / 2)
+
+    # Angular margins (convert to linear distance at current range)
+    az_margin = (half_az_rad - torch.abs(azimuth)) * range_vals
+    el_margin = (half_el_rad - torch.abs(elevation)) * range_vals
+
+    # Range margins
+    range_margin_near = range_vals - sonar_config.range_min
+    range_margin_far = sonar_config.range_max - range_vals
+
+    # Minimum margin across all constraints
+    margin = torch.min(torch.stack([
+        az_margin, el_margin, range_margin_near, range_margin_far
+    ], dim=0), dim=0).values
+
+    return margin
+
+
+def is_fully_in_sonar_fov(xyz, scaling, camera, sonar_config, scale_factor):
+    """
+    Check if surfels (center + size extent) are fully within the sonar FOV.
+
+    A surfel is fully inside FOV if:
+    1. Its center is within FOV (azimuth, elevation, range constraints)
+    2. Its margin to FOV boundary exceeds its radius
+
+    Args:
+        xyz: [N, 3] tensor of surfel center positions
+        scaling: [N, 2] tensor of surfel scaling (already activated, not log)
+        camera: Camera object with world_view_transform
+        sonar_config: SonarConfig with FOV and range parameters
+        scale_factor: SonarScaleFactor for pose scaling
+
+    Returns:
+        [N] boolean tensor: True if surfel is fully within FOV
+    """
+    N = xyz.shape[0]
+    if N == 0:
+        return torch.zeros(0, dtype=torch.bool, device=xyz.device)
+
+    # Transform points to sonar frame (same as is_in_sonar_fov)
+    w2v = camera.world_view_transform.cuda()
+    R_w2v = w2v[:3, :3]
+    t_w2v = w2v[3, :3]
+    t_w2v_scaled = scale_factor.scale * t_w2v
+    points_sonar = (xyz @ R_w2v.T) + t_w2v_scaled
+
+    right = points_sonar[:, 0]
+    down = points_sonar[:, 1]
+    forward = points_sonar[:, 2]
+
+    azimuth = torch.atan2(right, forward)
+    range_vals = torch.sqrt(right**2 + down**2 + forward**2)
+    horiz_dist = torch.sqrt(right**2 + forward**2)
+    elevation = torch.atan2(down, horiz_dist)
+
+    # Center-based FOV check
+    half_az_rad = math.radians(sonar_config.azimuth_fov / 2)
+    half_el_rad = math.radians(sonar_config.elevation_fov / 2)
+
+    in_azimuth = torch.abs(azimuth) <= half_az_rad
+    in_elevation = torch.abs(elevation) <= half_el_rad
+    in_range = (range_vals >= sonar_config.range_min) & (range_vals <= sonar_config.range_max)
+    in_front = forward > 0
+    center_in_fov = in_azimuth & in_elevation & in_range & in_front
+
+    # Size-aware check: margin must exceed surfel radius
+    surfel_radius = scaling.max(dim=1).values  # [N]
+    margin = compute_fov_margin_debug(range_vals, azimuth, elevation, sonar_config)
+
+    fully_inside = center_in_fov & (margin > surfel_radius)
+    return fully_inside
+
+
+def prune_outside_fov(gaussians, training_frames, sonar_config, scale_factor,
+                      require_all=False, check_size=True):
     """
     Prune Gaussians that are outside the FOV of training cameras.
 
@@ -134,6 +223,7 @@ def prune_outside_fov(gaussians, training_frames, sonar_config, scale_factor, re
         scale_factor: SonarScaleFactor
         require_all: If True, prune if outside ALL cameras' FOV
                      If False, keep if visible from ANY camera (default)
+        check_size: If True, also check that surfel size doesn't extend beyond FOV
 
     Returns:
         Number of points pruned
@@ -146,9 +236,17 @@ def prune_outside_fov(gaussians, training_frames, sonar_config, scale_factor, re
 
     # Check visibility from each training frame
     visible_masks = []
-    for cam in training_frames:
-        in_fov = is_in_sonar_fov(xyz, cam, sonar_config, scale_factor)
-        visible_masks.append(in_fov)
+    if check_size:
+        # Size-aware check: surfel center AND extent must be within FOV
+        scaling = gaussians.get_scaling  # [N, 2]
+        for cam in training_frames:
+            in_fov = is_fully_in_sonar_fov(xyz, scaling, cam, sonar_config, scale_factor)
+            visible_masks.append(in_fov)
+    else:
+        # Center-only check (original behavior)
+        for cam in training_frames:
+            in_fov = is_in_sonar_fov(xyz, cam, sonar_config, scale_factor)
+            visible_masks.append(in_fov)
 
     # Stack masks: [num_cameras, N]
     all_masks = torch.stack(visible_masks, dim=0)
