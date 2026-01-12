@@ -212,6 +212,14 @@ scale=2.0: L1=0.031900, SSIM=0.5307
 
 **Conclusion:** Scale factor learning is now working correctly. The curriculum learning approach (scale-first) is effective.
 
+## Session Notes (2026-01-12)
+
+- 500-frame runs show loss oscillations without downward trend and raw comparisons not matching; brightened comparisons only capture low-frequency blobs.
+- Thin-leg bright dots from the calibration cube are missing in multi-frame outputs; SSIM weighting may be suppressing high-frequency detail (to revisit).
+- Switched training frame selection to shuffle-per-epoch to remove strict per-frame cycling in `debug_multiframe.py`.
+- Added bright-pixel loss (top-k brightest GT pixels) with tunable `BRIGHT_PERCENTILE`, `BRIGHT_WEIGHT`, `BRIGHT_MIN_PIXELS` in `debug_multiframe.py` to preserve small bright dots; base loss remains `0.8*L1 + 0.2*(1-SSIM)` for blending.
+- Loss alternatives noted for trial: intensity-weighted L1, top-k bright-pixel loss (implemented), reduced/disabled SSIM, and blended base+bright losses.
+
 ---
 
 ## References

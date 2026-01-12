@@ -20,6 +20,7 @@ Outputs:
 
 import os
 import sys
+import atexit
 import torch
 import random
 import numpy as np
@@ -313,6 +314,13 @@ def brighten_image(img_np, percentile=99, gamma=0.5):
 # Intensity threshold: pixels below this value (0-255 scale) are treated as black
 INTENSITY_THRESHOLD = 10  # out of 255
 
+# Bright-pixel loss settings (top-k brightest GT pixels)
+BRIGHT_PERCENTILE = 95.0
+BRIGHT_WEIGHT = 0.5
+BRIGHT_MIN_PIXELS = 32
+LOSS_SMOOTH_WINDOW = 200
+LOSS_LOG_FLUSH_INTERVAL = 100
+
 
 def preprocess_gt_image(image_tensor, mask_top_rows=10, intensity_threshold=INTENSITY_THRESHOLD):
     """
@@ -338,6 +346,85 @@ def preprocess_gt_image(image_tensor, mask_top_rows=10, intensity_threshold=INTE
     gt[gt < threshold_normalized] = 0
 
     return gt
+
+
+def get_epoch_indices(num_frames, epoch_seed):
+    indices = list(range(num_frames))
+    random.Random(epoch_seed).shuffle(indices)
+    return indices
+
+
+def compute_bright_loss(rendered, gt_image, percentile=BRIGHT_PERCENTILE, min_pixels=BRIGHT_MIN_PIXELS):
+    gt_gray = gt_image.mean(dim=0)
+    diff_gray = (rendered - gt_image).abs().mean(dim=0)
+
+    threshold = torch.quantile(gt_gray, percentile / 100.0)
+    bright_mask = gt_gray >= threshold
+
+    if bright_mask.sum() < min_pixels:
+        bright_mask = gt_gray >= torch.quantile(gt_gray, 0.5)
+
+    return diff_gray[bright_mask].mean()
+
+
+class Tee:
+    def __init__(self, *streams):
+        self.streams = streams
+
+    def write(self, data):
+        for stream in self.streams:
+            stream.write(data)
+        self.flush()
+
+    def flush(self):
+        for stream in self.streams:
+            stream.flush()
+
+
+LOG_FILE = None
+LOSS_LOG_HANDLE = None
+LOSS_LOG_PATH = None
+
+
+def setup_logging(output_dir):
+    global LOG_FILE
+    log_path = os.path.join(output_dir, "run.log")
+    LOG_FILE = open(log_path, "w")
+    sys.stdout = Tee(sys.stdout, LOG_FILE)
+    sys.stderr = Tee(sys.stderr, LOG_FILE)
+    print(f"Logging to: {log_path}")
+    return log_path
+
+
+def init_loss_log(output_dir):
+    global LOSS_LOG_HANDLE, LOSS_LOG_PATH
+    LOSS_LOG_PATH = os.path.join(output_dir, "loss_log.csv")
+    LOSS_LOG_HANDLE = open(LOSS_LOG_PATH, "w")
+    LOSS_LOG_HANDLE.write("iter,stage,L1,SSIM,base_loss,bright_loss,total_loss,scale,num_points\n")
+    LOSS_LOG_HANDLE.flush()
+
+
+def log_loss(iteration, stage_name, l1_value, ssim_value, base_loss, bright_loss, total_loss,
+             scale_value, num_points):
+    if LOSS_LOG_HANDLE is None:
+        return
+
+    LOSS_LOG_HANDLE.write(
+        f"{iteration},{stage_name},{l1_value:.6f},{ssim_value:.6f},{base_loss:.6f},"
+        f"{bright_loss:.6f},{total_loss:.6f},{scale_value:.6f},{num_points}\n"
+    )
+
+    if LOSS_LOG_FLUSH_INTERVAL > 0 and iteration % LOSS_LOG_FLUSH_INTERVAL == 0:
+        LOSS_LOG_HANDLE.flush()
+
+
+def close_logs():
+    if LOSS_LOG_HANDLE is not None:
+        LOSS_LOG_HANDLE.flush()
+        LOSS_LOG_HANDLE.close()
+    if LOG_FILE is not None:
+        LOG_FILE.flush()
+        LOG_FILE.close()
 
 
 def extract_and_save_mesh(gaussians, mesh_cameras, pipe_args, bg_color,
@@ -467,6 +554,23 @@ def record_metrics(loss_value, scale_value, stage_name):
     metric_stage.append(stage_name)
 
 
+def smooth_series(values, window, x_values=None):
+    if not values:
+        return np.array([]), np.array([])
+
+    if x_values is None:
+        x_values = list(range(1, len(values) + 1))
+
+    window = max(1, min(window, len(values)))
+    if window == 1:
+        return np.array(values), np.array(x_values)
+
+    kernel = np.ones(window, dtype=np.float32) / window
+    smoothed = np.convolve(values, kernel, mode="valid")
+    x_smoothed = np.array(x_values[window - 1:])
+    return smoothed, x_smoothed
+
+
 def plot_training_metrics(output_dir, stage_boundaries):
     if not metric_iters:
         return
@@ -476,9 +580,17 @@ def plot_training_metrics(output_dir, stage_boundaries):
     axes[0].set_ylabel("Scale")
     axes[0].set_title("Scale Factor and Loss")
 
-    axes[1].plot(metric_iters, metric_loss, color="tab:orange", linewidth=1.5)
+    axes[1].plot(metric_iters, metric_loss, color="tab:orange", linewidth=1.0, alpha=0.4, label="Loss")
+
+    if LOSS_SMOOTH_WINDOW > 1:
+        smoothed_loss, smoothed_iters = smooth_series(metric_loss, LOSS_SMOOTH_WINDOW, metric_iters)
+        if smoothed_loss.size > 0:
+            axes[1].plot(smoothed_iters, smoothed_loss, color="tab:red", linewidth=2.0,
+                         label=f"Loss (MA {LOSS_SMOOTH_WINDOW})")
+
     axes[1].set_ylabel("Loss")
     axes[1].set_xlabel("Iteration")
+    axes[1].legend(loc="upper right")
 
     for boundary, label in stage_boundaries:
         axes[0].axvline(boundary, color="gray", linestyle="--", linewidth=0.8)
@@ -505,13 +617,13 @@ torch.cuda.manual_seed_all(SEED)
 # =============================================================================
 DATASET_PATH = "/home/gavin/ros2_ws/outputs/session_2025-12-08_16-35-13_sonar_data_for_2dgs"
 OUTPUT_DIR_BASE = "./output/debug_multiframe"
-NUM_TRAINING_FRAMES = 1  # Number of frames to use for training (TODO: increase to 500 for full run)
+NUM_TRAINING_FRAMES = 500  # Number of frames to use for training
 PYRAMID_DEPTH = 0.5
 
 # Curriculum learning parameters
 STAGE1_ITERATIONS = 0   # Learn scale only (surfels frozen) - DISABLED, using known scale=0.65
-STAGE2_ITERATIONS = 3000  # Learn surfels only (scale frozen)
-STAGE3_ITERATIONS = 50   # Joint fine-tuning
+STAGE2_ITERATIONS = 30000  # Learn surfels only (scale frozen)
+STAGE3_ITERATIONS = 1   # Joint fine-tuning
 
 # FOV-aware pruning: remove surfels that drift outside all training cameras' FOV
 FOV_PRUNE_INTERVAL = 100  # Prune every N iterations (0 to disable)
@@ -528,6 +640,10 @@ def get_next_output_dir(base_path):
 
 OUTPUT_DIR = get_next_output_dir(OUTPUT_DIR_BASE)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+setup_logging(OUTPUT_DIR)
+init_loss_log(OUTPUT_DIR)
+atexit.register(close_logs)
 
 print("=" * 60)
 print("DEBUG: Multi-Frame Training with Curriculum Learning")
@@ -863,10 +979,16 @@ if STAGE1_ITERATIONS > 0:
     print(f"STAGE 1: Learn scale factor only ({STAGE1_ITERATIONS} iterations)")
     print("=" * 60)
 
+    epoch_indices = get_epoch_indices(len(training_frames), SEED)
     for iteration in range(1, STAGE1_ITERATIONS + 1):
-        # Cycle through training frames
-        frame_idx = (iteration - 1) % len(training_frames)
+        # Shuffle frames per epoch
+        if (iteration - 1) % len(training_frames) == 0:
+            epoch_seed = SEED + (iteration - 1) // len(training_frames)
+            epoch_indices = get_epoch_indices(len(training_frames), epoch_seed)
+
+        frame_idx = epoch_indices[(iteration - 1) % len(training_frames)]
         viewpoint_cam = training_frames[frame_idx]
+
 
         # Get ground truth (with intensity thresholding)
         gt_image = preprocess_gt_image(viewpoint_cam.original_image)
@@ -891,7 +1013,9 @@ if STAGE1_ITERATIONS > 0:
         # Compute loss
         Ll1 = l1_loss(rendered, gt_image)
         ssim_val = ssim(rendered, gt_image)
-        loss = 0.8 * Ll1 + 0.2 * (1 - ssim_val)
+        base_loss = 0.8 * Ll1 + 0.2 * (1 - ssim_val)
+        bright_loss = compute_bright_loss(rendered, gt_image)
+        loss = (1 - BRIGHT_WEIGHT) * base_loss + BRIGHT_WEIGHT * bright_loss
 
         if iteration == 1:
             print(f"    loss.requires_grad: {loss.requires_grad}")
@@ -913,6 +1037,17 @@ if STAGE1_ITERATIONS > 0:
 
         scale_value = sonar_scale_factor.get_scale_value()
         record_metrics(loss.item(), scale_value, "stage1")
+        log_loss(
+            metric_step,
+            "stage1",
+            Ll1.item(),
+            ssim_val.item(),
+            base_loss.item(),
+            bright_loss.item(),
+            loss.item(),
+            scale_value,
+            len(gaussians.get_xyz)
+        )
 
         if iteration % 10 == 0 or iteration == 1:
             print(f"  Iter {iteration:3d}: L1={Ll1.item():.6f}, SSIM={ssim_val.item():.4f}, scale={scale_value:.4f}, grad={grad_val:.6f}")
@@ -950,9 +1085,14 @@ if STAGE2_ITERATIONS > 0:
     frozen_scale = sonar_scale_factor.get_scale_value()
     print(f"Scale factor frozen at: {frozen_scale:.6f}")
 
+    epoch_indices = get_epoch_indices(len(training_frames), SEED)
     for iteration in range(1, STAGE2_ITERATIONS + 1):
-        # Cycle through training frames
-        frame_idx = (iteration - 1) % len(training_frames)
+        # Shuffle frames per epoch
+        if (iteration - 1) % len(training_frames) == 0:
+            epoch_seed = SEED + (iteration - 1) // len(training_frames)
+            epoch_indices = get_epoch_indices(len(training_frames), epoch_seed)
+
+        frame_idx = epoch_indices[(iteration - 1) % len(training_frames)]
         viewpoint_cam = training_frames[frame_idx]
 
         # Get ground truth (with intensity thresholding)
@@ -970,7 +1110,9 @@ if STAGE2_ITERATIONS > 0:
         # Compute loss
         Ll1 = l1_loss(rendered, gt_image)
         ssim_val = ssim(rendered, gt_image)
-        loss = 0.8 * Ll1 + 0.2 * (1 - ssim_val)
+        base_loss = 0.8 * Ll1 + 0.2 * (1 - ssim_val)
+        bright_loss = compute_bright_loss(rendered, gt_image)
+        loss = (1 - BRIGHT_WEIGHT) * base_loss + BRIGHT_WEIGHT * bright_loss
 
         # Backward
         loss.backward()
@@ -989,6 +1131,17 @@ if STAGE2_ITERATIONS > 0:
 
         scale_value = sonar_scale_factor.get_scale_value()
         record_metrics(loss.item(), scale_value, "stage2")
+        log_loss(
+            metric_step,
+            "stage2",
+            Ll1.item(),
+            ssim_val.item(),
+            base_loss.item(),
+            bright_loss.item(),
+            loss.item(),
+            scale_value,
+            len(gaussians.get_xyz)
+        )
 
         if iteration % 10 == 0 or iteration == 1:
             print(f"  Iter {iteration:3d}: L1={Ll1.item():.6f}, SSIM={ssim_val.item():.4f}, scale={scale_value:.4f}, pts={len(gaussians.get_xyz)}")
@@ -1018,9 +1171,16 @@ if STAGE3_ITERATIONS > 0:
     # TODO: Re-enable scale learning once scale factor convergence is fixed
     sonar_scale_factor._log_scale.requires_grad = False
 
+    epoch_indices = get_epoch_indices(len(training_frames), SEED)
     for iteration in range(1, STAGE3_ITERATIONS + 1):
-        frame_idx = (iteration - 1) % len(training_frames)
+        # Shuffle frames per epoch
+        if (iteration - 1) % len(training_frames) == 0:
+            epoch_seed = SEED + (iteration - 1) // len(training_frames)
+            epoch_indices = get_epoch_indices(len(training_frames), epoch_seed)
+
+        frame_idx = epoch_indices[(iteration - 1) % len(training_frames)]
         viewpoint_cam = training_frames[frame_idx]
+
 
         gt_image = preprocess_gt_image(viewpoint_cam.original_image)
 
@@ -1034,7 +1194,9 @@ if STAGE3_ITERATIONS > 0:
 
         Ll1 = l1_loss(rendered, gt_image)
         ssim_val = ssim(rendered, gt_image)
-        loss = 0.8 * Ll1 + 0.2 * (1 - ssim_val)
+        base_loss = 0.8 * Ll1 + 0.2 * (1 - ssim_val)
+        bright_loss = compute_bright_loss(rendered, gt_image)
+        loss = (1 - BRIGHT_WEIGHT) * base_loss + BRIGHT_WEIGHT * bright_loss
 
         loss.backward()
 
@@ -1052,6 +1214,17 @@ if STAGE3_ITERATIONS > 0:
 
         scale_value = sonar_scale_factor.get_scale_value()
         record_metrics(loss.item(), scale_value, "stage3")
+        log_loss(
+            metric_step,
+            "stage3",
+            Ll1.item(),
+            ssim_val.item(),
+            base_loss.item(),
+            bright_loss.item(),
+            loss.item(),
+            scale_value,
+            len(gaussians.get_xyz)
+        )
 
         if iteration % 10 == 0 or iteration == 1:
             print(f"  Iter {iteration:3d}: L1={Ll1.item():.6f}, SSIM={ssim_val.item():.4f}, scale={scale_value:.4f}, pts={len(gaussians.get_xyz)}")
