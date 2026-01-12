@@ -314,12 +314,35 @@ def brighten_image(img_np, percentile=99, gamma=0.5):
 # Intensity threshold: pixels below this value (0-255 scale) are treated as black
 INTENSITY_THRESHOLD = 10  # out of 255
 
-# Bright-pixel loss settings (top-k brightest GT pixels)
-BRIGHT_PERCENTILE = 95.0
-BRIGHT_WEIGHT = 0.5
-BRIGHT_MIN_PIXELS = 32
+# =============================================================================
+# Peak-Aware Loss Parameters
+# =============================================================================
+# Log compression: J = log(1 + alpha * I_normalized)
+LOSS_ALPHA = 10.0           # Log compression factor
+LOSS_DELTA = 1e-6           # Normalization stability
+
+# Charbonnier robust penalty: rho(x) = sqrt(x^2 + eps^2)
+LOSS_EPSILON = 1e-3
+
+# Peak weighting: w(x) = 1 + beta * sigmoid((J_gt - tau) / s)
+LOSS_BETA_MAX = 20.0        # Peak weight boost (max weight = 1 + beta)
+LOSS_BETA_RAMP_ITERS = 2000 # Ramp beta from 0 to LOSS_BETA_MAX over this many iterations
+LOSS_SIGMOID_S = 0.08       # Sigmoid temperature
+LOSS_TAU_PERCENTILE = 0.97  # Threshold percentile for peak detection
+
+# DoG (Difference of Gaussians) blob loss - tuned for 1-2px dots
+LOSS_DOG_SIGMAS = [0.8, 1.6, 3.2]
+LOSS_DOG_K = 1.6
+LOSS_LAMBDA_BLOB = 0.5
+
+# KL distribution matching for peak recall
+LOSS_KL_GAMMA = 15.0        # Softmax temperature (higher = more top-k like)
+LOSS_KL_ETA = 1e-12         # Numerical stability
+LOSS_LAMBDA_KL = 0.1
+
+# Logging
 LOSS_SMOOTH_WINDOW = 200
-LOSS_LOG_FLUSH_INTERVAL = 100
+LOSS_LOG_FLUSH_INTERVAL = 1
 
 
 def preprocess_gt_image(image_tensor, mask_top_rows=10, intensity_threshold=INTENSITY_THRESHOLD):
@@ -354,17 +377,165 @@ def get_epoch_indices(num_frames, epoch_seed):
     return indices
 
 
-def compute_bright_loss(rendered, gt_image, percentile=BRIGHT_PERCENTILE, min_pixels=BRIGHT_MIN_PIXELS):
-    gt_gray = gt_image.mean(dim=0)
-    diff_gray = (rendered - gt_image).abs().mean(dim=0)
+# =============================================================================
+# Peak-Aware Loss Functions
+# =============================================================================
 
-    threshold = torch.quantile(gt_gray, percentile / 100.0)
-    bright_mask = gt_gray >= threshold
+def gaussian_blur_2d(x, sigma):
+    """Apply 2D Gaussian blur to tensor [C, H, W] or [H, W]."""
+    if x.dim() == 2:
+        x = x.unsqueeze(0).unsqueeze(0)  # [1, 1, H, W]
+        squeeze_back = True
+    elif x.dim() == 3:
+        x = x.unsqueeze(0)  # [1, C, H, W]
+        squeeze_back = False
+    else:
+        squeeze_back = False
 
-    if bright_mask.sum() < min_pixels:
-        bright_mask = gt_gray >= torch.quantile(gt_gray, 0.5)
+    # Kernel size = 6*sigma rounded up to odd
+    ksize = int(np.ceil(sigma * 6))
+    if ksize % 2 == 0:
+        ksize += 1
+    ksize = max(3, ksize)
 
-    return diff_gray[bright_mask].mean()
+    # Create 1D Gaussian kernel
+    coords = torch.arange(ksize, device=x.device, dtype=x.dtype) - ksize // 2
+    kernel_1d = torch.exp(-coords**2 / (2 * sigma**2))
+    kernel_1d = kernel_1d / kernel_1d.sum()
+
+    # Separable convolution
+    kernel_h = kernel_1d.view(1, 1, 1, -1)
+    kernel_v = kernel_1d.view(1, 1, -1, 1)
+
+    # Pad and convolve
+    pad_h = ksize // 2
+    pad_v = ksize // 2
+
+    C = x.shape[1]
+    # Expand kernel for all channels
+    kernel_h = kernel_h.expand(C, 1, 1, -1)
+    kernel_v = kernel_v.expand(C, 1, -1, 1)
+
+    x = torch.nn.functional.pad(x, (pad_h, pad_h, 0, 0), mode='reflect')
+    x = torch.nn.functional.conv2d(x, kernel_h, groups=C)
+    x = torch.nn.functional.pad(x, (0, 0, pad_v, pad_v), mode='reflect')
+    x = torch.nn.functional.conv2d(x, kernel_v, groups=C)
+
+    if squeeze_back:
+        x = x.squeeze(0).squeeze(0)
+    else:
+        x = x.squeeze(0)
+
+    return x
+
+
+def compute_dog(J, sigma, k=LOSS_DOG_K):
+    """Compute Difference of Gaussians at scale sigma."""
+    G_sigma = gaussian_blur_2d(J, sigma)
+    G_k_sigma = gaussian_blur_2d(J, k * sigma)
+    return G_sigma - G_k_sigma
+
+
+def compute_peak_aware_loss(rendered, gt_image, iteration, total_iterations):
+    """
+    Compute peak-aware loss with log compression, DoG blob loss, and KL distribution matching.
+
+    Args:
+        rendered: [C, H, W] predicted image (0-1 range)
+        gt_image: [C, H, W] ground truth image (0-1 range)
+        iteration: current training iteration (for beta ramping)
+        total_iterations: total iterations (for beta ramping schedule)
+
+    Returns:
+        total_loss, dict of individual loss components
+    """
+    # Work with grayscale (mean over channels)
+    I_gt = gt_image.mean(dim=0)      # [H, W]
+    I_pred = rendered.mean(dim=0)    # [H, W]
+
+    # Per-frame normalization (detach quantile computation)
+    with torch.no_grad():
+        c = torch.quantile(I_gt, 0.99)
+
+    I_gt_n = I_gt / (c + LOSS_DELTA)
+    I_pred_n = I_pred / (c + LOSS_DELTA)
+
+    # Log compression
+    J_gt = torch.log(1 + LOSS_ALPHA * I_gt_n)
+    J_pred = torch.log(1 + LOSS_ALPHA * I_pred_n)
+
+    # Threshold for peak detection (detached)
+    with torch.no_grad():
+        tau = torch.quantile(J_gt, LOSS_TAU_PERCENTILE)
+
+    # Beta ramping (0 -> LOSS_BETA_MAX over LOSS_BETA_RAMP_ITERS)
+    if iteration < LOSS_BETA_RAMP_ITERS:
+        beta = LOSS_BETA_MAX * (iteration / LOSS_BETA_RAMP_ITERS)
+    else:
+        beta = LOSS_BETA_MAX
+
+    # Peak weight: w(x) = 1 + beta * sigmoid((J_gt - tau) / s)
+    w = 1 + beta * torch.sigmoid((J_gt - tau) / LOSS_SIGMOID_S)
+
+    # Charbonnier penalty
+    diff = J_pred - J_gt
+    rho = torch.sqrt(diff**2 + LOSS_EPSILON**2)
+
+    # L_focal: weighted Charbonnier
+    L_focal = (w * rho).mean()
+
+    # L_blob: DoG multi-scale blob loss
+    L_blob_list = []
+    for sigma in LOSS_DOG_SIGMAS:
+        dog_gt = compute_dog(J_gt, sigma)
+        dog_pred = compute_dog(J_pred, sigma)
+        L_blob_list.append(torch.abs(dog_pred - dog_gt).mean())
+    L_blob = sum(L_blob_list) if L_blob_list else torch.zeros(1, device=rendered.device, requires_grad=True).squeeze()
+
+    # L_KL: masked peak distribution matching
+    # Mask: m(x) = sigmoid((J_gt - tau) / s)
+    with torch.no_grad():
+        m = torch.sigmoid((J_gt - tau) / LOSS_SIGMOID_S)
+
+    # Masked softmax distributions using numerically stable log-softmax
+    # Compute GT-related values with no_grad (they don't need gradients)
+    with torch.no_grad():
+        log_weights_gt = LOSS_KL_GAMMA * J_gt
+        mask_flat = m.flatten()
+        valid_region = mask_flat > 0.01  # regions with meaningful mask
+        num_valid = valid_region.sum().item()
+
+    if num_valid < 10:
+        # Not enough valid pixels for KL - return zero (no gradient contribution)
+        L_KL = torch.zeros(1, device=rendered.device).squeeze()
+    else:
+        # Pred-related values MUST be outside no_grad to preserve gradients
+        log_weights_pred = LOSS_KL_GAMMA * J_pred
+        log_m = torch.log(m.clamp(min=1e-10))
+
+        # Log-softmax for numerical stability: log(p) = logits - logsumexp(logits)
+        logits_gt = (log_weights_gt + log_m).flatten()[valid_region]
+        logits_pred = (log_weights_pred + log_m).flatten()[valid_region]
+
+        with torch.no_grad():
+            log_p = logits_gt - torch.logsumexp(logits_gt, dim=0)
+            p = torch.exp(log_p)  # GT distribution (detached)
+
+        log_q = logits_pred - torch.logsumexp(logits_pred, dim=0)
+
+        # KL = sum p * (log_p - log_q), p is detached
+        L_KL = (p * (log_p.detach() - log_q)).sum()
+
+    # Total loss
+    total_loss = L_focal + LOSS_LAMBDA_BLOB * L_blob + LOSS_LAMBDA_KL * L_KL
+
+    return total_loss, {
+        'L_focal': L_focal.item(),
+        'L_blob': L_blob.item(),
+        'L_KL': L_KL.item(),
+        'beta': beta,
+        'tau': tau.item()
+    }
 
 
 class Tee:
@@ -399,19 +570,19 @@ def setup_logging(output_dir):
 def init_loss_log(output_dir):
     global LOSS_LOG_HANDLE, LOSS_LOG_PATH
     LOSS_LOG_PATH = os.path.join(output_dir, "loss_log.csv")
-    LOSS_LOG_HANDLE = open(LOSS_LOG_PATH, "w")
-    LOSS_LOG_HANDLE.write("iter,stage,L1,SSIM,base_loss,bright_loss,total_loss,scale,num_points\n")
+    LOSS_LOG_HANDLE = open(LOSS_LOG_PATH, "w", buffering=1)
+    LOSS_LOG_HANDLE.write("iter,stage,L_focal,L_blob,L_KL,total_loss,beta,scale,num_points\n")
     LOSS_LOG_HANDLE.flush()
 
 
-def log_loss(iteration, stage_name, l1_value, ssim_value, base_loss, bright_loss, total_loss,
-             scale_value, num_points):
+def log_loss(iteration, stage_name, loss_components, total_loss, scale_value, num_points):
     if LOSS_LOG_HANDLE is None:
         return
 
     LOSS_LOG_HANDLE.write(
-        f"{iteration},{stage_name},{l1_value:.6f},{ssim_value:.6f},{base_loss:.6f},"
-        f"{bright_loss:.6f},{total_loss:.6f},{scale_value:.6f},{num_points}\n"
+        f"{iteration},{stage_name},{loss_components['L_focal']:.6f},{loss_components['L_blob']:.6f},"
+        f"{loss_components['L_KL']:.6f},{total_loss:.6f},{loss_components['beta']:.2f},"
+        f"{scale_value:.6f},{num_points}\n"
     )
 
     if LOSS_LOG_FLUSH_INTERVAL > 0 and iteration % LOSS_LOG_FLUSH_INTERVAL == 0:
@@ -1010,19 +1181,24 @@ if STAGE1_ITERATIONS > 0:
             print(f"    rendered.requires_grad: {rendered.requires_grad}")
             print(f"    rendered.grad_fn: {rendered.grad_fn}")
 
-        # Compute loss
-        Ll1 = l1_loss(rendered, gt_image)
-        ssim_val = ssim(rendered, gt_image)
-        base_loss = 0.8 * Ll1 + 0.2 * (1 - ssim_val)
-        bright_loss = compute_bright_loss(rendered, gt_image)
-        loss = (1 - BRIGHT_WEIGHT) * base_loss + BRIGHT_WEIGHT * bright_loss
+        # Compute loss (peak-aware)
+        total_iter_so_far = iteration  # Stage 1 iteration count
+        loss, loss_components = compute_peak_aware_loss(
+            rendered, gt_image, total_iter_so_far, STAGE1_ITERATIONS + STAGE2_ITERATIONS
+        )
 
         if iteration == 1:
             print(f"    loss.requires_grad: {loss.requires_grad}")
-            print(f"    loss.grad_fn: {loss.grad_fn}\n")
+            print(f"    loss.grad_fn: {loss.grad_fn}")
+            print(f"    L_focal={loss_components['L_focal']:.4f}, L_blob={loss_components['L_blob']:.4f}, L_KL={loss_components['L_KL']:.4f}\n")
 
         # Backward - only scale factor gets gradients (surfels frozen)
-        loss.backward()
+        # Skip if no gradients (no visible surfels)
+        if loss.requires_grad:
+            loss.backward()
+        else:
+            if iteration % 100 == 0:
+                print(f"  [Warning] Iter {iteration}: No visible surfels for frame, skipping backward")
 
         # Debug: Check scale factor gradient BEFORE optimizer step
         scale_grad = sonar_scale_factor._log_scale.grad
@@ -1037,20 +1213,10 @@ if STAGE1_ITERATIONS > 0:
 
         scale_value = sonar_scale_factor.get_scale_value()
         record_metrics(loss.item(), scale_value, "stage1")
-        log_loss(
-            metric_step,
-            "stage1",
-            Ll1.item(),
-            ssim_val.item(),
-            base_loss.item(),
-            bright_loss.item(),
-            loss.item(),
-            scale_value,
-            len(gaussians.get_xyz)
-        )
+        log_loss(metric_step, "stage1", loss_components, loss.item(), scale_value, len(gaussians.get_xyz))
 
         if iteration % 10 == 0 or iteration == 1:
-            print(f"  Iter {iteration:3d}: L1={Ll1.item():.6f}, SSIM={ssim_val.item():.4f}, scale={scale_value:.4f}, grad={grad_val:.6f}")
+            print(f"  Iter {iteration:3d}: L_focal={loss_components['L_focal']:.4f}, L_blob={loss_components['L_blob']:.4f}, scale={scale_value:.4f}, grad={grad_val:.6f}")
 
         # Extract mesh after iteration 1
         if iteration == 1:
@@ -1107,15 +1273,19 @@ if STAGE2_ITERATIONS > 0:
         )
         rendered = render_pkg["render"]
 
-        # Compute loss
-        Ll1 = l1_loss(rendered, gt_image)
-        ssim_val = ssim(rendered, gt_image)
-        base_loss = 0.8 * Ll1 + 0.2 * (1 - ssim_val)
-        bright_loss = compute_bright_loss(rendered, gt_image)
-        loss = (1 - BRIGHT_WEIGHT) * base_loss + BRIGHT_WEIGHT * bright_loss
+        # Compute loss (peak-aware)
+        total_iter_so_far = STAGE1_ITERATIONS + iteration
+        loss, loss_components = compute_peak_aware_loss(
+            rendered, gt_image, total_iter_so_far, STAGE1_ITERATIONS + STAGE2_ITERATIONS
+        )
 
-        # Backward
-        loss.backward()
+        # Backward - skip if no gradients (no visible surfels for this frame)
+        if loss.requires_grad:
+            loss.backward()
+        else:
+            # No visible surfels, skip this iteration
+            if iteration % 100 == 0:
+                print(f"  [Warning] Iter {iteration}: No visible surfels for frame, skipping backward")
 
         # Update surfels only
         with torch.no_grad():
@@ -1131,20 +1301,10 @@ if STAGE2_ITERATIONS > 0:
 
         scale_value = sonar_scale_factor.get_scale_value()
         record_metrics(loss.item(), scale_value, "stage2")
-        log_loss(
-            metric_step,
-            "stage2",
-            Ll1.item(),
-            ssim_val.item(),
-            base_loss.item(),
-            bright_loss.item(),
-            loss.item(),
-            scale_value,
-            len(gaussians.get_xyz)
-        )
+        log_loss(metric_step, "stage2", loss_components, loss.item(), scale_value, len(gaussians.get_xyz))
 
         if iteration % 10 == 0 or iteration == 1:
-            print(f"  Iter {iteration:3d}: L1={Ll1.item():.6f}, SSIM={ssim_val.item():.4f}, scale={scale_value:.4f}, pts={len(gaussians.get_xyz)}")
+            print(f"  Iter {iteration:3d}: L_focal={loss_components['L_focal']:.4f}, L_blob={loss_components['L_blob']:.4f}, L_KL={loss_components['L_KL']:.4f}, scale={scale_value:.4f}, pts={len(gaussians.get_xyz)}")
 
     print(f"Stage 2 complete. Surfels: {len(gaussians.get_xyz)}")
 
@@ -1192,13 +1352,18 @@ if STAGE3_ITERATIONS > 0:
         )
         rendered = render_pkg["render"]
 
-        Ll1 = l1_loss(rendered, gt_image)
-        ssim_val = ssim(rendered, gt_image)
-        base_loss = 0.8 * Ll1 + 0.2 * (1 - ssim_val)
-        bright_loss = compute_bright_loss(rendered, gt_image)
-        loss = (1 - BRIGHT_WEIGHT) * base_loss + BRIGHT_WEIGHT * bright_loss
+        # Compute loss (peak-aware)
+        total_iter_so_far = STAGE1_ITERATIONS + STAGE2_ITERATIONS + iteration
+        loss, loss_components = compute_peak_aware_loss(
+            rendered, gt_image, total_iter_so_far, STAGE1_ITERATIONS + STAGE2_ITERATIONS + STAGE3_ITERATIONS
+        )
 
-        loss.backward()
+        # Backward - skip if no gradients (no visible surfels)
+        if loss.requires_grad:
+            loss.backward()
+        else:
+            if iteration % 100 == 0:
+                print(f"  [Warning] Iter {iteration}: No visible surfels for frame, skipping backward")
 
         with torch.no_grad():
             gaussians.optimizer.step()
@@ -1214,20 +1379,10 @@ if STAGE3_ITERATIONS > 0:
 
         scale_value = sonar_scale_factor.get_scale_value()
         record_metrics(loss.item(), scale_value, "stage3")
-        log_loss(
-            metric_step,
-            "stage3",
-            Ll1.item(),
-            ssim_val.item(),
-            base_loss.item(),
-            bright_loss.item(),
-            loss.item(),
-            scale_value,
-            len(gaussians.get_xyz)
-        )
+        log_loss(metric_step, "stage3", loss_components, loss.item(), scale_value, len(gaussians.get_xyz))
 
         if iteration % 10 == 0 or iteration == 1:
-            print(f"  Iter {iteration:3d}: L1={Ll1.item():.6f}, SSIM={ssim_val.item():.4f}, scale={scale_value:.4f}, pts={len(gaussians.get_xyz)}")
+            print(f"  Iter {iteration:3d}: L_focal={loss_components['L_focal']:.4f}, L_blob={loss_components['L_blob']:.4f}, L_KL={loss_components['L_KL']:.4f}, scale={scale_value:.4f}, pts={len(gaussians.get_xyz)}")
 
     print(f"Stage 3 complete. Surfels: {len(gaussians.get_xyz)}")
 

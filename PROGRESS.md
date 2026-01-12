@@ -220,6 +220,121 @@ scale=2.0: L1=0.031900, SSIM=0.5307
 - Added bright-pixel loss (top-k brightest GT pixels) with tunable `BRIGHT_PERCENTILE`, `BRIGHT_WEIGHT`, `BRIGHT_MIN_PIXELS` in `debug_multiframe.py` to preserve small bright dots; base loss remains `0.8*L1 + 0.2*(1-SSIM)` for blending.
 - Loss alternatives noted for trial: intensity-weighted L1, top-k bright-pixel loss (implemented), reduced/disabled SSIM, and blended base+bright losses.
 
+## Session Notes (2026-01-12 continued) - Peak-Aware Loss Design
+
+### Problem
+Thin-leg bright dots from calibration cube are missing in outputs. Need a better loss function that preserves small bright features.
+
+### Proposed Loss (from external LLM consultation)
+
+**Log-compressed intensity** (per-frame 99th percentile normalization):
+```
+c = percentile(I_gt, 99)  # per-frame, detached
+I_n = I / (c + delta)
+J = log(1 + alpha * I_n)   # alpha=10
+```
+
+**Peak-aware weighted photometric loss (L_focal)**:
+- Charbonnier penalty: `rho(x) = sqrt(x^2 + eps^2)`, eps=1e-3
+- Peak weight: `w(x) = 1 + beta * sigmoid((J_gt - tau) / s)`
+- tau = 97-99th percentile of J_gt, s=0.08, beta=20 (ramp from 0)
+- `L_focal = E[w(x) * rho(J_pred - J_gt)]`
+
+**Multi-scale blob loss (DoG)**:
+- Scales: Sigma = {0.8, 1.6, 3.2} for 1-2px dots (or {1, 2, 4} for 2-3px)
+- k = 1.6
+- `L_blob = sum_sigma |DoG_sigma(J_pred) - DoG_sigma(J_gt)|_1`
+
+**Peak-recall via distribution matching (KL)**:
+- Softmax heatmaps: `p(x) = exp(gamma * J_gt) / sum`, gamma in [5,20]
+- `L_KL = sum p(x) * log(p(x)/q(x))`
+- Helps when model misses small dots entirely
+
+**Total**: `L = L_focal + lambda_blob * L_blob + lambda_KL * L_KL`
+- lambda_blob = 0.5, lambda_KL = 0.1
+
+**Skip L_size**: Renderer uses fixed 2x2 bilinear splats regardless of 3D scale.
+
+### Sonar Data Analysis (for loss tuning)
+
+**Q1: Pixel radius of leg dots?**
+- Measured: median ~1.6px, range 0.6-6.5px
+- User correction: actual leg dots are **2-3 pixels**
+- Implementation: Sigma = {0.8, 1.6, 3.2} (smaller scales for tighter matching)
+
+**Q2: Forward model - additive or alpha compositing?**
+- **Additive intensity** via `scatter_add_()` - intensities summed directly
+
+**Q3: Frames normalized?**
+- **Not normalized** - raw from sensor
+- Max intensity varies 81-112, 99th percentile 37-42
+- Per-frame 99th percentile normalization recommended
+
+**Q4: Resolution alignment?**
+- **Same resolution** - render_sonar outputs 200x256 (same as raw)
+
+**Q5: Range-dependent gain/attenuation?**
+- Initially appeared to have range-dependent intensity
+- **Actually scene geometry, not sensor artifact**:
+  - Near range (0.2-0.5m): Transducer backscatter/noise (masked with top 10 rows)
+  - Mid range (0.76-2.45m): Empty water - nothing to reflect
+  - Far range (2.45-3.0m): Actual scene content (floor, cube legs)
+- **No range weighting correction needed**
+
+**Q6: Saturation/clamping?**
+- **No saturation** - max values 87-115, nowhere near 255
+
+### Implementation (2026-01-12)
+
+Implemented peak-aware loss in `debug_multiframe.py`:
+
+**Parameters:**
+```python
+LOSS_ALPHA = 10.0           # Log compression
+LOSS_DELTA = 1e-6           # Normalization stability
+LOSS_EPSILON = 1e-3         # Charbonnier smoothing
+LOSS_BETA_MAX = 20.0        # Peak weight boost (ramped 0→20)
+LOSS_BETA_RAMP_ITERS = 2000
+LOSS_SIGMOID_S = 0.08       # Sigmoid temperature
+LOSS_TAU_PERCENTILE = 0.97  # Peak threshold
+LOSS_DOG_SIGMAS = [0.8, 1.6, 3.2]  # DoG scales for 1-2px dots
+LOSS_DOG_K = 1.6
+LOSS_LAMBDA_BLOB = 0.5
+LOSS_KL_GAMMA = 15.0        # KL softmax temperature
+LOSS_KL_ETA = 1e-12
+LOSS_LAMBDA_KL = 0.1
+```
+
+**Functions added:**
+- `gaussian_blur_2d(x, sigma)` - Separable Gaussian blur
+- `compute_dog(J, sigma, k)` - Difference of Gaussians
+- `compute_peak_aware_loss(rendered, gt_image, iteration, total_iterations)` - Main loss
+
+**Loss composition:**
+- L_focal: Peak-weighted Charbonnier loss in log-intensity space
+- L_blob: Multi-scale DoG blob matching
+- L_KL: Masked peak distribution matching (KL divergence)
+- Total: L = L_focal + 0.5*L_blob + 0.1*L_KL
+
+### Bug Fixes (2026-01-12)
+
+**L_KL NaN Issue:**
+- Root cause: `exp(gamma * J)` overflow and `log(0)` in KL divergence
+- Fix: Use numerically stable log-softmax computation
+- Added `valid_region` mask to skip pixels with near-zero mask weight
+
+**Gradient Error ("element 0 does not require grad"):**
+- Root cause: When no surfels visible in FOV, rendered tensor has no grad_fn
+- Fix: Check `loss.requires_grad` before calling `backward()`, skip if False
+
+**L_blob Gradient Issue:**
+- Root cause: `torch.tensor(0.0)` created without requires_grad
+- Fix: Accumulate losses in a list and use `sum()` for proper gradient flow
+
+**L_KL Gradient Flow:**
+- Root cause: Computing `log_weights_pred` inside `torch.no_grad()` block
+- Fix: Only detach GT-related computations, keep pred path differentiable
+
 ---
 
 ## References
@@ -231,4 +346,4 @@ scale=2.0: L1=0.031900, SSIM=0.5307
 
 ---
 
-*Last updated: 2025-01-10*
+*Last updated: 2026-01-12*
