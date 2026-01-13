@@ -306,6 +306,9 @@ class GaussianModel:
         self.denom = self.denom[valid_points_mask]
         self.max_radii2D = self.max_radii2D[valid_points_mask]
 
+        if hasattr(self, "peak_support"):
+            self.peak_support = self.peak_support[valid_points_mask]
+
     def cat_tensors_to_optimizer(self, tensors_dict):
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
@@ -347,6 +350,10 @@ class GaussianModel:
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+
+        if hasattr(self, "peak_support"):
+            new_support = torch.zeros((new_xyz.shape[0],), device=self.peak_support.device)
+            self.peak_support = torch.cat([self.peak_support, new_support], dim=0)
 
     def densify_and_split(self, grads, grad_threshold, scene_extent, N=2):
         n_init_points = self.get_xyz.shape[0]
@@ -397,6 +404,21 @@ class GaussianModel:
         self.densify_and_split(grads, max_grad, extent)
 
         prune_mask = (self.get_opacity < min_opacity).squeeze()
+        if hasattr(self, "peak_support"):
+            support_min = getattr(self, "peak_support_min", None)
+            grad_min = getattr(self, "peak_support_grad_min", None)
+            if support_min is None:
+                prune_mask = torch.zeros_like(prune_mask)
+            else:
+                grad_norm = torch.norm(grads, dim=-1)
+                if grad_norm.shape[0] != prune_mask.shape[0]:
+                    pad_len = prune_mask.shape[0] - grad_norm.shape[0]
+                    if pad_len > 0:
+                        grad_norm = torch.cat([grad_norm, torch.zeros(pad_len, device=grad_norm.device)], dim=0)
+                if grad_min is not None:
+                    prune_mask = prune_mask & (self.peak_support < support_min) & (grad_norm < grad_min)
+                else:
+                    prune_mask = prune_mask & (self.peak_support < support_min)
         if max_screen_size:
             big_points_vs = self.max_radii2D > max_screen_size
             big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent

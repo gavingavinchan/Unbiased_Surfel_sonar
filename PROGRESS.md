@@ -316,24 +316,53 @@ LOSS_LAMBDA_KL = 0.1
 - L_KL: Masked peak distribution matching (KL divergence)
 - Total: L = L_focal + 0.5*L_blob + 0.1*L_KL
 
-### Bug Fixes (2026-01-12)
+### Revised Loss Function (2026-01-12)
 
-**L_KL NaN Issue:**
-- Root cause: `exp(gamma * J)` overflow and `log(0)` in KL divergence
-- Fix: Use numerically stable log-softmax computation
-- Added `valid_region` mask to skip pixels with near-zero mask weight
+Updated loss to address collapse issues. New formulation:
 
-**Gradient Error ("element 0 does not require grad"):**
-- Root cause: When no surfels visible in FOV, rendered tensor has no grad_fn
-- Fix: Check `loss.requires_grad` before calling `backward()`, skip if False
+**Loss terms:**
+- `L_pos = mean(m * charbonnier(J_pred - J_gt))` - Peak-only photometric (no 1+βm baseline)
+- `L_neg = mean((1-m) * charbonnier(relu(J_pred - J_gt)))` - One-sided background overshoot penalty
+- `L_blob` - GT-weighted DoG blob matching
+- `L_KL` - Masked peak distribution KL divergence
+- `L_mass = |M_pred - M_gt|` where `M = sum(m * J)` - Peak mass constraint
 
-**L_blob Gradient Issue:**
-- Root cause: `torch.tensor(0.0)` created without requires_grad
-- Fix: Accumulate losses in a list and use `sum()` for proper gradient flow
+**Total:** `L = L_pos + 0.01*L_neg + 0.5*L_blob + 0.1*L_KL + 0.1*L_mass`
 
-**L_KL Gradient Flow:**
-- Root cause: Computing `log_weights_pred` inside `torch.no_grad()` block
-- Fix: Only detach GT-related computations, keep pred path differentiable
+**Anti-collapse measures:**
+- Stabilization phase (5k iters): disable pruning, reduce opacity LR to 5e-3
+- Peak-gated opacity pruning: only prune if `(opacity < min) AND (peak_support < 0.05) AND (grad < 1e-4)`
+- Peak support EMA updated every 10 iters via bilinear sampling from peak mask
+- `torch.cuda.empty_cache()` every 100 iters to prevent OOM
+
+### Training Results (v44, 2026-01-12)
+
+**Configuration:** 500 frames, 30k iterations Stage 2, scale fixed at 0.65
+
+**Loss convergence:**
+| Iter | total_loss | L_mass | M_pred/M_gt |
+|------|------------|--------|-------------|
+| 1 | 1464 | 14476 | 12.9x |
+| 5000 | 53.7 | 470 | 0.53x |
+| 20000 | 11.5 | 9.4 | 0.96x |
+| 30000 | 0.57 | 0.15 | 1.00x |
+
+**Opacity stats at end:** mean=0.062, median=6e-5, 66% surfels have opacity < 1e-3
+
+**Observations:**
+1. Loss converged well (1464 → 0.57)
+2. Peak mass preserved (M_pred ≈ M_gt at end)
+3. First signs of vertical cube legs appearing in mesh
+4. **Issues:**
+   - Vertical legs in wrong positions (not in square formation)
+   - No horizontal legs visible (likely physics - parallel to sonar beam)
+   - Too many false positives in rendered sonar frames
+   - 66% of surfels effectively "dead" but not pruned
+
+**Next steps to try:**
+1. Check `sonar_init_points.ply` - if cube wrong there, issue is upstream (poses/projection)
+2. Increase `LOSS_LAMBDA_NEG` from 0.01 to 0.05 to reduce false positives
+3. Reduce `PEAK_SUPPORT_MIN` from 0.05 to 0.02 to prune more dead surfels
 
 ---
 
@@ -346,4 +375,4 @@ LOSS_LAMBDA_KL = 0.1
 
 ---
 
-*Last updated: 2026-01-12*
+*Last updated: 2026-01-13*

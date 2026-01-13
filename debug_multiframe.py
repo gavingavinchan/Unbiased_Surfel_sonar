@@ -324,15 +324,17 @@ LOSS_DELTA = 1e-6           # Normalization stability
 # Charbonnier robust penalty: rho(x) = sqrt(x^2 + eps^2)
 LOSS_EPSILON = 1e-3
 
-# Peak weighting: w(x) = 1 + beta * sigmoid((J_gt - tau) / s)
-LOSS_BETA_MAX = 20.0        # Peak weight boost (max weight = 1 + beta)
-LOSS_BETA_RAMP_ITERS = 2000 # Ramp beta from 0 to LOSS_BETA_MAX over this many iterations
+# Peak mask: m(x) = sigmoid((J_gt - tau) / s)
 LOSS_SIGMOID_S = 0.08       # Sigmoid temperature
-LOSS_TAU_PERCENTILE = 0.97  # Threshold percentile for peak detection
+LOSS_TAU_PERCENTILE = 0.97  # Threshold percentile for peak detection (log-space)
+
+# One-sided negative penalty on background overshoot
+LOSS_LAMBDA_NEG = 0.01
 
 # DoG (Difference of Gaussians) blob loss - tuned for 1-2px dots
 LOSS_DOG_SIGMAS = [0.8, 1.6, 3.2]
 LOSS_DOG_K = 1.6
+LOSS_DOG_WEIGHT_EPS = 1e-12
 LOSS_LAMBDA_BLOB = 0.5
 
 # KL distribution matching for peak recall
@@ -340,7 +342,17 @@ LOSS_KL_GAMMA = 15.0        # Softmax temperature (higher = more top-k like)
 LOSS_KL_ETA = 1e-12         # Numerical stability
 LOSS_LAMBDA_KL = 0.1
 
+# Peak-mass constraint
+LOSS_LAMBDA_MASS = 0.1
+
+# Peak-support EMA (for pruning)
+PEAK_SUPPORT_EMA = 0.02
+PEAK_SUPPORT_MIN = 0.05
+PEAK_SUPPORT_GRAD_MIN = 1e-4
+PEAK_SUPPORT_UPDATE_INTERVAL = 10
+
 # Logging
+
 LOSS_SMOOTH_WINDOW = 200
 LOSS_LOG_FLUSH_INTERVAL = 1
 
@@ -438,13 +450,14 @@ def compute_dog(J, sigma, k=LOSS_DOG_K):
 
 def compute_peak_aware_loss(rendered, gt_image, iteration, total_iterations):
     """
-    Compute peak-aware loss with log compression, DoG blob loss, and KL distribution matching.
+    Peak-aware loss with peak-only photometric term, weak background overshoot,
+    DoG blob matching, masked KL, and peak-mass constraint.
 
     Args:
         rendered: [C, H, W] predicted image (0-1 range)
         gt_image: [C, H, W] ground truth image (0-1 range)
-        iteration: current training iteration (for beta ramping)
-        total_iterations: total iterations (for beta ramping schedule)
+        iteration: current training iteration
+        total_iterations: total iterations (unused, kept for call compatibility)
 
     Returns:
         total_loss, dict of individual loss components
@@ -461,81 +474,165 @@ def compute_peak_aware_loss(rendered, gt_image, iteration, total_iterations):
     I_pred_n = I_pred / (c + LOSS_DELTA)
 
     # Log compression
-    J_gt = torch.log(1 + LOSS_ALPHA * I_gt_n)
-    J_pred = torch.log(1 + LOSS_ALPHA * I_pred_n)
+    J_gt = torch.log1p(LOSS_ALPHA * I_gt_n)
+    J_pred = torch.log1p(LOSS_ALPHA * I_pred_n)
 
-    # Threshold for peak detection (detached)
+    # Peak mask in log space (detached)
     with torch.no_grad():
         tau = torch.quantile(J_gt, LOSS_TAU_PERCENTILE)
-
-    # Beta ramping (0 -> LOSS_BETA_MAX over LOSS_BETA_RAMP_ITERS)
-    if iteration < LOSS_BETA_RAMP_ITERS:
-        beta = LOSS_BETA_MAX * (iteration / LOSS_BETA_RAMP_ITERS)
-    else:
-        beta = LOSS_BETA_MAX
-
-    # Peak weight: w(x) = 1 + beta * sigmoid((J_gt - tau) / s)
-    w = 1 + beta * torch.sigmoid((J_gt - tau) / LOSS_SIGMOID_S)
+        m = torch.sigmoid((J_gt - tau) / LOSS_SIGMOID_S)
 
     # Charbonnier penalty
     diff = J_pred - J_gt
     rho = torch.sqrt(diff**2 + LOSS_EPSILON**2)
 
-    # L_focal: weighted Charbonnier
-    L_focal = (w * rho).mean()
+    # Peak-only positive term
+    L_pos = (m * rho).mean()
 
-    # L_blob: DoG multi-scale blob loss
+    # Very weak one-sided negative (overshoot only)
+    relu_diff = torch.relu(diff)
+    rho_neg = torch.sqrt(relu_diff**2 + LOSS_EPSILON**2)
+    L_neg = ((1 - m) * rho_neg).mean()
+
+    # DoG multi-scale blob loss (weighted by GT bandpass energy)
     L_blob_list = []
     for sigma in LOSS_DOG_SIGMAS:
         dog_gt = compute_dog(J_gt, sigma)
         dog_pred = compute_dog(J_pred, sigma)
-        L_blob_list.append(torch.abs(dog_pred - dog_gt).mean())
-    L_blob = sum(L_blob_list) if L_blob_list else torch.zeros(1, device=rendered.device, requires_grad=True).squeeze()
+        with torch.no_grad():
+            denom = torch.quantile(dog_gt.abs(), 0.99) + LOSS_DOG_WEIGHT_EPS
+            weight = torch.clamp(dog_gt.abs() / denom, 0.0, 1.0)
+        L_blob_list.append((weight * (dog_pred - dog_gt).abs()).mean())
+    L_blob = sum(L_blob_list) if L_blob_list else torch.zeros(1, device=rendered.device).squeeze()
 
-    # L_KL: masked peak distribution matching
-    # Mask: m(x) = sigmoid((J_gt - tau) / s)
+    # Masked peak distribution KL
     with torch.no_grad():
-        m = torch.sigmoid((J_gt - tau) / LOSS_SIGMOID_S)
-
-    # Masked softmax distributions using numerically stable log-softmax
-    # Compute GT-related values with no_grad (they don't need gradients)
-    with torch.no_grad():
-        log_weights_gt = LOSS_KL_GAMMA * J_gt
         mask_flat = m.flatten()
-        valid_region = mask_flat > 0.01  # regions with meaningful mask
+        valid_region = mask_flat > 0.01
         num_valid = valid_region.sum().item()
 
     if num_valid < 10:
-        # Not enough valid pixels for KL - return zero (no gradient contribution)
         L_KL = torch.zeros(1, device=rendered.device).squeeze()
     else:
-        # Pred-related values MUST be outside no_grad to preserve gradients
-        log_weights_pred = LOSS_KL_GAMMA * J_pred
-        log_m = torch.log(m.clamp(min=1e-10))
-
-        # Log-softmax for numerical stability: log(p) = logits - logsumexp(logits)
-        logits_gt = (log_weights_gt + log_m).flatten()[valid_region]
-        logits_pred = (log_weights_pred + log_m).flatten()[valid_region]
+        log_m = torch.log(mask_flat[valid_region].clamp(min=1e-10))
+        logits_gt = LOSS_KL_GAMMA * J_gt.flatten()[valid_region] + log_m
+        logits_pred = LOSS_KL_GAMMA * J_pred.flatten()[valid_region] + log_m
 
         with torch.no_grad():
-            log_p = logits_gt - torch.logsumexp(logits_gt, dim=0)
-            p = torch.exp(log_p)  # GT distribution (detached)
+            log_denom_gt = torch.logaddexp(
+                torch.logsumexp(logits_gt, dim=0),
+                torch.log(torch.tensor(LOSS_KL_ETA, device=logits_gt.device, dtype=logits_gt.dtype))
+            )
+            log_p = logits_gt - log_denom_gt
+            p = torch.exp(log_p)
 
-        log_q = logits_pred - torch.logsumexp(logits_pred, dim=0)
+        log_denom_pred = torch.logaddexp(
+            torch.logsumexp(logits_pred, dim=0),
+            torch.log(torch.tensor(LOSS_KL_ETA, device=logits_pred.device, dtype=logits_pred.dtype))
+        )
+        log_q = logits_pred - log_denom_pred
 
-        # KL = sum p * (log_p - log_q), p is detached
-        L_KL = (p * (log_p.detach() - log_q)).sum()
+        L_KL = (p * (log_p - log_q)).sum()
 
-    # Total loss
-    total_loss = L_focal + LOSS_LAMBDA_BLOB * L_blob + LOSS_LAMBDA_KL * L_KL
+    # Peak-mass constraint
+    M_gt = (m * J_gt).sum()
+    M_pred = (m * J_pred).sum()
+    L_mass = torch.abs(M_pred - M_gt)
+
+    total_loss = (
+        L_pos
+        + LOSS_LAMBDA_NEG * L_neg
+        + LOSS_LAMBDA_BLOB * L_blob
+        + LOSS_LAMBDA_KL * L_KL
+        + LOSS_LAMBDA_MASS * L_mass
+    )
+
+    mask_frac = (m > 0.5).float().mean()
 
     return total_loss, {
-        'L_focal': L_focal.item(),
+        'L_pos': L_pos.item(),
+        'L_neg': L_neg.item(),
         'L_blob': L_blob.item(),
         'L_KL': L_KL.item(),
-        'beta': beta,
-        'tau': tau.item()
-    }
+        'L_mass': L_mass.item(),
+        'tau': tau.item(),
+        'mask_frac': mask_frac.item(),
+        'M_gt': M_gt.item(),
+        'M_pred': M_pred.item()
+    }, m
+
+
+def project_sonar_pixels(gaussians, camera, sonar_config, scale_factor):
+    w2c = camera.world_view_transform.cuda()
+    R_w2v = w2c[:3, :3]
+    t_w2v = w2c[3, :3]
+    t_w2v_scaled = scale_factor.scale * t_w2v
+
+    points_sonar = (gaussians.get_xyz @ R_w2v.T) + t_w2v_scaled
+    right = points_sonar[:, 0]
+    down = points_sonar[:, 1]
+    forward = points_sonar[:, 2]
+
+    azimuth = -torch.atan2(right, forward)
+    range_vals = torch.sqrt(right**2 + down**2 + forward**2)
+    elevation = torch.atan2(down, torch.sqrt(right**2 + forward**2))
+
+    valid_azimuth = torch.abs(azimuth) <= sonar_config.half_azimuth_rad
+    valid_elevation = torch.abs(elevation) <= sonar_config.half_elevation_rad
+    valid_range = (range_vals >= sonar_config.range_min) & (range_vals <= sonar_config.range_max)
+    center_in_fov = valid_azimuth & valid_elevation & valid_range & (forward > 0)
+
+    scaling = gaussians.get_scaling
+    surfel_radius = scaling.max(dim=1).values
+    margin = compute_fov_margin_debug(range_vals, azimuth, elevation, sonar_config)
+    in_fov = center_in_fov & (margin > surfel_radius)
+
+    H = camera.image_height
+    W = camera.image_width
+    col = (-azimuth / sonar_config.half_azimuth_rad + 1) * (W / 2)
+    row = (range_vals - sonar_config.range_min) / (sonar_config.range_max - sonar_config.range_min) * H
+
+    col = torch.clamp(col, 0, W - 1)
+    row = torch.clamp(row, 0, H - 1)
+
+    return col, row, in_fov
+
+
+def bilinear_sample_mask(mask, col, row):
+    H, W = mask.shape
+    col_floor = col.floor().long()
+    row_floor = row.floor().long()
+    col_ceil = (col_floor + 1).clamp(max=W - 1)
+    row_ceil = (row_floor + 1).clamp(max=H - 1)
+
+    col_frac = col - col_floor.float()
+    row_frac = row - row_floor.float()
+
+    w00 = (1 - col_frac) * (1 - row_frac)
+    w01 = (1 - col_frac) * row_frac
+    w10 = col_frac * (1 - row_frac)
+    w11 = col_frac * row_frac
+
+    v00 = mask[row_floor, col_floor]
+    v01 = mask[row_ceil, col_floor]
+    v10 = mask[row_floor, col_ceil]
+    v11 = mask[row_ceil, col_ceil]
+
+    return w00 * v00 + w01 * v01 + w10 * v10 + w11 * v11
+
+
+@torch.no_grad()
+def update_peak_support(gaussians, camera, sonar_config, scale_factor, peak_mask):
+    if not hasattr(gaussians, "peak_support"):
+        gaussians.peak_support = torch.zeros(len(gaussians.get_xyz), device=peak_mask.device)
+
+    col, row, in_fov = project_sonar_pixels(gaussians, camera, sonar_config, scale_factor)
+    sampled = bilinear_sample_mask(peak_mask, col, row)
+
+    update_mask = in_fov
+    if update_mask.any():
+        updated = (1 - PEAK_SUPPORT_EMA) * gaussians.peak_support + PEAK_SUPPORT_EMA * sampled
+        gaussians.peak_support = torch.where(update_mask, updated, gaussians.peak_support)
 
 
 class Tee:
@@ -571,7 +668,9 @@ def init_loss_log(output_dir):
     global LOSS_LOG_HANDLE, LOSS_LOG_PATH
     LOSS_LOG_PATH = os.path.join(output_dir, "loss_log.csv")
     LOSS_LOG_HANDLE = open(LOSS_LOG_PATH, "w", buffering=1)
-    LOSS_LOG_HANDLE.write("iter,stage,L_focal,L_blob,L_KL,total_loss,beta,scale,num_points\n")
+    LOSS_LOG_HANDLE.write(
+        "iter,stage,L_pos,L_neg,L_blob,L_KL,L_mass,total_loss,mask_frac,M_gt,M_pred,scale,num_points\n"
+    )
     LOSS_LOG_HANDLE.flush()
 
 
@@ -580,13 +679,37 @@ def log_loss(iteration, stage_name, loss_components, total_loss, scale_value, nu
         return
 
     LOSS_LOG_HANDLE.write(
-        f"{iteration},{stage_name},{loss_components['L_focal']:.6f},{loss_components['L_blob']:.6f},"
-        f"{loss_components['L_KL']:.6f},{total_loss:.6f},{loss_components['beta']:.2f},"
-        f"{scale_value:.6f},{num_points}\n"
+        f"{iteration},{stage_name},{loss_components['L_pos']:.6f},{loss_components['L_neg']:.6f},"
+        f"{loss_components['L_blob']:.6f},{loss_components['L_KL']:.6f},{loss_components['L_mass']:.6f},"
+        f"{total_loss:.6f},{loss_components['mask_frac']:.6f},{loss_components['M_gt']:.6f},"
+        f"{loss_components['M_pred']:.6f},{scale_value:.6f},{num_points}\n"
     )
 
     if LOSS_LOG_FLUSH_INTERVAL > 0 and iteration % LOSS_LOG_FLUSH_INTERVAL == 0:
         LOSS_LOG_HANDLE.flush()
+
+
+def update_opacity_lr(gaussians, new_lr):
+    for group in gaussians.optimizer.param_groups:
+        if group.get("name") == "opacity":
+            group["lr"] = new_lr
+
+
+def print_collapse_stats(global_iter, loss_components, gaussians):
+    with torch.no_grad():
+        opacity = gaussians.get_opacity.squeeze()
+        mean_opacity = opacity.mean().item()
+        median_opacity = opacity.median().item()
+        frac_low = (opacity < OPACITY_LOW_THRESHOLD).float().mean().item()
+        mask_frac = loss_components.get("mask_frac", 0.0)
+        mass_gt = loss_components.get("M_gt", 0.0)
+        mass_pred = loss_components.get("M_pred", 0.0)
+
+    print(
+        f"  [Stats] Iter {global_iter}: opacity mean={mean_opacity:.4e}, median={median_opacity:.4e}, "
+        f"frac<1e-3={frac_low:.3f}, M_gt={mass_gt:.4f}, M_pred={mass_pred:.4f}, "
+        f"mask_frac={mask_frac:.3f}"
+    )
 
 
 def close_logs():
@@ -796,8 +919,23 @@ STAGE1_ITERATIONS = 0   # Learn scale only (surfels frozen) - DISABLED, using kn
 STAGE2_ITERATIONS = 30000  # Learn surfels only (scale frozen)
 STAGE3_ITERATIONS = 1   # Joint fine-tuning
 
+# Stabilization phase to avoid collapse (disable prune/reset early)
+STABILIZATION_ITERS = 5000  # 5k-10k recommended
+OPACITY_LR_STABLE = 5e-3
+OPACITY_LR_AFTER = 5e-2
+OPACITY_RESET_INTERVAL = 1_000_000  # effectively off during debug
+
 # FOV-aware pruning: remove surfels that drift outside all training cameras' FOV
 FOV_PRUNE_INTERVAL = 100  # Prune every N iterations (0 to disable)
+FOV_PRUNE_START = STABILIZATION_ITERS
+
+# Opacity prune warmup (delay opacity pruning after stabilization)
+OPACITY_PRUNE_WARMUP = 1000
+OPACITY_PRUNE_START = FOV_PRUNE_START + OPACITY_PRUNE_WARMUP
+
+# Debug stats
+DEBUG_STATS_INTERVAL = 500
+OPACITY_LOW_THRESHOLD = 1e-3
 
 # Create unique output folder
 def get_next_output_dir(base_path):
@@ -1006,6 +1144,10 @@ gaussians = GaussianModel(dataset_args.sh_degree)
 gaussians.create_from_pcd(basic_pcd, cameras_extent)
 print(f"Gaussian count: {len(gaussians.get_xyz)}")
 
+gaussians.peak_support = torch.zeros(len(gaussians.get_xyz), device="cuda")
+gaussians.peak_support_min = None
+gaussians.peak_support_grad_min = PEAK_SUPPORT_GRAD_MIN
+
 # Diagnostic: Check initial FOV visibility with temporary scale factor
 print("\nDiagnostic: Initial surfel FOV visibility")
 temp_scale = SonarScaleFactor(init_value=0.65).cuda()  # Use calibrated scale
@@ -1072,14 +1214,14 @@ gaussians.training_setup(Namespace(
     position_lr_delay_mult=0.01,
     position_lr_max_steps=30000,
     feature_lr=0.0025,
-    opacity_lr=0.05,
+    opacity_lr=OPACITY_LR_STABLE,
     scaling_lr=0.005,
     rotation_lr=0.001,
     percent_dense=0.01,
     lambda_dssim=0.2,
     densification_interval=100,
-    opacity_reset_interval=3000,
-    densify_from_iter=500,
+    opacity_reset_interval=OPACITY_RESET_INTERVAL,
+    densify_from_iter=STABILIZATION_ITERS,
     densify_until_iter=15000,
     densify_grad_threshold=0.0002,
 ))
@@ -1159,9 +1301,14 @@ if STAGE1_ITERATIONS > 0:
 
         frame_idx = epoch_indices[(iteration - 1) % len(training_frames)]
         viewpoint_cam = training_frames[frame_idx]
+        global_iter = iteration
 
+        if global_iter == STABILIZATION_ITERS + 1:
+            update_opacity_lr(gaussians, OPACITY_LR_AFTER)
+            print(f"  [Stabilization] Opacity LR set to {OPACITY_LR_AFTER}")
 
         # Get ground truth (with intensity thresholding)
+
         gt_image = preprocess_gt_image(viewpoint_cam.original_image)
 
         # Forward projection WITH scale factor
@@ -1183,14 +1330,21 @@ if STAGE1_ITERATIONS > 0:
 
         # Compute loss (peak-aware)
         total_iter_so_far = iteration  # Stage 1 iteration count
-        loss, loss_components = compute_peak_aware_loss(
+        loss, loss_components, peak_mask = compute_peak_aware_loss(
             rendered, gt_image, total_iter_so_far, STAGE1_ITERATIONS + STAGE2_ITERATIONS
         )
 
         if iteration == 1:
             print(f"    loss.requires_grad: {loss.requires_grad}")
             print(f"    loss.grad_fn: {loss.grad_fn}")
-            print(f"    L_focal={loss_components['L_focal']:.4f}, L_blob={loss_components['L_blob']:.4f}, L_KL={loss_components['L_KL']:.4f}\n")
+            print(
+                f"    L_pos={loss_components['L_pos']:.4f}, L_neg={loss_components['L_neg']:.4f}, "
+                f"L_blob={loss_components['L_blob']:.4f}, L_KL={loss_components['L_KL']:.4f}, "
+                f"L_mass={loss_components['L_mass']:.4f}\n"
+            )
+
+        if PEAK_SUPPORT_UPDATE_INTERVAL > 0 and global_iter % PEAK_SUPPORT_UPDATE_INTERVAL == 0:
+            update_peak_support(gaussians, viewpoint_cam, sonar_config, sonar_scale_factor, peak_mask.detach())
 
         # Backward - only scale factor gets gradients (surfels frozen)
         # Skip if no gradients (no visible surfels)
@@ -1215,15 +1369,20 @@ if STAGE1_ITERATIONS > 0:
         record_metrics(loss.item(), scale_value, "stage1")
         log_loss(metric_step, "stage1", loss_components, loss.item(), scale_value, len(gaussians.get_xyz))
 
-        if iteration % 10 == 0 or iteration == 1:
-            print(f"  Iter {iteration:3d}: L_focal={loss_components['L_focal']:.4f}, L_blob={loss_components['L_blob']:.4f}, scale={scale_value:.4f}, grad={grad_val:.6f}")
+        # Periodic memory cleanup
+        if iteration % 100 == 0:
+            torch.cuda.empty_cache()
 
-        # Extract mesh after iteration 1
-        if iteration == 1:
-            _, depth_trunc, voxel_size, sdf_trunc = extract_and_save_mesh(
-                gaussians, mesh_cameras, pipe_args, bg_color,
-                OUTPUT_DIR, "mesh_after_iter1.ply"
+        if DEBUG_STATS_INTERVAL > 0 and global_iter % DEBUG_STATS_INTERVAL == 0:
+            print_collapse_stats(global_iter, loss_components, gaussians)
+
+        if iteration % 10 == 0 or iteration == 1:
+            print(
+                f"  Iter {iteration:3d}: L_pos={loss_components['L_pos']:.4f}, L_neg={loss_components['L_neg']:.4f}, "
+                f"L_blob={loss_components['L_blob']:.4f}, L_KL={loss_components['L_KL']:.4f}, "
+                f"L_mass={loss_components['L_mass']:.4f}, scale={scale_value:.4f}, pts={len(gaussians.get_xyz)}"
             )
+
 
     print(f"Stage 1 complete. Scale factor: {sonar_scale_factor.get_scale_value():.6f}")
 
@@ -1246,7 +1405,6 @@ if STAGE2_ITERATIONS > 0:
     print(f"STAGE 2: Learn surfels only ({STAGE2_ITERATIONS} iterations)")
     print("=" * 60)
 
-    # Freeze scale factor
     sonar_scale_factor._log_scale.requires_grad = False
     frozen_scale = sonar_scale_factor.get_scale_value()
     print(f"Scale factor frozen at: {frozen_scale:.6f}")
@@ -1260,6 +1418,15 @@ if STAGE2_ITERATIONS > 0:
 
         frame_idx = epoch_indices[(iteration - 1) % len(training_frames)]
         viewpoint_cam = training_frames[frame_idx]
+        global_iter = STAGE1_ITERATIONS + iteration
+
+        if global_iter == STABILIZATION_ITERS + 1:
+            update_opacity_lr(gaussians, OPACITY_LR_AFTER)
+            print(f"  [Stabilization] Opacity LR set to {OPACITY_LR_AFTER}")
+
+        if global_iter == OPACITY_PRUNE_START:
+            gaussians.peak_support_min = PEAK_SUPPORT_MIN
+            print(f"  [Stabilization] Peak-support opacity pruning enabled at S_min={PEAK_SUPPORT_MIN}")
 
         # Get ground truth (with intensity thresholding)
         gt_image = preprocess_gt_image(viewpoint_cam.original_image)
@@ -1275,15 +1442,17 @@ if STAGE2_ITERATIONS > 0:
 
         # Compute loss (peak-aware)
         total_iter_so_far = STAGE1_ITERATIONS + iteration
-        loss, loss_components = compute_peak_aware_loss(
+        loss, loss_components, peak_mask = compute_peak_aware_loss(
             rendered, gt_image, total_iter_so_far, STAGE1_ITERATIONS + STAGE2_ITERATIONS
         )
+
+        if PEAK_SUPPORT_UPDATE_INTERVAL > 0 and global_iter % PEAK_SUPPORT_UPDATE_INTERVAL == 0:
+            update_peak_support(gaussians, viewpoint_cam, sonar_config, sonar_scale_factor, peak_mask.detach())
 
         # Backward - skip if no gradients (no visible surfels for this frame)
         if loss.requires_grad:
             loss.backward()
         else:
-            # No visible surfels, skip this iteration
             if iteration % 100 == 0:
                 print(f"  [Warning] Iter {iteration}: No visible surfels for frame, skipping backward")
 
@@ -1293,8 +1462,8 @@ if STAGE2_ITERATIONS > 0:
             gaussians.optimizer.zero_grad(set_to_none=True)
             gaussians.update_learning_rate(iteration)
 
-            # FOV-aware pruning: remove surfels that drifted outside all training FOVs
-            if FOV_PRUNE_INTERVAL > 0 and iteration % FOV_PRUNE_INTERVAL == 0:
+            # FOV-aware pruning after stabilization
+            if global_iter >= FOV_PRUNE_START and FOV_PRUNE_INTERVAL > 0 and global_iter % FOV_PRUNE_INTERVAL == 0:
                 num_pruned = prune_outside_fov(gaussians, training_frames, sonar_config, sonar_scale_factor)
                 if num_pruned > 0:
                     print(f"  [FOV prune] Removed {num_pruned} surfels outside FOV, {len(gaussians.get_xyz)} remaining")
@@ -1303,8 +1472,19 @@ if STAGE2_ITERATIONS > 0:
         record_metrics(loss.item(), scale_value, "stage2")
         log_loss(metric_step, "stage2", loss_components, loss.item(), scale_value, len(gaussians.get_xyz))
 
+        # Periodic memory cleanup
+        if iteration % 100 == 0:
+            torch.cuda.empty_cache()
+
+        if DEBUG_STATS_INTERVAL > 0 and global_iter % DEBUG_STATS_INTERVAL == 0:
+            print_collapse_stats(global_iter, loss_components, gaussians)
+
         if iteration % 10 == 0 or iteration == 1:
-            print(f"  Iter {iteration:3d}: L_focal={loss_components['L_focal']:.4f}, L_blob={loss_components['L_blob']:.4f}, L_KL={loss_components['L_KL']:.4f}, scale={scale_value:.4f}, pts={len(gaussians.get_xyz)}")
+            print(
+                f"  Iter {iteration:3d}: L_pos={loss_components['L_pos']:.4f}, L_neg={loss_components['L_neg']:.4f}, "
+                f"L_blob={loss_components['L_blob']:.4f}, L_KL={loss_components['L_KL']:.4f}, "
+                f"L_mass={loss_components['L_mass']:.4f}, scale={scale_value:.4f}, pts={len(gaussians.get_xyz)}"
+            )
 
     print(f"Stage 2 complete. Surfels: {len(gaussians.get_xyz)}")
 
@@ -1340,7 +1520,11 @@ if STAGE3_ITERATIONS > 0:
 
         frame_idx = epoch_indices[(iteration - 1) % len(training_frames)]
         viewpoint_cam = training_frames[frame_idx]
+        global_iter = STAGE1_ITERATIONS + STAGE2_ITERATIONS + iteration
 
+        if global_iter == OPACITY_PRUNE_START and gaussians.peak_support_min is None:
+            gaussians.peak_support_min = PEAK_SUPPORT_MIN
+            print(f"  [Stabilization] Peak-support opacity pruning enabled at S_min={PEAK_SUPPORT_MIN}")
 
         gt_image = preprocess_gt_image(viewpoint_cam.original_image)
 
@@ -1354,9 +1538,12 @@ if STAGE3_ITERATIONS > 0:
 
         # Compute loss (peak-aware)
         total_iter_so_far = STAGE1_ITERATIONS + STAGE2_ITERATIONS + iteration
-        loss, loss_components = compute_peak_aware_loss(
+        loss, loss_components, peak_mask = compute_peak_aware_loss(
             rendered, gt_image, total_iter_so_far, STAGE1_ITERATIONS + STAGE2_ITERATIONS + STAGE3_ITERATIONS
         )
+
+        if PEAK_SUPPORT_UPDATE_INTERVAL > 0 and global_iter % PEAK_SUPPORT_UPDATE_INTERVAL == 0:
+            update_peak_support(gaussians, viewpoint_cam, sonar_config, sonar_scale_factor, peak_mask.detach())
 
         # Backward - skip if no gradients (no visible surfels)
         if loss.requires_grad:
@@ -1371,8 +1558,8 @@ if STAGE3_ITERATIONS > 0:
             # Scale frozen - no optimizer step
             gaussians.update_learning_rate(STAGE2_ITERATIONS + iteration)
 
-            # FOV-aware pruning
-            if FOV_PRUNE_INTERVAL > 0 and iteration % FOV_PRUNE_INTERVAL == 0:
+            # FOV-aware pruning after stabilization
+            if global_iter >= FOV_PRUNE_START and FOV_PRUNE_INTERVAL > 0 and global_iter % FOV_PRUNE_INTERVAL == 0:
                 num_pruned = prune_outside_fov(gaussians, training_frames, sonar_config, sonar_scale_factor)
                 if num_pruned > 0:
                     print(f"  [FOV prune] Removed {num_pruned} surfels outside FOV, {len(gaussians.get_xyz)} remaining")
@@ -1381,8 +1568,19 @@ if STAGE3_ITERATIONS > 0:
         record_metrics(loss.item(), scale_value, "stage3")
         log_loss(metric_step, "stage3", loss_components, loss.item(), scale_value, len(gaussians.get_xyz))
 
+        # Periodic memory cleanup
+        if iteration % 100 == 0:
+            torch.cuda.empty_cache()
+
+        if DEBUG_STATS_INTERVAL > 0 and global_iter % DEBUG_STATS_INTERVAL == 0:
+            print_collapse_stats(global_iter, loss_components, gaussians)
+
         if iteration % 10 == 0 or iteration == 1:
-            print(f"  Iter {iteration:3d}: L_focal={loss_components['L_focal']:.4f}, L_blob={loss_components['L_blob']:.4f}, L_KL={loss_components['L_KL']:.4f}, scale={scale_value:.4f}, pts={len(gaussians.get_xyz)}")
+            print(
+                f"  Iter {iteration:3d}: L_pos={loss_components['L_pos']:.4f}, L_neg={loss_components['L_neg']:.4f}, "
+                f"L_blob={loss_components['L_blob']:.4f}, L_KL={loss_components['L_KL']:.4f}, "
+                f"L_mass={loss_components['L_mass']:.4f}, scale={scale_value:.4f}, pts={len(gaussians.get_xyz)}"
+            )
 
     print(f"Stage 3 complete. Surfels: {len(gaussians.get_xyz)}")
 
