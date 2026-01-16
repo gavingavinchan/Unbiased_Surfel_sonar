@@ -12,7 +12,8 @@ each other in single-frame training. Multi-frame provides geometric constraints.
 
 Outputs:
 - sonar_init_points.ply: Initial point cloud from sonar backward projection (all frames)
-- pose_pyramids_wireframe.ply: Wireframe pyramids for all training frames
+- pose_pyramids_wireframe.ply: Wireframe pyramids for all training frames (camera poses)
+- sonar_pose_pyramids_wireframe.ply: Wireframe pyramids for sonar poses (with offset)
 - mesh_before_training.ply: Mesh from sonar-initialized Gaussians (no training)
 - mesh_after_training.ply: Mesh after curriculum training
 - comparison_frame_N.png: GT vs rendered for each training frame
@@ -43,7 +44,7 @@ import open3d as o3d
 from PIL import Image
 
 
-def is_in_sonar_fov(xyz, camera, sonar_config, scale_factor, return_details=False):
+def is_in_sonar_fov(xyz, camera, sonar_config, scale_factor, sonar_extrinsic=None, return_details=False):
     """
     Check if 3D points are within the sonar FOV of a given camera.
 
@@ -54,6 +55,7 @@ def is_in_sonar_fov(xyz, camera, sonar_config, scale_factor, return_details=Fals
         camera: Camera object with world_view_transform
         sonar_config: SonarConfig with FOV and range parameters
         scale_factor: SonarScaleFactor for pose scaling
+        sonar_extrinsic: Optional SonarExtrinsic for camera-to-sonar transform
         return_details: If True, return dict with per-constraint masks
 
     Returns:
@@ -69,7 +71,13 @@ def is_in_sonar_fov(xyz, camera, sonar_config, scale_factor, return_details=Fals
         return empty
 
     # Match render_sonar's transform EXACTLY
-    w2v = camera.world_view_transform.cuda()  # [4, 4]
+    w2c = camera.world_view_transform.cuda()  # [4, 4]
+
+    # Apply camera-to-sonar extrinsic if provided
+    if sonar_extrinsic is not None:
+        w2v = sonar_extrinsic(w2c)  # world-to-sonar
+    else:
+        w2v = w2c
 
     # Extract R and t (translation is in row 3, not column 3!)
     R_w2v = w2v[:3, :3]
@@ -156,7 +164,7 @@ def compute_fov_margin_debug(range_vals, azimuth, elevation, sonar_config):
     return margin
 
 
-def is_fully_in_sonar_fov(xyz, scaling, camera, sonar_config, scale_factor):
+def is_fully_in_sonar_fov(xyz, scaling, camera, sonar_config, scale_factor, sonar_extrinsic=None):
     """
     Check if surfels (center + size extent) are fully within the sonar FOV.
 
@@ -170,6 +178,7 @@ def is_fully_in_sonar_fov(xyz, scaling, camera, sonar_config, scale_factor):
         camera: Camera object with world_view_transform
         sonar_config: SonarConfig with FOV and range parameters
         scale_factor: SonarScaleFactor for pose scaling
+        sonar_extrinsic: Optional SonarExtrinsic for camera-to-sonar transform
 
     Returns:
         [N] boolean tensor: True if surfel is fully within FOV
@@ -179,7 +188,14 @@ def is_fully_in_sonar_fov(xyz, scaling, camera, sonar_config, scale_factor):
         return torch.zeros(0, dtype=torch.bool, device=xyz.device)
 
     # Transform points to sonar frame (same as is_in_sonar_fov)
-    w2v = camera.world_view_transform.cuda()
+    w2c = camera.world_view_transform.cuda()
+
+    # Apply camera-to-sonar extrinsic if provided
+    if sonar_extrinsic is not None:
+        w2v = sonar_extrinsic(w2c)
+    else:
+        w2v = w2c
+
     R_w2v = w2v[:3, :3]
     t_w2v = w2v[3, :3]
     t_w2v_scaled = scale_factor.scale * t_w2v
@@ -213,7 +229,7 @@ def is_fully_in_sonar_fov(xyz, scaling, camera, sonar_config, scale_factor):
 
 
 def prune_outside_fov(gaussians, training_frames, sonar_config, scale_factor,
-                      require_all=False, check_size=True):
+                      sonar_extrinsic=None, require_all=False, check_size=True):
     """
     Prune Gaussians that are outside the FOV of training cameras.
 
@@ -222,6 +238,7 @@ def prune_outside_fov(gaussians, training_frames, sonar_config, scale_factor,
         training_frames: List of camera objects
         sonar_config: SonarConfig
         scale_factor: SonarScaleFactor
+        sonar_extrinsic: Optional SonarExtrinsic for camera-to-sonar transform
         require_all: If True, prune if outside ALL cameras' FOV
                      If False, keep if visible from ANY camera (default)
         check_size: If True, also check that surfel size doesn't extend beyond FOV
@@ -241,12 +258,12 @@ def prune_outside_fov(gaussians, training_frames, sonar_config, scale_factor,
         # Size-aware check: surfel center AND extent must be within FOV
         scaling = gaussians.get_scaling  # [N, 2]
         for cam in training_frames:
-            in_fov = is_fully_in_sonar_fov(xyz, scaling, cam, sonar_config, scale_factor)
+            in_fov = is_fully_in_sonar_fov(xyz, scaling, cam, sonar_config, scale_factor, sonar_extrinsic)
             visible_masks.append(in_fov)
     else:
         # Center-only check (original behavior)
         for cam in training_frames:
-            in_fov = is_in_sonar_fov(xyz, cam, sonar_config, scale_factor)
+            in_fov = is_in_sonar_fov(xyz, cam, sonar_config, scale_factor, sonar_extrinsic)
             visible_masks.append(in_fov)
 
     # Stack masks: [num_cameras, N]
@@ -351,6 +368,45 @@ PEAK_SUPPORT_MIN = 0.05
 PEAK_SUPPORT_GRAD_MIN = 1e-4
 PEAK_SUPPORT_UPDATE_INTERVAL = 10
 
+# =============================================================================
+# Position Anchor Loss (prevent geometry drift)
+# =============================================================================
+ANCHOR_LAMBDA_INIT = 1000.0       # Strong anchor first 10k iters
+ANCHOR_LAMBDA_AFTER = 100.0       # Reduce by 10x after
+ANCHOR_RAMPDOWN_ITER = 10000      # When to reduce anchor weight
+ANCHOR_LOG_INTERVAL = 500         # Log mean displacement every N iters
+
+# =============================================================================
+# Two-Tier Mask for Photometric Loss
+# =============================================================================
+LOSS_TAU_PERCENTILE_HI = 0.97     # High peak threshold (was LOSS_TAU_PERCENTILE)
+LOSS_TAU_PERCENTILE_MID = 0.90    # Mid peak threshold for weaker features
+LOSS_LAMBDA_MID = 0.2             # Weight for mid-tier photometric
+
+# =============================================================================
+# Tighter KL Loss
+# =============================================================================
+LOSS_TAU_PERCENTILE_KL = 0.99     # Stricter mask for KL
+LOSS_KL_GAMMA_NEW = 20.0          # Increased sharpness (was 15)
+
+# =============================================================================
+# Scheduled Negative Loss
+# =============================================================================
+LOSS_LAMBDA_NEG_INIT = 0.001      # Very weak early
+LOSS_LAMBDA_NEG_RAMP_START = 5000
+LOSS_LAMBDA_NEG_RAMP_END = 15000
+LOSS_LAMBDA_NEG_FINAL = 0.02      # Target after ramp
+
+# =============================================================================
+# Outside-Mask Energy Penalty
+# =============================================================================
+LOSS_LAMBDA_OUT = 2e-4            # Penalty for rendering outside GT peaks
+
+# =============================================================================
+# Densification Gating by Peak Support
+# =============================================================================
+DENSIFY_PEAK_SUPPORT_MIN = 0.1    # Only densify if peak_support > this
+
 # Logging
 
 LOSS_SMOOTH_WINDOW = 200
@@ -450,8 +506,13 @@ def compute_dog(J, sigma, k=LOSS_DOG_K):
 
 def compute_peak_aware_loss(rendered, gt_image, iteration, total_iterations):
     """
-    Peak-aware loss with peak-only photometric term, weak background overshoot,
-    DoG blob matching, masked KL, and peak-mass constraint.
+    Peak-aware loss with:
+    - Two-tier photometric (hi p97 + mid p90)
+    - Scheduled one-sided negative loss
+    - DoG blob matching
+    - Tighter KL with p99 mask and gamma=20
+    - Peak-mass constraint
+    - Outside-mask energy penalty
 
     Args:
         rendered: [C, H, W] predicted image (0-1 range)
@@ -477,22 +538,40 @@ def compute_peak_aware_loss(rendered, gt_image, iteration, total_iterations):
     J_gt = torch.log1p(LOSS_ALPHA * I_gt_n)
     J_pred = torch.log1p(LOSS_ALPHA * I_pred_n)
 
-    # Peak mask in log space (detached)
+    # Two-tier peak masks in log space (detached)
     with torch.no_grad():
-        tau = torch.quantile(J_gt, LOSS_TAU_PERCENTILE)
-        m = torch.sigmoid((J_gt - tau) / LOSS_SIGMOID_S)
+        tau_hi = torch.quantile(J_gt, LOSS_TAU_PERCENTILE_HI)
+        tau_mid = torch.quantile(J_gt, LOSS_TAU_PERCENTILE_MID)
+        tau_kl = torch.quantile(J_gt, LOSS_TAU_PERCENTILE_KL)
+        m_hi = torch.sigmoid((J_gt - tau_hi) / LOSS_SIGMOID_S)
+        m_mid = torch.sigmoid((J_gt - tau_mid) / LOSS_SIGMOID_S)
+        m_kl = torch.sigmoid((J_gt - tau_kl) / LOSS_SIGMOID_S)
 
     # Charbonnier penalty
     diff = J_pred - J_gt
     rho = torch.sqrt(diff**2 + LOSS_EPSILON**2)
 
-    # Peak-only positive term
-    L_pos = (m * rho).mean()
+    # Two-tier photometric: high + mid
+    L_pos_hi = (m_hi * rho).mean()
+    L_pos_mid = (m_mid * rho).mean()
+    L_pos = L_pos_hi + LOSS_LAMBDA_MID * L_pos_mid
 
-    # Very weak one-sided negative (overshoot only)
+    # Scheduled one-sided negative (overshoot only)
+    if iteration < LOSS_LAMBDA_NEG_RAMP_START:
+        lambda_neg = LOSS_LAMBDA_NEG_INIT
+    elif iteration >= LOSS_LAMBDA_NEG_RAMP_END:
+        lambda_neg = LOSS_LAMBDA_NEG_FINAL
+    else:
+        # Linear ramp
+        t = (iteration - LOSS_LAMBDA_NEG_RAMP_START) / (LOSS_LAMBDA_NEG_RAMP_END - LOSS_LAMBDA_NEG_RAMP_START)
+        lambda_neg = LOSS_LAMBDA_NEG_INIT + t * (LOSS_LAMBDA_NEG_FINAL - LOSS_LAMBDA_NEG_INIT)
+
     relu_diff = torch.relu(diff)
     rho_neg = torch.sqrt(relu_diff**2 + LOSS_EPSILON**2)
-    L_neg = ((1 - m) * rho_neg).mean()
+    L_neg = ((1 - m_hi) * rho_neg).mean()
+
+    # Outside-mask energy penalty: penalize rendering where GT has no peaks
+    L_out = ((1 - m_hi) * J_pred).mean()
 
     # DoG multi-scale blob loss (weighted by GT bandpass energy)
     L_blob_list = []
@@ -505,9 +584,9 @@ def compute_peak_aware_loss(rendered, gt_image, iteration, total_iterations):
         L_blob_list.append((weight * (dog_pred - dog_gt).abs()).mean())
     L_blob = sum(L_blob_list) if L_blob_list else torch.zeros(1, device=rendered.device).squeeze()
 
-    # Masked peak distribution KL
+    # Tighter KL with p99 mask and higher gamma
     with torch.no_grad():
-        mask_flat = m.flatten()
+        mask_flat = m_kl.flatten()
         valid_region = mask_flat > 0.01
         num_valid = valid_region.sum().item()
 
@@ -515,8 +594,8 @@ def compute_peak_aware_loss(rendered, gt_image, iteration, total_iterations):
         L_KL = torch.zeros(1, device=rendered.device).squeeze()
     else:
         log_m = torch.log(mask_flat[valid_region].clamp(min=1e-10))
-        logits_gt = LOSS_KL_GAMMA * J_gt.flatten()[valid_region] + log_m
-        logits_pred = LOSS_KL_GAMMA * J_pred.flatten()[valid_region] + log_m
+        logits_gt = LOSS_KL_GAMMA_NEW * J_gt.flatten()[valid_region] + log_m
+        logits_pred = LOSS_KL_GAMMA_NEW * J_pred.flatten()[valid_region] + log_m
 
         with torch.no_grad():
             log_denom_gt = torch.logaddexp(
@@ -534,38 +613,51 @@ def compute_peak_aware_loss(rendered, gt_image, iteration, total_iterations):
 
         L_KL = (p * (log_p - log_q)).sum()
 
-    # Peak-mass constraint
-    M_gt = (m * J_gt).sum()
-    M_pred = (m * J_pred).sum()
+    # Peak-mass constraint (use hi mask)
+    M_gt = (m_hi * J_gt).sum()
+    M_pred = (m_hi * J_pred).sum()
     L_mass = torch.abs(M_pred - M_gt)
 
     total_loss = (
         L_pos
-        + LOSS_LAMBDA_NEG * L_neg
+        + lambda_neg * L_neg
+        + LOSS_LAMBDA_OUT * L_out
         + LOSS_LAMBDA_BLOB * L_blob
         + LOSS_LAMBDA_KL * L_KL
         + LOSS_LAMBDA_MASS * L_mass
     )
 
-    mask_frac = (m > 0.5).float().mean()
+    mask_frac_hi = (m_hi > 0.5).float().mean()
+    mask_frac_mid = (m_mid > 0.5).float().mean()
 
     return total_loss, {
         'L_pos': L_pos.item(),
         'L_neg': L_neg.item(),
+        'L_out': L_out.item(),
         'L_blob': L_blob.item(),
         'L_KL': L_KL.item(),
         'L_mass': L_mass.item(),
-        'tau': tau.item(),
-        'mask_frac': mask_frac.item(),
+        'lambda_neg': lambda_neg,
+        'tau_hi': tau_hi.item(),
+        'tau_mid': tau_mid.item(),
+        'mask_frac_hi': mask_frac_hi.item(),
+        'mask_frac_mid': mask_frac_mid.item(),
         'M_gt': M_gt.item(),
         'M_pred': M_pred.item()
-    }, m
+    }, m_hi
 
 
-def project_sonar_pixels(gaussians, camera, sonar_config, scale_factor):
+def project_sonar_pixels(gaussians, camera, sonar_config, scale_factor, sonar_extrinsic=None):
     w2c = camera.world_view_transform.cuda()
-    R_w2v = w2c[:3, :3]
-    t_w2v = w2c[3, :3]
+
+    # Apply camera-to-sonar extrinsic if provided
+    if sonar_extrinsic is not None:
+        w2v = sonar_extrinsic(w2c)
+    else:
+        w2v = w2c
+
+    R_w2v = w2v[:3, :3]
+    t_w2v = w2v[3, :3]
     t_w2v_scaled = scale_factor.scale * t_w2v
 
     points_sonar = (gaussians.get_xyz @ R_w2v.T) + t_w2v_scaled
@@ -622,11 +714,11 @@ def bilinear_sample_mask(mask, col, row):
 
 
 @torch.no_grad()
-def update_peak_support(gaussians, camera, sonar_config, scale_factor, peak_mask):
+def update_peak_support(gaussians, camera, sonar_config, scale_factor, peak_mask, sonar_extrinsic=None):
     if not hasattr(gaussians, "peak_support"):
         gaussians.peak_support = torch.zeros(len(gaussians.get_xyz), device=peak_mask.device)
 
-    col, row, in_fov = project_sonar_pixels(gaussians, camera, sonar_config, scale_factor)
+    col, row, in_fov = project_sonar_pixels(gaussians, camera, sonar_config, scale_factor, sonar_extrinsic)
     sampled = bilinear_sample_mask(peak_mask, col, row)
 
     update_mask = in_fov
@@ -669,20 +761,24 @@ def init_loss_log(output_dir):
     LOSS_LOG_PATH = os.path.join(output_dir, "loss_log.csv")
     LOSS_LOG_HANDLE = open(LOSS_LOG_PATH, "w", buffering=1)
     LOSS_LOG_HANDLE.write(
-        "iter,stage,L_pos,L_neg,L_blob,L_KL,L_mass,total_loss,mask_frac,M_gt,M_pred,scale,num_points\n"
+        "iter,stage,L_pos,L_neg,L_out,L_blob,L_KL,L_mass,lambda_neg,total_loss,"
+        "mask_frac_hi,mask_frac_mid,M_gt,M_pred,scale,num_points,mean_disp\n"
     )
     LOSS_LOG_HANDLE.flush()
 
 
-def log_loss(iteration, stage_name, loss_components, total_loss, scale_value, num_points):
+def log_loss(iteration, stage_name, loss_components, total_loss, scale_value, num_points, mean_disp=0.0):
     if LOSS_LOG_HANDLE is None:
         return
 
     LOSS_LOG_HANDLE.write(
         f"{iteration},{stage_name},{loss_components['L_pos']:.6f},{loss_components['L_neg']:.6f},"
-        f"{loss_components['L_blob']:.6f},{loss_components['L_KL']:.6f},{loss_components['L_mass']:.6f},"
-        f"{total_loss:.6f},{loss_components['mask_frac']:.6f},{loss_components['M_gt']:.6f},"
-        f"{loss_components['M_pred']:.6f},{scale_value:.6f},{num_points}\n"
+        f"{loss_components.get('L_out', 0.0):.6f},{loss_components['L_blob']:.6f},"
+        f"{loss_components['L_KL']:.6f},{loss_components['L_mass']:.6f},"
+        f"{loss_components.get('lambda_neg', 0.0):.6f},{total_loss:.6f},"
+        f"{loss_components.get('mask_frac_hi', loss_components.get('mask_frac', 0.0)):.6f},"
+        f"{loss_components.get('mask_frac_mid', 0.0):.6f},{loss_components['M_gt']:.6f},"
+        f"{loss_components['M_pred']:.6f},{scale_value:.6f},{num_points},{mean_disp:.6f}\n"
     )
 
     if LOSS_LOG_FLUSH_INTERVAL > 0 and iteration % LOSS_LOG_FLUSH_INTERVAL == 0:
@@ -695,20 +791,47 @@ def update_opacity_lr(gaussians, new_lr):
             group["lr"] = new_lr
 
 
+@torch.no_grad()
+def compute_mean_displacement(gaussians):
+    """Compute mean displacement from initial positions."""
+    if not hasattr(gaussians, 'initial_xyz'):
+        return 0.0
+    disp = (gaussians.get_xyz - gaussians.initial_xyz).norm(dim=1)
+    return disp.mean().item()
+
+
+def compute_anchor_loss(gaussians, iteration):
+    """Compute position anchor loss with scheduled weight."""
+    if not hasattr(gaussians, 'initial_xyz'):
+        return torch.zeros(1, device="cuda").squeeze(), 0.0
+
+    # Scheduled anchor weight
+    if iteration < ANCHOR_RAMPDOWN_ITER:
+        lambda_anchor = ANCHOR_LAMBDA_INIT
+    else:
+        lambda_anchor = ANCHOR_LAMBDA_AFTER
+
+    diff = gaussians.get_xyz - gaussians.initial_xyz
+    L_anchor = (diff ** 2).mean()
+
+    return lambda_anchor * L_anchor, lambda_anchor
+
+
 def print_collapse_stats(global_iter, loss_components, gaussians):
     with torch.no_grad():
         opacity = gaussians.get_opacity.squeeze()
         mean_opacity = opacity.mean().item()
         median_opacity = opacity.median().item()
         frac_low = (opacity < OPACITY_LOW_THRESHOLD).float().mean().item()
-        mask_frac = loss_components.get("mask_frac", 0.0)
+        mask_frac_hi = loss_components.get("mask_frac_hi", loss_components.get("mask_frac", 0.0))
         mass_gt = loss_components.get("M_gt", 0.0)
         mass_pred = loss_components.get("M_pred", 0.0)
+        mean_disp = compute_mean_displacement(gaussians)
 
     print(
         f"  [Stats] Iter {global_iter}: opacity mean={mean_opacity:.4e}, median={median_opacity:.4e}, "
         f"frac<1e-3={frac_low:.3f}, M_gt={mass_gt:.4f}, M_pred={mass_pred:.4f}, "
-        f"mask_frac={mask_frac:.3f}"
+        f"mask_frac_hi={mask_frac_hi:.3f}, mean_disp={mean_disp:.4f}m"
     )
 
 
@@ -775,7 +898,7 @@ def save_comparison_images(training_frames, gaussians, background, sonar_config,
                 cam, gaussians, background,
                 sonar_config=sonar_config,
                 scale_factor=scale_factor,
-                sonar_extrinsic=None
+                sonar_extrinsic=sonar_extrinsic
             )
             rendered = render_pkg["render"]
 
@@ -817,7 +940,7 @@ def save_raw_comparison_images(training_frames, gaussians, background, sonar_con
                 cam, gaussians, background,
                 sonar_config=sonar_config,
                 scale_factor=scale_factor,
-                sonar_extrinsic=None
+                sonar_extrinsic=sonar_extrinsic
             )
             rendered = render_pkg["render"]
 
@@ -1043,6 +1166,11 @@ print(f"  Image size: {sonar_config.image_width}x{sonar_config.image_height}")
 print(f"  Azimuth FOV: {sonar_config.azimuth_fov}deg")
 print(f"  Range: {sonar_config.range_min}m - {sonar_config.range_max}m")
 
+# Create sonar extrinsic early (before any FOV checks or rendering)
+# Sonar is mounted: 8cm behind, 10cm above, 5deg pitched down from camera
+sonar_extrinsic = SonarExtrinsic(device="cuda")
+print(f"  Sonar extrinsic: 8cm back, 10cm up, 5deg pitch down from camera")
+
 # =============================================================================
 # Generate Pose Pyramids for All Training Frames
 # =============================================================================
@@ -1067,6 +1195,56 @@ for i, cam in enumerate(training_frames):
 pyramid_path = os.path.join(OUTPUT_DIR, "pose_pyramids_wireframe.ply")
 o3d.io.write_line_set(pyramid_path, combined_wireframe)
 print(f"Saved: {pyramid_path}")
+
+# =============================================================================
+# Generate Sonar Pose Pyramids (with camera-to-sonar offset)
+# =============================================================================
+print("\n" + "=" * 60)
+print("SONAR POSE PYRAMIDS: Generating wireframes with sonar offset")
+print("=" * 60)
+
+# Sonar offset in camera local frame:
+# - 8cm back (-Z direction)
+# - 10cm up (-Y direction, since +Y is down)
+# - 5 degrees pitch down (rotation around X axis)
+sonar_offset_local = np.array([0.0, -0.10, -0.08])  # [X, Y, Z] in camera frame
+
+# Pitch rotation matrix (5 degrees down around X axis)
+pitch_deg = 5.0
+pitch_rad = math.radians(pitch_deg)
+cos_p = math.cos(pitch_rad)
+sin_p = math.sin(pitch_rad)
+R_pitch = np.array([
+    [1.0,    0.0,     0.0],
+    [0.0,  cos_p, -sin_p],
+    [0.0,  sin_p,  cos_p]
+])
+
+combined_sonar_wireframe = o3d.geometry.LineSet()
+sonar_colors = [[1, 0.5, 0], [0, 1, 1], [0.5, 0, 1], [1, 0, 0.5], [0.5, 1, 0]]  # Orange, cyan, purple, pink, lime
+
+for i, cam in enumerate(training_frames):
+    R_w2c = cam.R
+    T_w2c = cam.T
+    R_c2w = R_w2c.T
+    cam_position = -R_c2w @ T_w2c
+
+    # Transform sonar offset from camera local frame to world frame
+    sonar_offset_world = R_c2w @ sonar_offset_local
+    sonar_position = cam_position + sonar_offset_world
+
+    # Apply pitch rotation to get sonar orientation
+    # Sonar rotation = camera rotation * pitch rotation
+    R_sonar_c2w = R_c2w @ R_pitch
+
+    color = sonar_colors[i % len(sonar_colors)]
+    pyramid = create_pose_pyramid_wireframe(sonar_position, R_sonar_c2w, depth=PYRAMID_DEPTH, color=color)
+    combined_sonar_wireframe += pyramid
+    print(f"  Frame {i}: sonar pos=[{sonar_position[0]:.2f}, {sonar_position[1]:.2f}, {sonar_position[2]:.2f}]")
+
+sonar_pyramid_path = os.path.join(OUTPUT_DIR, "sonar_pose_pyramids_wireframe.ply")
+o3d.io.write_line_set(sonar_pyramid_path, combined_sonar_wireframe)
+print(f"Saved: {sonar_pyramid_path}")
 
 # =============================================================================
 # Initialize Gaussians from Multi-Frame Backward Projection
@@ -1152,7 +1330,7 @@ gaussians.peak_support_grad_min = PEAK_SUPPORT_GRAD_MIN
 print("\nDiagnostic: Initial surfel FOV visibility")
 temp_scale = SonarScaleFactor(init_value=0.65).cuda()  # Use calibrated scale
 for i, cam in enumerate(training_frames):
-    details = is_in_sonar_fov(gaussians.get_xyz, cam, sonar_config, temp_scale, return_details=True)
+    details = is_in_sonar_fov(gaussians.get_xyz, cam, sonar_config, temp_scale, sonar_extrinsic, return_details=True)
     in_fov = details["in_fov"]
     print(f"  Frame {i}: {in_fov.sum().item()}/{len(gaussians.get_xyz)} surfels in FOV")
     print(f"    - in_front: {details['in_front'].sum().item()}")
@@ -1207,10 +1385,14 @@ print("\n" + "=" * 60)
 print("TRAINING SETUP")
 print("=" * 60)
 
-# Setup Gaussian optimizer
+# Store initial positions for anchor loss (before any optimization)
+gaussians.initial_xyz = gaussians.get_xyz.detach().clone()
+print(f"Stored initial positions for anchor loss ({len(gaussians.initial_xyz)} points)")
+
+# Setup Gaussian optimizer (position LR reduced 10x for stability with anchor)
 gaussians.training_setup(Namespace(
-    position_lr_init=0.00016,
-    position_lr_final=0.0000016,
+    position_lr_init=0.000016,       # 10x reduction (was 0.00016)
+    position_lr_final=0.00000016,    # 10x reduction (was 0.0000016)
     position_lr_delay_mult=0.01,
     position_lr_max_steps=30000,
     feature_lr=0.0025,
@@ -1225,6 +1407,9 @@ gaussians.training_setup(Namespace(
     densify_until_iter=15000,
     densify_grad_threshold=0.0002,
 ))
+
+# Store densification gating threshold on gaussians
+gaussians.densify_peak_support_min = DENSIFY_PEAK_SUPPORT_MIN
 
 # Scale factor module
 # Known scale factor from calibration cube in COLMAP (true value ~0.66)
@@ -1274,7 +1459,7 @@ for test_scale in test_scales:
             viewpoint_test, gaussians, background,
             sonar_config=sonar_config,
             scale_factor=test_sf,
-            sonar_extrinsic=None
+            sonar_extrinsic=sonar_extrinsic
         )
         rendered = render_pkg["render"]
 
@@ -1316,7 +1501,7 @@ if STAGE1_ITERATIONS > 0:
             viewpoint_cam, gaussians, background,
             sonar_config=sonar_config,
             scale_factor=sonar_scale_factor,  # Scale factor enabled
-            sonar_extrinsic=None
+            sonar_extrinsic=sonar_extrinsic
         )
         rendered = render_pkg["render"]
 
@@ -1344,7 +1529,7 @@ if STAGE1_ITERATIONS > 0:
             )
 
         if PEAK_SUPPORT_UPDATE_INTERVAL > 0 and global_iter % PEAK_SUPPORT_UPDATE_INTERVAL == 0:
-            update_peak_support(gaussians, viewpoint_cam, sonar_config, sonar_scale_factor, peak_mask.detach())
+            update_peak_support(gaussians, viewpoint_cam, sonar_config, sonar_scale_factor, peak_mask.detach(), sonar_extrinsic)
 
         # Backward - only scale factor gets gradients (surfels frozen)
         # Skip if no gradients (no visible surfels)
@@ -1367,7 +1552,7 @@ if STAGE1_ITERATIONS > 0:
 
         scale_value = sonar_scale_factor.get_scale_value()
         record_metrics(loss.item(), scale_value, "stage1")
-        log_loss(metric_step, "stage1", loss_components, loss.item(), scale_value, len(gaussians.get_xyz))
+        log_loss(metric_step, "stage1", loss_components, loss.item(), scale_value, len(gaussians.get_xyz), 0.0)
 
         # Periodic memory cleanup
         if iteration % 100 == 0:
@@ -1436,7 +1621,7 @@ if STAGE2_ITERATIONS > 0:
             viewpoint_cam, gaussians, background,
             sonar_config=sonar_config,
             scale_factor=sonar_scale_factor,
-            sonar_extrinsic=None
+            sonar_extrinsic=sonar_extrinsic
         )
         rendered = render_pkg["render"]
 
@@ -1446,12 +1631,18 @@ if STAGE2_ITERATIONS > 0:
             rendered, gt_image, total_iter_so_far, STAGE1_ITERATIONS + STAGE2_ITERATIONS
         )
 
+        # Add anchor loss to prevent geometry drift
+        L_anchor, lambda_anchor = compute_anchor_loss(gaussians, global_iter)
+        total_loss = loss + L_anchor
+        loss_components['L_anchor'] = L_anchor.item() if torch.is_tensor(L_anchor) else L_anchor
+        loss_components['lambda_anchor'] = lambda_anchor
+
         if PEAK_SUPPORT_UPDATE_INTERVAL > 0 and global_iter % PEAK_SUPPORT_UPDATE_INTERVAL == 0:
-            update_peak_support(gaussians, viewpoint_cam, sonar_config, sonar_scale_factor, peak_mask.detach())
+            update_peak_support(gaussians, viewpoint_cam, sonar_config, sonar_scale_factor, peak_mask.detach(), sonar_extrinsic)
 
         # Backward - skip if no gradients (no visible surfels for this frame)
-        if loss.requires_grad:
-            loss.backward()
+        if total_loss.requires_grad:
+            total_loss.backward()
         else:
             if iteration % 100 == 0:
                 print(f"  [Warning] Iter {iteration}: No visible surfels for frame, skipping backward")
@@ -1464,17 +1655,22 @@ if STAGE2_ITERATIONS > 0:
 
             # FOV-aware pruning after stabilization
             if global_iter >= FOV_PRUNE_START and FOV_PRUNE_INTERVAL > 0 and global_iter % FOV_PRUNE_INTERVAL == 0:
-                num_pruned = prune_outside_fov(gaussians, training_frames, sonar_config, sonar_scale_factor)
+                num_pruned = prune_outside_fov(gaussians, training_frames, sonar_config, sonar_scale_factor, sonar_extrinsic)
                 if num_pruned > 0:
                     print(f"  [FOV prune] Removed {num_pruned} surfels outside FOV, {len(gaussians.get_xyz)} remaining")
 
         scale_value = sonar_scale_factor.get_scale_value()
-        record_metrics(loss.item(), scale_value, "stage2")
-        log_loss(metric_step, "stage2", loss_components, loss.item(), scale_value, len(gaussians.get_xyz))
+        mean_disp = compute_mean_displacement(gaussians)
+        record_metrics(total_loss.item(), scale_value, "stage2")
+        log_loss(metric_step, "stage2", loss_components, total_loss.item(), scale_value, len(gaussians.get_xyz), mean_disp)
 
         # Periodic memory cleanup
         if iteration % 100 == 0:
             torch.cuda.empty_cache()
+
+        # Log displacement periodically
+        if ANCHOR_LOG_INTERVAL > 0 and global_iter % ANCHOR_LOG_INTERVAL == 0:
+            print(f"  [Anchor] Iter {global_iter}: mean_disp={mean_disp:.4f}m, L_anchor={loss_components['L_anchor']:.4f}, λ={lambda_anchor:.0f}")
 
         if DEBUG_STATS_INTERVAL > 0 and global_iter % DEBUG_STATS_INTERVAL == 0:
             print_collapse_stats(global_iter, loss_components, gaussians)
@@ -1482,8 +1678,8 @@ if STAGE2_ITERATIONS > 0:
         if iteration % 10 == 0 or iteration == 1:
             print(
                 f"  Iter {iteration:3d}: L_pos={loss_components['L_pos']:.4f}, L_neg={loss_components['L_neg']:.4f}, "
-                f"L_blob={loss_components['L_blob']:.4f}, L_KL={loss_components['L_KL']:.4f}, "
-                f"L_mass={loss_components['L_mass']:.4f}, scale={scale_value:.4f}, pts={len(gaussians.get_xyz)}"
+                f"L_out={loss_components.get('L_out', 0.0):.4f}, L_anchor={loss_components['L_anchor']:.4f}, "
+                f"scale={scale_value:.4f}, pts={len(gaussians.get_xyz)}"
             )
 
     print(f"Stage 2 complete. Surfels: {len(gaussians.get_xyz)}")
@@ -1532,7 +1728,7 @@ if STAGE3_ITERATIONS > 0:
             viewpoint_cam, gaussians, background,
             sonar_config=sonar_config,
             scale_factor=sonar_scale_factor,
-            sonar_extrinsic=None
+            sonar_extrinsic=sonar_extrinsic
         )
         rendered = render_pkg["render"]
 
@@ -1542,12 +1738,18 @@ if STAGE3_ITERATIONS > 0:
             rendered, gt_image, total_iter_so_far, STAGE1_ITERATIONS + STAGE2_ITERATIONS + STAGE3_ITERATIONS
         )
 
+        # Add anchor loss to prevent geometry drift
+        L_anchor, lambda_anchor = compute_anchor_loss(gaussians, global_iter)
+        total_loss = loss + L_anchor
+        loss_components['L_anchor'] = L_anchor.item() if torch.is_tensor(L_anchor) else L_anchor
+        loss_components['lambda_anchor'] = lambda_anchor
+
         if PEAK_SUPPORT_UPDATE_INTERVAL > 0 and global_iter % PEAK_SUPPORT_UPDATE_INTERVAL == 0:
-            update_peak_support(gaussians, viewpoint_cam, sonar_config, sonar_scale_factor, peak_mask.detach())
+            update_peak_support(gaussians, viewpoint_cam, sonar_config, sonar_scale_factor, peak_mask.detach(), sonar_extrinsic)
 
         # Backward - skip if no gradients (no visible surfels)
-        if loss.requires_grad:
-            loss.backward()
+        if total_loss.requires_grad:
+            total_loss.backward()
         else:
             if iteration % 100 == 0:
                 print(f"  [Warning] Iter {iteration}: No visible surfels for frame, skipping backward")
@@ -1560,17 +1762,22 @@ if STAGE3_ITERATIONS > 0:
 
             # FOV-aware pruning after stabilization
             if global_iter >= FOV_PRUNE_START and FOV_PRUNE_INTERVAL > 0 and global_iter % FOV_PRUNE_INTERVAL == 0:
-                num_pruned = prune_outside_fov(gaussians, training_frames, sonar_config, sonar_scale_factor)
+                num_pruned = prune_outside_fov(gaussians, training_frames, sonar_config, sonar_scale_factor, sonar_extrinsic)
                 if num_pruned > 0:
                     print(f"  [FOV prune] Removed {num_pruned} surfels outside FOV, {len(gaussians.get_xyz)} remaining")
 
         scale_value = sonar_scale_factor.get_scale_value()
-        record_metrics(loss.item(), scale_value, "stage3")
-        log_loss(metric_step, "stage3", loss_components, loss.item(), scale_value, len(gaussians.get_xyz))
+        mean_disp = compute_mean_displacement(gaussians)
+        record_metrics(total_loss.item(), scale_value, "stage3")
+        log_loss(metric_step, "stage3", loss_components, total_loss.item(), scale_value, len(gaussians.get_xyz), mean_disp)
 
         # Periodic memory cleanup
         if iteration % 100 == 0:
             torch.cuda.empty_cache()
+
+        # Log displacement periodically
+        if ANCHOR_LOG_INTERVAL > 0 and global_iter % ANCHOR_LOG_INTERVAL == 0:
+            print(f"  [Anchor] Iter {global_iter}: mean_disp={mean_disp:.4f}m, L_anchor={loss_components['L_anchor']:.4f}, λ={lambda_anchor:.0f}")
 
         if DEBUG_STATS_INTERVAL > 0 and global_iter % DEBUG_STATS_INTERVAL == 0:
             print_collapse_stats(global_iter, loss_components, gaussians)
@@ -1578,8 +1785,8 @@ if STAGE3_ITERATIONS > 0:
         if iteration % 10 == 0 or iteration == 1:
             print(
                 f"  Iter {iteration:3d}: L_pos={loss_components['L_pos']:.4f}, L_neg={loss_components['L_neg']:.4f}, "
-                f"L_blob={loss_components['L_blob']:.4f}, L_KL={loss_components['L_KL']:.4f}, "
-                f"L_mass={loss_components['L_mass']:.4f}, scale={scale_value:.4f}, pts={len(gaussians.get_xyz)}"
+                f"L_out={loss_components.get('L_out', 0.0):.4f}, L_anchor={loss_components['L_anchor']:.4f}, "
+                f"scale={scale_value:.4f}, pts={len(gaussians.get_xyz)}"
             )
 
     print(f"Stage 3 complete. Surfels: {len(gaussians.get_xyz)}")
@@ -1587,7 +1794,7 @@ if STAGE3_ITERATIONS > 0:
     # Final FOV diagnostic and forced prune before mesh extraction
     print("\n  Final FOV check before mesh extraction:")
     for i, cam in enumerate(training_frames):
-        details = is_in_sonar_fov(gaussians.get_xyz, cam, sonar_config, sonar_scale_factor, return_details=True)
+        details = is_in_sonar_fov(gaussians.get_xyz, cam, sonar_config, sonar_scale_factor, sonar_extrinsic, return_details=True)
         in_fov = details["in_fov"]
         print(f"    Frame {i}: {in_fov.sum().item()}/{len(gaussians.get_xyz)} in FOV")
         if not in_fov.all():
@@ -1602,7 +1809,7 @@ if STAGE3_ITERATIONS > 0:
                       f"el=[{el.min().item():.1f}, {el.max().item():.1f}]°")
 
     # Force final prune
-    num_pruned = prune_outside_fov(gaussians, training_frames, sonar_config, sonar_scale_factor)
+    num_pruned = prune_outside_fov(gaussians, training_frames, sonar_config, sonar_scale_factor, sonar_extrinsic)
     if num_pruned > 0:
         print(f"  [Final prune] Removed {num_pruned} surfels, {len(gaussians.get_xyz)} remaining")
 
@@ -1654,8 +1861,9 @@ print("=" * 60)
 print(f"\nOutput directory: {OUTPUT_DIR}")
 print(f"\nFinal scale factor: {sonar_scale_factor.get_scale_value():.6f}")
 print(f"\nGenerated files:")
-print(f"  - sonar_init_points.ply       (Combined points from {NUM_TRAINING_FRAMES} frames)")
-print(f"  - pose_pyramids_wireframe.ply (Wireframes for training frames)")
+print(f"  - sonar_init_points.ply              (Combined points from {NUM_TRAINING_FRAMES} frames)")
+print(f"  - pose_pyramids_wireframe.ply       (Camera pose wireframes)")
+print(f"  - sonar_pose_pyramids_wireframe.ply (Sonar pose wireframes with offset)")
 print(f"  - mesh_before_training.ply    (Mesh before any training)")
 print(f"  - mesh_after_iter1.ply        (Mesh after 1st iteration)")
 print(f"  - mesh_after_stage1.ply       (Mesh after Stage 1: scale learning)")

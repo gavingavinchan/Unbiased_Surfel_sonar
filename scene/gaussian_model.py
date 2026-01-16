@@ -309,6 +309,9 @@ class GaussianModel:
         if hasattr(self, "peak_support"):
             self.peak_support = self.peak_support[valid_points_mask]
 
+        if hasattr(self, "initial_xyz"):
+            self.initial_xyz = self.initial_xyz[valid_points_mask]
+
     def cat_tensors_to_optimizer(self, tensors_dict):
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
@@ -355,6 +358,10 @@ class GaussianModel:
             new_support = torch.zeros((new_xyz.shape[0],), device=self.peak_support.device)
             self.peak_support = torch.cat([self.peak_support, new_support], dim=0)
 
+        if hasattr(self, "initial_xyz"):
+            # New points use their current position as initial (zero anchor loss)
+            self.initial_xyz = torch.cat([self.initial_xyz, new_xyz.detach().clone()], dim=0)
+
     def densify_and_split(self, grads, grad_threshold, scene_extent, N=2):
         n_init_points = self.get_xyz.shape[0]
         # Extract points that satisfy the gradient condition
@@ -363,6 +370,21 @@ class GaussianModel:
         selected_pts_mask = torch.where(padded_grad >= grad_threshold, True, False)
         selected_pts_mask = torch.logical_and(selected_pts_mask,
                                               torch.max(self.get_scaling, dim=1).values > self.percent_dense*scene_extent)
+
+        # Gate by peak_support if available (only densify near GT peaks)
+        densify_support_min = getattr(self, "densify_peak_support_min", None)
+        if hasattr(self, "peak_support") and densify_support_min is not None:
+            selected_pts_mask = torch.logical_and(selected_pts_mask,
+                                                  self.peak_support >= densify_support_min)
+
+        num_split = selected_pts_mask.sum().item()
+
+        # Log densification quality if peak_support is available
+        if hasattr(self, "peak_support") and num_split > 0:
+            split_support = self.peak_support[selected_pts_mask]
+            mean_support = split_support.mean().item()
+            frac_good = (split_support > 0.2).float().mean().item()
+            print(f"    [Densify split] {num_split} pts: mean_support={mean_support:.3f}, frac>0.2={frac_good:.2f}")
 
         stds = self.get_scaling[selected_pts_mask].repeat(N,1)
         stds = torch.cat([stds, 0 * torch.ones_like(stds[:,:1])], dim=-1)
@@ -386,7 +408,22 @@ class GaussianModel:
         selected_pts_mask = torch.where(torch.norm(grads, dim=-1) >= grad_threshold, True, False)
         selected_pts_mask = torch.logical_and(selected_pts_mask,
                                               torch.max(self.get_scaling, dim=1).values <= self.percent_dense*scene_extent)
-        
+
+        # Gate by peak_support if available (only densify near GT peaks)
+        densify_support_min = getattr(self, "densify_peak_support_min", None)
+        if hasattr(self, "peak_support") and densify_support_min is not None:
+            selected_pts_mask = torch.logical_and(selected_pts_mask,
+                                                  self.peak_support >= densify_support_min)
+
+        num_cloned = selected_pts_mask.sum().item()
+
+        # Log densification quality if peak_support is available
+        if hasattr(self, "peak_support") and num_cloned > 0:
+            cloned_support = self.peak_support[selected_pts_mask]
+            mean_support = cloned_support.mean().item()
+            frac_good = (cloned_support > 0.2).float().mean().item()
+            print(f"    [Densify clone] {num_cloned} pts: mean_support={mean_support:.3f}, frac>0.2={frac_good:.2f}")
+
         new_xyz = self._xyz[selected_pts_mask]
         new_features_dc = self._features_dc[selected_pts_mask]
         new_features_rest = self._features_rest[selected_pts_mask]

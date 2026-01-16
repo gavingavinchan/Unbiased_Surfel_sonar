@@ -201,27 +201,29 @@ def build_sonar_config(args) -> SonarConfig:
 def get_camera_to_sonar_transform(device="cuda"):
     """
     Get the transformation matrix from camera frame to sonar frame.
-    
+
     The sonar is mounted:
+    - 8cm behind the camera (translation in -Z direction in camera frame)
     - 10cm above the camera (translation in -Y direction in camera frame)
     - Pitched down 5 degrees (rotation around X-axis)
-    
+
     Camera frame convention (OpenCV/COLMAP):
     - +X = right
     - +Y = down
     - +Z = forward (optical axis)
-    
+
     Sonar frame convention:
     - +X = forward (boresight)
     - +Y = right
     - +Z = down
-    
+
     Returns:
         T_cam_to_sonar: 4x4 homogeneous transformation matrix
     """
-    # Translation: sonar is 10cm above camera (in camera frame: -Y direction)
-    # In camera frame coordinates: [0, -0.1, 0] (up is -Y)
-    translation = torch.tensor([0.0, -0.1, 0.0], device=device)
+    # Translation: sonar offset from camera in camera frame coordinates
+    # - 8cm behind: -Z direction (-0.08)
+    # - 10cm above: -Y direction (-0.10) since +Y is down
+    translation = torch.tensor([0.0, -0.10, -0.08], device=device)
     
     # Rotation: sonar is pitched down 5 degrees relative to camera
     # Pitch down = rotation around X-axis by +5 degrees (in camera frame)
@@ -320,93 +322,115 @@ class SonarExtrinsic(nn.Module):
 # Sonar-Based Point Cloud Generation
 # =============================================================================
 
-def sonar_frame_to_points(camera, sonar_config, intensity_threshold=0.05, mask_top_rows=10):
+def sonar_frame_to_points(camera, sonar_config, intensity_threshold=0.05, mask_top_rows=10,
+                          use_sonar_extrinsic=True):
     """
     Generate 3D points from a single sonar frame via backward projection.
-    
+
     For each valid sonar pixel (intensity > threshold):
     - Convert (col, row) -> (azimuth, range)
     - Assume elevation = 0 (center of beam)
-    - Convert to 3D in sonar frame: x = r*cos(az), y = -r*sin(az), z = 0
-    - Transform to world frame using camera pose
-    
+    - Convert to 3D in sonar frame
+    - Transform to world frame using sonar pose (camera pose + extrinsic)
+
     Args:
         camera: Camera object with R, T, and original_image
         sonar_config: SonarConfig with FOV and range parameters
         intensity_threshold: Minimum intensity to consider valid (0-1)
         mask_top_rows: Skip top N rows (closest range, often artifacts)
-        
+        use_sonar_extrinsic: If True, apply sonar extrinsic offset from camera pose
+
     Returns:
         points: [N, 3] numpy array of 3D points in world coordinates
         colors: [N, 3] numpy array of RGB colors (grayscale from intensity)
     """
     import numpy as np
-    
+
     # Get sonar image
     image = camera.original_image  # [3, H, W] or [1, H, W]
     if image.shape[0] == 3:
         intensity = image[0]  # Take first channel
     else:
         intensity = image.squeeze(0)
-    
+
     # Convert to numpy
     if hasattr(intensity, 'numpy'):
         intensity = intensity.numpy()
-    
+
     H, W = intensity.shape
-    
+
     # Create mask for valid pixels
     valid_mask = intensity > intensity_threshold
-    
+
     # Mask out top rows (artifacts at close range)
     if mask_top_rows > 0:
         valid_mask[:mask_top_rows, :] = False
-    
+
     # Get indices of valid pixels
     rows, cols = np.where(valid_mask)
-    
+
     if len(rows) == 0:
         return np.zeros((0, 3)), np.zeros((0, 3))
-    
+
     # Convert pixel coords to polar (azimuth, range)
     # Azimuth: center column = 0, left = positive, right = negative
     half_az_rad = math.radians(sonar_config.azimuth_fov / 2)
     azimuth = -(cols - W / 2) / (W / 2) * half_az_rad  # radians
-    
+
     # Range: top row = range_min, bottom row = range_max
     range_vals = sonar_config.range_min + (rows / H) * (sonar_config.range_max - sonar_config.range_min)
-    
-    # Convert to 3D in sonar/camera frame
+
+    # Convert to 3D in sonar frame
     # Assuming elevation = 0 (center of beam)
-    # Camera frame: +Z forward, +X right, +Y down
+    # Sonar/camera frame: +Z forward, +X right, +Y down
     # Azimuth convention: right side of image = negative azimuth, left = positive
-    # So: x = -r * sin(az) to get positive x for right side (negative azimuth)
-    x_cam = -range_vals * np.sin(azimuth)  # lateral (flipped to match +X = right)
-    y_cam = np.zeros_like(range_vals)      # elevation = 0
-    z_cam = range_vals * np.cos(azimuth)   # forward (depth)
-    
-    points_cam = np.stack([x_cam, y_cam, z_cam], axis=1)  # [N, 3]
-    
-    # Transform to world coordinates
-    # Camera pose: R is world-to-camera rotation, T is world-to-camera translation
-    # point_world = R^T @ (point_cam - T) ... wait, that's not right
-    # Actually: point_cam = R @ point_world + T
-    # So: point_world = R^T @ point_cam - R^T @ T = R^T @ (point_cam - T)
-    # But T is not subtracted from point_cam, it's: point_world = R^T @ point_cam + camera_center
-    # where camera_center = -R^T @ T
-    
+    x_sonar = -range_vals * np.sin(azimuth)  # lateral
+    y_sonar = np.zeros_like(range_vals)       # elevation = 0
+    z_sonar = range_vals * np.cos(azimuth)    # forward (depth)
+
+    points_sonar = np.stack([x_sonar, y_sonar, z_sonar], axis=1)  # [N, 3]
+
+    # Get camera pose
     R_w2c = camera.R  # [3, 3]
     T_w2c = camera.T  # [3]
-    R_c2w = R_w2c.T
-    camera_center = -R_c2w @ T_w2c
-    
-    # Transform points: point_world = R_c2w @ point_cam + camera_center
-    points_world = (R_c2w @ points_cam.T).T + camera_center  # [N, 3]
-    
+
+    if use_sonar_extrinsic:
+        # Apply sonar extrinsic: sonar is offset from camera
+        # Sonar offset in camera frame: 8cm back (-Z), 10cm up (-Y), 5deg pitch down
+        sonar_offset_cam = np.array([0.0, -0.10, -0.08])  # [x, y, z] in camera frame
+
+        # Pitch rotation (5 degrees down around X axis)
+        pitch_rad = math.radians(5.0)
+        cos_p = math.cos(pitch_rad)
+        sin_p = math.sin(pitch_rad)
+        R_pitch = np.array([
+            [1.0, 0.0, 0.0],
+            [0.0, cos_p, -sin_p],
+            [0.0, sin_p, cos_p]
+        ])
+
+        # Camera to world
+        R_c2w = R_w2c.T
+        camera_center = -R_c2w @ T_w2c
+
+        # Sonar position in world = camera_center + R_c2w @ sonar_offset_cam
+        sonar_center = camera_center + R_c2w @ sonar_offset_cam
+
+        # Sonar orientation in world = R_c2w @ R_pitch
+        R_sonar2w = R_c2w @ R_pitch
+
+        # Transform points from sonar frame to world
+        points_world = (R_sonar2w @ points_sonar.T).T + sonar_center
+    else:
+        # Use camera pose directly (legacy behavior)
+        R_c2w = R_w2c.T
+        camera_center = -R_c2w @ T_w2c
+        points_world = (R_c2w @ points_sonar.T).T + camera_center
+
     # Get colors from intensity (grayscale -> RGB)
     intensities = intensity[rows, cols]
     colors = np.stack([intensities, intensities, intensities], axis=1)  # [N, 3]
-    
+
     return points_world, colors
 
 
