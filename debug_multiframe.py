@@ -699,8 +699,19 @@ INIT_SCALE_FACTORS = {
 INIT_SCALE_FACTOR = INIT_SCALE_FACTORS[DATASET_KEY]
 
 OUTPUT_DIR_BASE = f"./output/debug_multiframe_{DATASET_KEY}"
+OUTPUT_DIR_OVERRIDE = os.environ.get("SONAR_OUTPUT_DIR")
 NUM_TRAINING_FRAMES = 500  # Number of frames to use for training
 PYRAMID_DEPTH = 0.5
+
+def env_float(name, default):
+    value = os.environ.get(name)
+    return float(value) if value not in (None, "") else default
+
+
+def env_int(name, default):
+    value = os.environ.get(name)
+    return int(value) if value not in (None, "") else default
+
 
 # Curriculum learning parameters
 STAGE1_ITERATIONS = 0   # Learn scale only (surfels frozen) - DISABLED, using known scale
@@ -717,17 +728,30 @@ POISSON_MIN_OPACITY = 0.05
 POISSON_OPACITY_PERCENTILE = 0.2
 POISSON_SCALE_PERCENTILE = 0.9
 
-# Create unique output folder
-def get_next_output_dir(base_path):
-    """Find next available output directory with incrementing version."""
-    version = 1
-    while True:
-        output_dir = f"{base_path}_v{version}"
-        if not os.path.exists(output_dir):
-            return output_dir
-        version += 1
+POISSON_DEPTH = env_int("POISSON_DEPTH", POISSON_DEPTH)
+POISSON_DENSITY_QUANTILE = env_float("POISSON_DENSITY_QUANTILE", POISSON_DENSITY_QUANTILE)
+POISSON_MIN_OPACITY = env_float("POISSON_MIN_OPACITY", POISSON_MIN_OPACITY)
+POISSON_OPACITY_PERCENTILE = env_float("POISSON_OPACITY_PERCENTILE", POISSON_OPACITY_PERCENTILE)
+POISSON_SCALE_PERCENTILE = env_float("POISSON_SCALE_PERCENTILE", POISSON_SCALE_PERCENTILE)
 
-OUTPUT_DIR = get_next_output_dir(OUTPUT_DIR_BASE)
+STAGE2_ITERATIONS = env_int("SONAR_STAGE2_ITERS", STAGE2_ITERATIONS)
+
+# Create output folder
+if OUTPUT_DIR_OVERRIDE:
+    OUTPUT_DIR = OUTPUT_DIR_OVERRIDE
+else:
+    # Create unique output folder
+    def get_next_output_dir(base_path):
+        """Find next available output directory with incrementing version."""
+        version = 1
+        while True:
+            output_dir = f"{base_path}_v{version}"
+            if not os.path.exists(output_dir):
+                return output_dir
+            version += 1
+
+    OUTPUT_DIR = get_next_output_dir(OUTPUT_DIR_BASE)
+
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 setup_logging(OUTPUT_DIR)
