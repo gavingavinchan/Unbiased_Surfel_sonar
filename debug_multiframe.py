@@ -1032,13 +1032,13 @@ torch.cuda.manual_seed_all(SEED)
 # =============================================================================
 # Configuration
 # =============================================================================
-DATASET_PATH = "/home/gavin/ros2_ws/outputs/session_2025-12-08_16-35-13_sonar_data_for_2dgs"
+DATASET_PATH = "/home/gavin/ros2_ws/outputs/session_2025-12-08_16-35-13_sonar_data_for_2dgs_R2"
 OUTPUT_DIR_BASE = "./output/debug_multiframe"
 NUM_TRAINING_FRAMES = 500  # Number of frames to use for training
 PYRAMID_DEPTH = 0.5
 
 # Curriculum learning parameters
-STAGE1_ITERATIONS = 0   # Learn scale only (surfels frozen) - DISABLED, using known scale=0.65
+STAGE1_ITERATIONS = 0   # Learn scale only (surfels frozen) - DISABLED, using known scale=0.6127
 STAGE2_ITERATIONS = 30000  # Learn surfels only (scale frozen)
 STAGE3_ITERATIONS = 1   # Joint fine-tuning
 
@@ -1257,11 +1257,14 @@ all_points = []
 all_colors = []
 all_normals = []
 
+INIT_SCALE_FACTOR = 0.6127  # Scale factor for COLMAP-to-metric conversion (calibrated for R2)
+
 for i, cam in enumerate(training_frames):
     points, colors = sonar_frame_to_points(
         cam, sonar_config,
         intensity_threshold=INTENSITY_THRESHOLD / 255.0,  # Same threshold as training
-        mask_top_rows=10
+        mask_top_rows=10,
+        scale_factor=INIT_SCALE_FACTOR  # Convert metric ranges to COLMAP scale
     )
 
     if len(points) == 0:
@@ -1328,7 +1331,7 @@ gaussians.peak_support_grad_min = PEAK_SUPPORT_GRAD_MIN
 
 # Diagnostic: Check initial FOV visibility with temporary scale factor
 print("\nDiagnostic: Initial surfel FOV visibility")
-temp_scale = SonarScaleFactor(init_value=0.65).cuda()  # Use calibrated scale
+temp_scale = SonarScaleFactor(init_value=0.6127).cuda()  # Use calibrated scale
 for i, cam in enumerate(training_frames):
     details = is_in_sonar_fov(gaussians.get_xyz, cam, sonar_config, temp_scale, sonar_extrinsic, return_details=True)
     in_fov = details["in_fov"]
@@ -1414,7 +1417,7 @@ gaussians.densify_peak_support_min = DENSIFY_PEAK_SUPPORT_MIN
 # Scale factor module
 # Known scale factor from calibration cube in COLMAP (true value ~0.66)
 # TODO: Fix scale factor learning - currently not converging to correct value
-sonar_scale_factor = SonarScaleFactor(init_value=0.65).cuda()
+sonar_scale_factor = SonarScaleFactor(init_value=0.6127).cuda()
 
 # Separate optimizer for scale factor
 scale_optimizer = torch.optim.Adam([

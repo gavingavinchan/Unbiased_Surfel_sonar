@@ -323,7 +323,7 @@ class SonarExtrinsic(nn.Module):
 # =============================================================================
 
 def sonar_frame_to_points(camera, sonar_config, intensity_threshold=0.05, mask_top_rows=10,
-                          use_sonar_extrinsic=True):
+                          use_sonar_extrinsic=True, scale_factor=1.0):
     """
     Generate 3D points from a single sonar frame via backward projection.
 
@@ -339,9 +339,12 @@ def sonar_frame_to_points(camera, sonar_config, intensity_threshold=0.05, mask_t
         intensity_threshold: Minimum intensity to consider valid (0-1)
         mask_top_rows: Skip top N rows (closest range, often artifacts)
         use_sonar_extrinsic: If True, apply sonar extrinsic offset from camera pose
+        scale_factor: Scale factor to convert metric to COLMAP scale (1/scale_factor).
+                      Points are created in COLMAP scale so render_sonar can scale
+                      both positions and translations consistently to metric.
 
     Returns:
-        points: [N, 3] numpy array of 3D points in world coordinates
+        points: [N, 3] numpy array of 3D points in world coordinates (COLMAP scale)
         colors: [N, 3] numpy array of RGB colors (grayscale from intensity)
     """
     import numpy as np
@@ -377,27 +380,27 @@ def sonar_frame_to_points(camera, sonar_config, intensity_threshold=0.05, mask_t
     half_az_rad = math.radians(sonar_config.azimuth_fov / 2)
     azimuth = -(cols - W / 2) / (W / 2) * half_az_rad  # radians
 
-    # Range: top row = range_min, bottom row = range_max
-    range_vals = sonar_config.range_min + (rows / H) * (sonar_config.range_max - sonar_config.range_min)
+    # Range: top row = range_min, bottom row = range_max (metric)
+    range_vals_metric = sonar_config.range_min + (rows / H) * (sonar_config.range_max - sonar_config.range_min)
 
-    # Convert to 3D in sonar frame
+    # Convert to 3D in sonar frame (metric scale)
     # Assuming elevation = 0 (center of beam)
     # Sonar/camera frame: +Z forward, +X right, +Y down
     # Azimuth convention: right side of image = negative azimuth, left = positive
-    x_sonar = -range_vals * np.sin(azimuth)  # lateral
-    y_sonar = np.zeros_like(range_vals)       # elevation = 0
-    z_sonar = range_vals * np.cos(azimuth)    # forward (depth)
+    x_sonar = -range_vals_metric * np.sin(azimuth)  # lateral (metric)
+    y_sonar = np.zeros_like(range_vals_metric)       # elevation = 0
+    z_sonar = range_vals_metric * np.cos(azimuth)    # forward (depth, metric)
 
-    points_sonar = np.stack([x_sonar, y_sonar, z_sonar], axis=1)  # [N, 3]
+    points_sonar_metric = np.stack([x_sonar, y_sonar, z_sonar], axis=1)  # [N, 3] metric
 
-    # Get camera pose
+    # Get camera pose (COLMAP scale)
     R_w2c = camera.R  # [3, 3]
     T_w2c = camera.T  # [3]
 
     if use_sonar_extrinsic:
         # Apply sonar extrinsic: sonar is offset from camera
         # Sonar offset in camera frame: 8cm back (-Z), 10cm up (-Y), 5deg pitch down
-        sonar_offset_cam = np.array([0.0, -0.10, -0.08])  # [x, y, z] in camera frame
+        sonar_offset_cam = np.array([0.0, -0.10, -0.08])  # metric
 
         # Pitch rotation (5 degrees down around X axis)
         pitch_rad = math.radians(5.0)
@@ -411,21 +414,30 @@ def sonar_frame_to_points(camera, sonar_config, intensity_threshold=0.05, mask_t
 
         # Camera to world
         R_c2w = R_w2c.T
-        camera_center = -R_c2w @ T_w2c
+        camera_center_colmap = -R_c2w @ T_w2c
 
-        # Sonar position in world = camera_center + R_c2w @ sonar_offset_cam
-        sonar_center = camera_center + R_c2w @ sonar_offset_cam
+        # Scale camera center to metric (consistent with render_sonar)
+        camera_center_metric = camera_center_colmap * scale_factor
+
+        # Sonar position in world (metric) = camera_metric + R_c2w @ sonar_offset_metric
+        sonar_center_metric = camera_center_metric + R_c2w @ sonar_offset_cam
 
         # Sonar orientation in world = R_c2w @ R_pitch
         R_sonar2w = R_c2w @ R_pitch
 
-        # Transform points from sonar frame to world
-        points_world = (R_sonar2w @ points_sonar.T).T + sonar_center
+        # Transform points from sonar frame to world (all in metric)
+        points_world_metric = (R_sonar2w @ points_sonar_metric.T).T + sonar_center_metric
+
+        # Convert back to COLMAP scale for storage
+        # render_sonar will scale these back to metric
+        points_world = points_world_metric / scale_factor
     else:
         # Use camera pose directly (legacy behavior)
         R_c2w = R_w2c.T
-        camera_center = -R_c2w @ T_w2c
-        points_world = (R_c2w @ points_sonar.T).T + camera_center
+        camera_center_colmap = -R_c2w @ T_w2c
+        camera_center_metric = camera_center_colmap * scale_factor
+        points_world_metric = (R_c2w @ points_sonar_metric.T).T + camera_center_metric
+        points_world = points_world_metric / scale_factor
 
     # Get colors from intensity (grayscale -> RGB)
     intensities = intensity[rows, cols]
