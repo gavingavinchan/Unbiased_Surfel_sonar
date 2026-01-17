@@ -15,6 +15,11 @@ Outputs:
 - pose_pyramids_wireframe.ply: Wireframe pyramids for all training frames
 - mesh_before_training.ply: Mesh from sonar-initialized Gaussians (no training)
 - mesh_after_training.ply: Mesh after curriculum training
+- mesh_poisson_init.ply: Poisson mesh from initial point cloud
+- mesh_poisson_after_stage1.ply: Poisson mesh after Stage 1
+- mesh_poisson_after_stage2.ply: Poisson mesh after Stage 2
+- mesh_poisson_after_stage3.ply: Poisson mesh after Stage 3
+- mesh_poisson_after_iter1.ply: Poisson mesh after iter 1
 - comparison_frame_N.png: GT vs rendered for each training frame
 """
 
@@ -33,7 +38,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from argparse import Namespace
 from scene import Scene, GaussianModel
 from scene.dataset_readers import readColmapCameras, readColmapSceneInfo, getNerfppNorm
-from gaussian_renderer import render_sonar, render
+from gaussian_renderer import render_sonar, render, quaternion_to_normal
 from utils.sonar_utils import (SonarConfig, SonarScaleFactor, SonarExtrinsic,
                                 sonar_frame_to_points, sonar_frames_to_point_cloud)
 from utils.graphics_utils import BasicPointCloud
@@ -75,13 +80,14 @@ def is_in_sonar_fov(xyz, camera, sonar_config, scale_factor, return_details=Fals
     R_w2v = w2v[:3, :3]
     t_w2v = w2v[3, :3]
 
-    # Apply scale factor to translation
-    scale = scale_factor.scale
+    # Apply scale factor to translation and points
+    scale = scale_factor.scale if scale_factor is not None else 1.0
+    xyz_scaled = xyz * scale
     t_w2v_scaled = scale * t_w2v
 
-    # Transform points to sonar frame: p_sonar = p_world @ R.T + t_scaled
+    # Transform points to sonar frame: p_sonar = p_world_scaled @ R.T + t_scaled
     # This matches render_sonar exactly
-    points_sonar = (xyz @ R_w2v.T) + t_w2v_scaled  # [N, 3]
+    points_sonar = (xyz_scaled @ R_w2v.T) + t_w2v_scaled  # [N, 3]
 
     # Camera/sonar frame: +X = right, +Y = down, +Z = forward
     right = points_sonar[:, 0]
@@ -180,10 +186,14 @@ def is_fully_in_sonar_fov(xyz, scaling, camera, sonar_config, scale_factor):
 
     # Transform points to sonar frame (same as is_in_sonar_fov)
     w2v = camera.world_view_transform.cuda()
+
     R_w2v = w2v[:3, :3]
     t_w2v = w2v[3, :3]
-    t_w2v_scaled = scale_factor.scale * t_w2v
-    points_sonar = (xyz @ R_w2v.T) + t_w2v_scaled
+    scale = scale_factor.scale if scale_factor is not None else 1.0
+    xyz_scaled = xyz * scale
+    t_w2v_scaled = scale * t_w2v
+    points_sonar = (xyz_scaled @ R_w2v.T) + t_w2v_scaled
+
 
     right = points_sonar[:, 0]
     down = points_sonar[:, 1]
@@ -427,11 +437,69 @@ def close_logs():
         LOG_FILE.close()
 
 
-def extract_and_save_mesh(gaussians, mesh_cameras, pipe_args, bg_color,
-                          output_dir, filename, depth_trunc=None, voxel_size=None, sdf_trunc=None):
+def render_sonar_for_mesh(sonar_config, scale_factor, sonar_extrinsic=None):
+    def _render(viewpoint_cam, gaussians, pipe, bg_color):
+        return render_sonar(
+            viewpoint_cam, gaussians, bg_color,
+            sonar_config=sonar_config,
+            scale_factor=scale_factor,
+            sonar_extrinsic=sonar_extrinsic
+        )
+    return _render
+
+
+def save_poisson_mesh(points, normals, output_dir, filename, opacities=None, scales=None):
+    if points.size == 0:
+        print("  Skipping Poisson mesh (no points)")
+        return
+
+    if opacities is not None:
+        opacities = np.asarray(opacities).reshape(-1)
+        min_opacity = POISSON_MIN_OPACITY
+        perc_opacity = np.quantile(opacities, POISSON_OPACITY_PERCENTILE)
+        opacity_cutoff = max(min_opacity, perc_opacity)
+        keep_mask = opacities >= opacity_cutoff
+        points = points[keep_mask]
+        normals = normals[keep_mask]
+        print(f"  Poisson filter: opacity >= {opacity_cutoff:.4f} (kept {keep_mask.sum()}/{len(keep_mask)})")
+
+    if scales is not None:
+        scales = np.asarray(scales)
+        if scales.ndim == 2:
+            scales = np.max(scales, axis=1)
+        max_scale = np.quantile(scales, POISSON_SCALE_PERCENTILE)
+        keep_mask = scales <= max_scale
+        points = points[keep_mask]
+        normals = normals[keep_mask]
+        print(f"  Poisson filter: scale <= {max_scale:.4f} (kept {keep_mask.sum()}/{len(keep_mask)})")
+
+    if points.size == 0:
+        print("  Skipping Poisson mesh (filtered all points)")
+        return
+
+    pcd_mesh = o3d.geometry.PointCloud()
+    pcd_mesh.points = o3d.utility.Vector3dVector(points)
+    pcd_mesh.normals = o3d.utility.Vector3dVector(normals)
+    poisson_mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
+        pcd_mesh, depth=POISSON_DEPTH
+    )
+    densities = np.asarray(densities)
+    if densities.size > 0:
+        cutoff = np.quantile(densities, POISSON_DENSITY_QUANTILE)
+        poisson_mesh.remove_vertices_by_mask(densities < cutoff)
+        print(f"  Removed low-density vertices below {cutoff:.6f}")
+    poisson_mesh_path = os.path.join(output_dir, filename)
+    o3d.io.write_triangle_mesh(poisson_mesh_path, poisson_mesh)
+    print(f"  Saved: {poisson_mesh_path} (V={len(poisson_mesh.vertices)}, T={len(poisson_mesh.triangles)})")
+
+
+def extract_and_save_mesh(gaussians, mesh_cameras, pipe_args, bg_color, sonar_config,
+                          scale_factor, output_dir, filename, depth_trunc=None, voxel_size=None, sdf_trunc=None,
+                          sonar_extrinsic=None):
     """Helper to extract and save mesh at a checkpoint."""
     print(f"  Extracting mesh: {filename}")
-    extractor = GaussianExtractor(gaussians, render, pipe_args, bg_color=bg_color)
+    render_fn = render_sonar_for_mesh(sonar_config, scale_factor, sonar_extrinsic=sonar_extrinsic)
+    extractor = GaussianExtractor(gaussians, render_fn, pipe_args, bg_color=bg_color)
     extractor.reconstruction(mesh_cameras)
 
     if depth_trunc is None:
@@ -615,18 +683,39 @@ torch.cuda.manual_seed_all(SEED)
 # =============================================================================
 # Configuration
 # =============================================================================
-DATASET_PATH = "/home/gavin/ros2_ws/outputs/session_2025-12-08_16-35-13_sonar_data_for_2dgs"
-OUTPUT_DIR_BASE = "./output/debug_multiframe"
+DATASET_PATHS = {
+    "legacy": "/home/gavin/ros2_ws/outputs/session_2025-12-08_16-35-13_sonar_data_for_2dgs",
+    "r2": "/home/gavin/ros2_ws/outputs/session_2025-12-08_16-35-13_sonar_data_for_2dgs_R2",
+}
+DATASET_KEY = os.environ.get("SONAR_DATASET", "r2")
+if DATASET_KEY not in DATASET_PATHS:
+    raise ValueError(f"Unknown dataset key '{DATASET_KEY}'. Options: {list(DATASET_PATHS)}")
+DATASET_PATH = DATASET_PATHS[DATASET_KEY]
+
+INIT_SCALE_FACTORS = {
+    "legacy": 0.65,
+    "r2": 0.6127,
+}
+INIT_SCALE_FACTOR = INIT_SCALE_FACTORS[DATASET_KEY]
+
+OUTPUT_DIR_BASE = f"./output/debug_multiframe_{DATASET_KEY}"
 NUM_TRAINING_FRAMES = 500  # Number of frames to use for training
 PYRAMID_DEPTH = 0.5
 
 # Curriculum learning parameters
-STAGE1_ITERATIONS = 0   # Learn scale only (surfels frozen) - DISABLED, using known scale=0.65
-STAGE2_ITERATIONS = 30000  # Learn surfels only (scale frozen)
+STAGE1_ITERATIONS = 0   # Learn scale only (surfels frozen) - DISABLED, using known scale
+STAGE2_ITERATIONS = 1000  # Learn surfels only (scale frozen)
 STAGE3_ITERATIONS = 1   # Joint fine-tuning
 
 # FOV-aware pruning: remove surfels that drift outside all training cameras' FOV
 FOV_PRUNE_INTERVAL = 100  # Prune every N iterations (0 to disable)
+
+POISSON_MESH = True
+POISSON_DEPTH = 9
+POISSON_DENSITY_QUANTILE = 0.02
+POISSON_MIN_OPACITY = 0.05
+POISSON_OPACITY_PERCENTILE = 0.2
+POISSON_SCALE_PERCENTILE = 0.9
 
 # Create unique output folder
 def get_next_output_dir(base_path):
@@ -649,6 +738,8 @@ print("=" * 60)
 print("DEBUG: Multi-Frame Training with Curriculum Learning")
 print("=" * 60)
 print(f"Seed: {SEED}")
+print(f"Dataset: {DATASET_KEY} ({DATASET_PATH})")
+print(f"Init scale: {INIT_SCALE_FACTOR}")
 print(f"Num training frames: {NUM_TRAINING_FRAMES}")
 print(f"Curriculum: Stage1={STAGE1_ITERATIONS} (scale), Stage2={STAGE2_ITERATIONS} (surfels), Stage3={STAGE3_ITERATIONS} (joint)")
 print(f"FOV pruning interval: {FOV_PRUNE_INTERVAL} iterations")
@@ -770,11 +861,14 @@ all_points = []
 all_colors = []
 all_normals = []
 
+temp_scale_factor = SonarScaleFactor(init_value=INIT_SCALE_FACTOR).cuda()
+
 for i, cam in enumerate(training_frames):
     points, colors = sonar_frame_to_points(
         cam, sonar_config,
         intensity_threshold=INTENSITY_THRESHOLD / 255.0,  # Same threshold as training
-        mask_top_rows=10
+        mask_top_rows=10,
+        scale_factor=temp_scale_factor.get_scale_value()
     )
 
     if len(points) == 0:
@@ -831,13 +925,20 @@ basic_pcd = BasicPointCloud(points=points, colors=colors, normals=normals)
 cameras_extent = getNerfppNorm(train_cameras)["radius"]
 print(f"Cameras extent (radius): {cameras_extent:.3f}")
 
+if POISSON_MESH:
+    print("\nPoisson reconstruction from initial point cloud...")
+    save_poisson_mesh(points, normals, OUTPUT_DIR, "mesh_poisson_init.ply")
+
+
 gaussians = GaussianModel(dataset_args.sh_degree)
 gaussians.create_from_pcd(basic_pcd, cameras_extent)
 print(f"Gaussian count: {len(gaussians.get_xyz)}")
 
 # Diagnostic: Check initial FOV visibility with temporary scale factor
-print("\nDiagnostic: Initial surfel FOV visibility")
-temp_scale = SonarScaleFactor(init_value=0.65).cuda()  # Use calibrated scale
+# ============================================================================
+
+temp_scale = SonarScaleFactor(init_value=INIT_SCALE_FACTOR).cuda()  # Use calibrated scale
+
 for i, cam in enumerate(training_frames):
     details = is_in_sonar_fov(gaussians.get_xyz, cam, sonar_config, temp_scale, return_details=True)
     in_fov = details["in_fov"]
@@ -862,7 +963,12 @@ background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
 NUM_CAMERAS_FOR_MESH = 50
 mesh_cameras = train_cameras[:NUM_CAMERAS_FOR_MESH]
-gaussExtractor = GaussianExtractor(gaussians, render, pipe_args, bg_color=bg_color)
+gaussExtractor = GaussianExtractor(
+    gaussians,
+    render_sonar_for_mesh(sonar_config, temp_scale, sonar_extrinsic=None),
+    pipe_args,
+    bg_color=bg_color
+)
 
 print(f"Reconstructing from {NUM_CAMERAS_FOR_MESH} cameras...")
 gaussExtractor.reconstruction(mesh_cameras)
@@ -882,8 +988,8 @@ o3d.io.write_triangle_mesh(mesh_before_path, mesh_before)
 print(f"Saved: {mesh_before_path}")
 print(f"  Vertices: {len(mesh_before.vertices)}, Triangles: {len(mesh_before.triangles)}")
 
-# Save comparison images before any training (using scale=1.0)
-temp_scale = SonarScaleFactor(init_value=1.0).cuda()
+# Save comparison images before any training (using calibrated scale)
+temp_scale = SonarScaleFactor(init_value=INIT_SCALE_FACTOR).cuda()
 save_comparison_images(training_frames, gaussians, background, sonar_config,
                        temp_scale, OUTPUT_DIR, "before_training")
 
@@ -916,7 +1022,7 @@ gaussians.training_setup(Namespace(
 # Scale factor module
 # Known scale factor from calibration cube in COLMAP (true value ~0.66)
 # TODO: Fix scale factor learning - currently not converging to correct value
-sonar_scale_factor = SonarScaleFactor(init_value=0.65).cuda()
+sonar_scale_factor = SonarScaleFactor(init_value=INIT_SCALE_FACTOR).cuda()
 
 # Separate optimizer for scale factor
 scale_optimizer = torch.optim.Adam([
@@ -1054,18 +1160,47 @@ if STAGE1_ITERATIONS > 0:
 
         # Extract mesh after iteration 1
         if iteration == 1:
+            if POISSON_MESH:
+                poisson_points = gaussians.get_xyz.detach()
+                poisson_normals = quaternion_to_normal(gaussians.get_rotation.detach()).cpu().numpy()
+                poisson_opacity = gaussians.get_opacity.detach().cpu().numpy().squeeze(-1)
+                poisson_scale = gaussians.get_scaling.detach().cpu().numpy()
+                save_poisson_mesh(
+                    poisson_points.cpu().numpy(),
+                    poisson_normals,
+                    OUTPUT_DIR,
+                    "mesh_poisson_after_iter1.ply",
+                    opacities=poisson_opacity,
+                    scales=poisson_scale
+                )
             _, depth_trunc, voxel_size, sdf_trunc = extract_and_save_mesh(
-                gaussians, mesh_cameras, pipe_args, bg_color,
-                OUTPUT_DIR, "mesh_after_iter1.ply"
+                gaussians, mesh_cameras, pipe_args, bg_color, sonar_config,
+                sonar_scale_factor, OUTPUT_DIR, "mesh_after_iter1.ply",
+                sonar_extrinsic=None
             )
 
     print(f"Stage 1 complete. Scale factor: {sonar_scale_factor.get_scale_value():.6f}")
 
+    if POISSON_MESH:
+        poisson_points = gaussians.get_xyz.detach()
+        poisson_normals = quaternion_to_normal(gaussians.get_rotation.detach()).cpu().numpy()
+        poisson_opacity = gaussians.get_opacity.detach().cpu().numpy().squeeze(-1)
+        poisson_scale = gaussians.get_scaling.detach().cpu().numpy()
+        save_poisson_mesh(
+            poisson_points.cpu().numpy(),
+            poisson_normals,
+            OUTPUT_DIR,
+            "mesh_poisson_after_stage1.ply",
+            opacities=poisson_opacity,
+            scales=poisson_scale
+        )
+
     # Extract mesh after Stage 1
     extract_and_save_mesh(
-        gaussians, mesh_cameras, pipe_args, bg_color,
-        OUTPUT_DIR, "mesh_after_stage1.ply",
-        depth_trunc=depth_trunc, voxel_size=voxel_size, sdf_trunc=sdf_trunc
+        gaussians, mesh_cameras, pipe_args, bg_color, sonar_config,
+        sonar_scale_factor, OUTPUT_DIR, "mesh_after_stage1.ply",
+        depth_trunc=depth_trunc, voxel_size=voxel_size, sdf_trunc=sdf_trunc,
+        sonar_extrinsic=None
     )
 
     # Save comparison images after Stage 1
@@ -1148,11 +1283,26 @@ if STAGE2_ITERATIONS > 0:
 
     print(f"Stage 2 complete. Surfels: {len(gaussians.get_xyz)}")
 
+    if POISSON_MESH:
+        poisson_points = gaussians.get_xyz.detach()
+        poisson_normals = quaternion_to_normal(gaussians.get_rotation.detach()).cpu().numpy()
+        poisson_opacity = gaussians.get_opacity.detach().cpu().numpy().squeeze(-1)
+        poisson_scale = gaussians.get_scaling.detach().cpu().numpy()
+        save_poisson_mesh(
+            poisson_points.cpu().numpy(),
+            poisson_normals,
+            OUTPUT_DIR,
+            "mesh_poisson_after_stage2.ply",
+            opacities=poisson_opacity,
+            scales=poisson_scale
+        )
+
     # Extract mesh after Stage 2
     extract_and_save_mesh(
-        gaussians, mesh_cameras, pipe_args, bg_color,
-        OUTPUT_DIR, "mesh_after_stage2.ply",
-        depth_trunc=depth_trunc, voxel_size=voxel_size, sdf_trunc=sdf_trunc
+        gaussians, mesh_cameras, pipe_args, bg_color, sonar_config,
+        sonar_scale_factor, OUTPUT_DIR, "mesh_after_stage2.ply",
+        depth_trunc=depth_trunc, voxel_size=voxel_size, sdf_trunc=sdf_trunc,
+        sonar_extrinsic=None
     )
 
     # Save comparison images after Stage 2
@@ -1261,11 +1411,26 @@ if STAGE3_ITERATIONS > 0:
     o3d.io.write_point_cloud(final_pcd_path, final_pcd)
     print(f"  Saved surfel positions: {final_pcd_path} ({len(final_xyz)} points)")
 
+    if POISSON_MESH:
+        poisson_points = gaussians.get_xyz.detach()
+        poisson_normals = quaternion_to_normal(gaussians.get_rotation.detach()).cpu().numpy()
+        poisson_opacity = gaussians.get_opacity.detach().cpu().numpy().squeeze(-1)
+        poisson_scale = gaussians.get_scaling.detach().cpu().numpy()
+        save_poisson_mesh(
+            poisson_points.cpu().numpy(),
+            poisson_normals,
+            OUTPUT_DIR,
+            "mesh_poisson_after_stage3.ply",
+            opacities=poisson_opacity,
+            scales=poisson_scale
+        )
+
     # Extract mesh after Stage 3
     extract_and_save_mesh(
-        gaussians, mesh_cameras, pipe_args, bg_color,
-        OUTPUT_DIR, "mesh_after_stage3.ply",
-        depth_trunc=depth_trunc, voxel_size=voxel_size, sdf_trunc=sdf_trunc
+        gaussians, mesh_cameras, pipe_args, bg_color, sonar_config,
+        sonar_scale_factor, OUTPUT_DIR, "mesh_after_stage3.ply",
+        depth_trunc=depth_trunc, voxel_size=voxel_size, sdf_trunc=sdf_trunc,
+        sonar_extrinsic=None
     )
 
     # Save comparison images after Stage 3

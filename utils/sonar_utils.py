@@ -320,24 +320,27 @@ class SonarExtrinsic(nn.Module):
 # Sonar-Based Point Cloud Generation
 # =============================================================================
 
-def sonar_frame_to_points(camera, sonar_config, intensity_threshold=0.05, mask_top_rows=10):
+def sonar_frame_to_points(camera, sonar_config, intensity_threshold=0.05, mask_top_rows=10,
+                          scale_factor=1.0):
     """
     Generate 3D points from a single sonar frame via backward projection.
     
     For each valid sonar pixel (intensity > threshold):
     - Convert (col, row) -> (azimuth, range)
     - Assume elevation = 0 (center of beam)
-    - Convert to 3D in sonar frame: x = r*cos(az), y = -r*sin(az), z = 0
-    - Transform to world frame using camera pose
+    - Convert to 3D in sonar frame (metric)
+    - Transform to world frame using camera pose (COLMAP scale)
+    - Convert to COLMAP scale for downstream consistency
     
     Args:
         camera: Camera object with R, T, and original_image
         sonar_config: SonarConfig with FOV and range parameters
         intensity_threshold: Minimum intensity to consider valid (0-1)
         mask_top_rows: Skip top N rows (closest range, often artifacts)
+        scale_factor: COLMAP->metric scale; points returned in COLMAP scale
         
     Returns:
-        points: [N, 3] numpy array of 3D points in world coordinates
+        points: [N, 3] numpy array of 3D points in world coordinates (COLMAP scale)
         colors: [N, 3] numpy array of RGB colors (grayscale from intensity)
     """
     import numpy as np
@@ -373,19 +376,19 @@ def sonar_frame_to_points(camera, sonar_config, intensity_threshold=0.05, mask_t
     half_az_rad = math.radians(sonar_config.azimuth_fov / 2)
     azimuth = -(cols - W / 2) / (W / 2) * half_az_rad  # radians
     
-    # Range: top row = range_min, bottom row = range_max
-    range_vals = sonar_config.range_min + (rows / H) * (sonar_config.range_max - sonar_config.range_min)
+    # Range: top row = range_min, bottom row = range_max (metric)
+    range_vals_metric = sonar_config.range_min + (rows / H) * (sonar_config.range_max - sonar_config.range_min)
     
-    # Convert to 3D in sonar/camera frame
+    # Convert to 3D in sonar/camera frame (metric)
     # Assuming elevation = 0 (center of beam)
     # Camera frame: +Z forward, +X right, +Y down
     # Azimuth convention: right side of image = negative azimuth, left = positive
     # So: x = -r * sin(az) to get positive x for right side (negative azimuth)
-    x_cam = -range_vals * np.sin(azimuth)  # lateral (flipped to match +X = right)
-    y_cam = np.zeros_like(range_vals)      # elevation = 0
-    z_cam = range_vals * np.cos(azimuth)   # forward (depth)
+    x_cam = -range_vals_metric * np.sin(azimuth)  # lateral (flipped to match +X = right)
+    y_cam = np.zeros_like(range_vals_metric)      # elevation = 0
+    z_cam = range_vals_metric * np.cos(azimuth)   # forward (depth)
     
-    points_cam = np.stack([x_cam, y_cam, z_cam], axis=1)  # [N, 3]
+    points_cam_metric = np.stack([x_cam, y_cam, z_cam], axis=1)  # [N, 3] metric
     
     # Transform to world coordinates
     # Camera pose: R is world-to-camera rotation, T is world-to-camera translation
@@ -398,10 +401,12 @@ def sonar_frame_to_points(camera, sonar_config, intensity_threshold=0.05, mask_t
     R_w2c = camera.R  # [3, 3]
     T_w2c = camera.T  # [3]
     R_c2w = R_w2c.T
-    camera_center = -R_c2w @ T_w2c
+    camera_center_colmap = -R_c2w @ T_w2c
+    camera_center_metric = camera_center_colmap * scale_factor
     
-    # Transform points: point_world = R_c2w @ point_cam + camera_center
-    points_world = (R_c2w @ points_cam.T).T + camera_center  # [N, 3]
+    # Transform points: point_world_metric = R_c2w @ point_cam_metric + camera_center_metric
+    points_world_metric = (R_c2w @ points_cam_metric.T).T + camera_center_metric  # [N, 3] metric
+    points_world = points_world_metric / scale_factor  # back to COLMAP scale
     
     # Get colors from intensity (grayscale -> RGB)
     intensities = intensity[rows, cols]
@@ -412,7 +417,7 @@ def sonar_frame_to_points(camera, sonar_config, intensity_threshold=0.05, mask_t
 
 def sonar_frames_to_point_cloud(cameras, sonar_config, intensity_threshold=0.05, 
                                  mask_top_rows=10, max_points_per_frame=5000,
-                                 voxel_downsample=None):
+                                 voxel_downsample=None, scale_factor=1.0):
     """
     Generate combined 3D point cloud from multiple sonar frames.
     
@@ -437,7 +442,8 @@ def sonar_frames_to_point_cloud(cameras, sonar_config, intensity_threshold=0.05,
         points, colors = sonar_frame_to_points(
             cam, sonar_config, 
             intensity_threshold=intensity_threshold,
-            mask_top_rows=mask_top_rows
+            mask_top_rows=mask_top_rows,
+            scale_factor=scale_factor
         )
         
         if len(points) == 0:

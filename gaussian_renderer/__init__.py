@@ -219,41 +219,51 @@ def render_sonar(viewpoint_camera, pc: GaussianModel, bg_color: torch.Tensor,
     """
     device = pc.get_xyz.device
     
-    # Get camera pose and transform to sonar pose if extrinsic is provided
-    w2c = viewpoint_camera.world_view_transform  # [4, 4] world-to-camera
-    
-    # Apply camera-to-sonar extrinsic transform if provided
-    if sonar_extrinsic is not None:
-        w2v = sonar_extrinsic(w2c)  # world-to-sonar
-    else:
-        w2v = w2c  # Use camera pose directly (assumes poses are already sonar poses)
-    
-    # Extract rotation and translation from world-to-view transform
+    # Get camera pose
+    w2c = viewpoint_camera.world_view_transform  # [4, 4] world-to-camera (COLMAP scale)
+
+    # Extract rotation and translation from camera transform
     # Note: world_view_transform is stored TRANSPOSED (row-major for OpenGL)
     # Rotation is in top-left 3x3, but translation is in ROW 3 (not column 3)
-    R_w2v = w2v[:3, :3]  # rotation (same either way for orthogonal matrix)
-    t_w2v = w2v[3, :3]   # translation is in row 3, not column 3!
-    
-    # Apply scale factor to translation
+    R_w2c = w2c[:3, :3]  # rotation
+    t_w2c = w2c[3, :3]   # translation (COLMAP scale)
+
+    # Scale COLMAP translation to metric BEFORE applying sonar extrinsic
     if scale_factor is not None:
-        t_w2v_scaled = scale_factor.scale * t_w2v
-        # Debug: check requires_grad
-        # print(f"[DEBUG] scale.requires_grad={scale_factor.scale.requires_grad}, t_w2v_scaled.requires_grad={t_w2v_scaled.requires_grad}")
+        t_w2c_metric = scale_factor.scale * t_w2c
     else:
-        t_w2v_scaled = t_w2v
-    
+        t_w2c_metric = t_w2c
+
+    # Rebuild w2c with scaled translation
+    w2c_scaled = w2c.clone()
+    w2c_scaled[3, :3] = t_w2c_metric
+
+    # Now apply camera-to-sonar extrinsic transform (metric offset added to metric translation)
+    if sonar_extrinsic is not None:
+        w2v = sonar_extrinsic(w2c_scaled)  # world-to-sonar (metric scale)
+    else:
+        w2v = w2c_scaled  # Use camera pose directly
+
+    # Extract rotation and translation from world-to-sonar transform
+    R_w2v = w2v[:3, :3]
+    t_w2v_scaled = w2v[3, :3]   # translation (metric scale)
+
     # Reconstruct the scaled transform for point transformation
     w2v_scaled = w2v.clone()
     w2v_scaled[:3, 3] = t_w2v_scaled
-    
+
     # Compute sonar origin in world coordinates WITHOUT torch.inverse()
     # For transform [R|t], the camera/sonar center is at -R^T @ t
     # This avoids numerical instability from inverse()
     R_v2w = R_w2v.T  # transpose = inverse for orthogonal rotation matrix
     sonar_origin = -R_v2w @ t_w2v_scaled  # [3]
-    
-    # Get surfel positions
+
+    # Get surfel positions and scale to metric
     means3D = pc.get_xyz  # [N, 3]
+    if scale_factor is not None:
+        means3D_scaled = scale_factor.scale * means3D
+    else:
+        means3D_scaled = means3D
     N = means3D.shape[0]
     
     # Create screenspace points tensor for gradient tracking
@@ -264,8 +274,8 @@ def render_sonar(viewpoint_camera, pc: GaussianModel, bg_color: torch.Tensor,
         pass
     
     # Transform surfel positions to sonar frame using scaled transform
-    # p_sonar = R @ p_world + t_scaled
-    points_sonar = (means3D @ R_w2v.T) + t_w2v_scaled  # [N, 3]
+    # p_sonar = R @ p_world_scaled + t_scaled (both in metric)
+    points_sonar = (means3D_scaled @ R_w2v.T) + t_w2v_scaled  # [N, 3]
     
     # Compute polar coordinates in CAMERA frame (OpenCV convention)
     # Camera frame: +X = right, +Y = down, +Z = forward

@@ -119,9 +119,10 @@ def sonar_ranges_to_points(view, range_image, sonar_config, scale_factor=None):
     
     # Get sonar-to-world transform from view WITHOUT using torch.inverse()
     # world_view_transform is [R|t] where camera_pos = -R^T @ t
+    # NOTE: translation is stored in ROW 3 (not column 3)
     w2v = view.world_view_transform  # [4, 4]
     R_w2v = w2v[:3, :3]  # rotation world-to-view
-    t_w2v = w2v[:3, 3]   # translation
+    t_w2v = w2v[3, :3]   # translation (row 3)
     
     # Apply scale factor to translation if provided
     if scale_factor is not None:
