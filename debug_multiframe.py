@@ -1032,9 +1032,9 @@ torch.cuda.manual_seed_all(SEED)
 # =============================================================================
 # Configuration
 # =============================================================================
-DATASET_PATH = "/home/gavin/ros2_ws/outputs/session_2025-12-08_16-35-13_sonar_data_for_2dgs_R2"
+DATASET_PATH = "/home/gavin/ros2_ws/outputs/session_2025-12-08_16-35-13_sonar_data_for_2dgs"
 OUTPUT_DIR_BASE = "./output/debug_multiframe"
-NUM_TRAINING_FRAMES = 500  # Number of frames to use for training
+NUM_TRAINING_FRAMES = 5  # Number of frames to use for testing (set to 500 for full run)
 PYRAMID_DEPTH = 0.5
 
 # Curriculum learning parameters
@@ -1257,7 +1257,7 @@ all_points = []
 all_colors = []
 all_normals = []
 
-INIT_SCALE_FACTOR = 0.6127  # Scale factor for COLMAP-to-metric conversion (calibrated for R2)
+INIT_SCALE_FACTOR = 0.65  # Scale factor for COLMAP-to-metric conversion (old dataset)
 
 for i, cam in enumerate(training_frames):
     points, colors = sonar_frame_to_points(

@@ -250,12 +250,15 @@ def get_camera_to_sonar_transform(device="cuda"):
     
     # Combined rotation: first apply pitch, then convention change
     R_cam_to_sonar = R_convention @ R_pitch
-    
+
     # Build 4x4 homogeneous transform
+    # NOTE: world_view_transform uses row-major (transposed) convention
+    # where translation is in row 3, not column 3. So we build the
+    # transform in that convention directly.
     T_cam_to_sonar = torch.eye(4, device=device)
     T_cam_to_sonar[:3, :3] = R_cam_to_sonar
-    T_cam_to_sonar[:3, 3] = R_convention @ translation  # Transform translation to sonar frame
-    
+    T_cam_to_sonar[3, :3] = R_convention @ translation  # Row 3 for row-major convention
+
     return T_cam_to_sonar
 
 
