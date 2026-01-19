@@ -76,7 +76,16 @@ class PoissonTunerApp:
 
         self.scene_widget = gui.SceneWidget()
         self.scene_widget.scene = rendering.Open3DScene(self.window.renderer)
-        self.scene_widget.scene.set_background([0.05, 0.05, 0.05, 1.0])
+        self.scene_widget.scene.set_background([0.15, 0.15, 0.15, 1.0])
+        self.sun_direction = [0.577, -0.577, -0.577]
+        self.sun_color = [1.0, 1.0, 1.0]
+        self.sun_intensity = 75000
+        self.scene_widget.scene.scene.set_sun_light(
+            self.sun_direction,
+            self.sun_color,
+            self.sun_intensity
+        )
+        self.scene_widget.scene.scene.enable_sun_light(True)
 
         self.panel = gui.Vert(0, gui.Margins(10, 10, 10, 10))
         self.panel.add_child(gui.Label("Poisson Tuner"))
@@ -132,6 +141,13 @@ class PoissonTunerApp:
         self.mesh_note = gui.Label("(auto-loads first available Poisson mesh)")
         self.panel.add_child(self.mesh_note)
 
+        self.brightness = gui.Slider(gui.Slider.DOUBLE)
+        self.brightness.set_limits(10000, 200000)
+        self.brightness.double_value = self.sun_intensity
+        self.brightness.set_on_value_changed(self._on_brightness)
+        self.panel.add_child(gui.Label("Brightness"))
+        self.panel.add_child(self.brightness)
+
         self.run_button = gui.Button("Run")
         self.run_button.set_on_clicked(self._on_run)
         self.panel.add_child(self.run_button)
@@ -182,6 +198,14 @@ class PoissonTunerApp:
         def update():
             self.log_box.text_value += f"\n{text}"
         gui.Application.instance.post_to_main_thread(self.window, update)
+
+    def _on_brightness(self, value):
+        self.sun_intensity = float(value)
+        self.scene_widget.scene.scene.set_sun_light(
+            self.sun_direction,
+            self.sun_color,
+            self.sun_intensity
+        )
 
     def _on_run(self):
         if self._is_running:
@@ -235,6 +259,7 @@ class PoissonTunerApp:
             self.scene_widget.scene.clear_geometry()
             material = rendering.MaterialRecord()
             material.shader = "defaultLit"
+            material.base_color = [0.9, 0.9, 0.9, 1.0]
             self.scene_widget.scene.add_geometry("mesh", mesh, material)
             bounds = mesh.get_axis_aligned_bounding_box()
             self.scene_widget.setup_camera(60.0, bounds, bounds.get_center())
