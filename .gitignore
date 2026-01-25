@@ -177,7 +177,7 @@ datasets/
 # Project Specific
 # =========================
 # Local-only files
-CLAUDE.md
+scratchpad.md
 .cursor/
 pdf/
 submodules/simple-knn/
