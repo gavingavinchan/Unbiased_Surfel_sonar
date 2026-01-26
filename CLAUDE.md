@@ -1,6 +1,7 @@
 # CLAUDE.md
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+It is loaded at the start of every session; keep it concise to avoid bloating context length.
 
 ## Project Overview
 
@@ -235,44 +236,13 @@ Used by `debug_multiframe.py` and the GUI. Defaults change often; check the scri
 
 ### Documentation
 - Planning & progress: `plans/` (PLAN_* files, progress_overview.md, scientific_progress.md)
+- Plans guide: `plans/README.md` (plan format and naming)
+- Snapshots: `snapshots/` (SNAPSHOT_* files; current-state notes meant to reduce repeated forensics)
+- Snapshots guide: `snapshots/README.md` (snapshot format and naming)
 - Reference docs: `docs/` (DATASET_PREPARATION.md, R2_DATASET_ISSUES.md, unbiased_surfel_installation_notes.md)
 - Archived docs: `docs/old/` (superseded by plans/)
 
 ## Documentation Workflow
-
-### Plan Files
-
-Filename format: `plans/PLAN_<NAME>_<YYYY-MM-DD>.md`
-
-Example: `plans/PLAN_GUI_POISSON_TUNER_2026-01-17.md`
-
-Content format:
-
-```markdown
-# Plan: <Title>
-
-**Date/Time:** YYYY-MM-DD HH:MM:SS CST
-**Git Commit:** <current commit hash>
-
-## Goals
-- Goal 1
-- Goal 2
-
-## Plan
-1. Step 1
-2. Step 2
-
-## Decisions
-For each significant decision, document:
-- **What**: The decision made
-- **Why**: Reasoning behind the choice
-- **Alternatives considered**: Other approaches and why they weren't chosen
-
-## Notes
-- Additional context
-```
-
-Plans are updated as decisions evolve, then committed with the implementation.
 
 ### Git Commit Format
 
@@ -302,3 +272,4 @@ Examples:
 - Limitations and open issues
 
 Both should be updated before git commits to keep project history coherent.
+Plans are updated as decisions evolve, then committed with the implementation.
