@@ -229,6 +229,9 @@ Algorithm 4 (Poisson Tuning Loop)
 3. Solve for $\chi^*$ with tunable depth and smoothing parameters.
 4. Iterate parameters and refresh mesh outputs for evaluation.
 
+### 9.3 Sonar TSDF Mismatch (Observation)
+The current TSDF extraction path still uses Open3D pinhole intrinsics and pinhole ray integration, while sonar rendering produces a polar range image. This projection mismatch causes extracted meshes to extend beyond the sonar FOV even when surfels remain inside the FOV. A sonar-native TSDF plan (ray integration along sonar azimuth/elevation) is documented in the latest snapshots for future implementation once training stability is improved.
+
 ## 10. Diagnostics and Validation
 We added diagnostics tied to scale learning, FOV constraints, and projection consistency.
 

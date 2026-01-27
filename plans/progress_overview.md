@@ -332,3 +332,9 @@ flowchart TB
 - Most effort has gone into the core projection pipeline and debug harness, followed by repeated quality tuning and pruning.
 - The project shifted from geometry correctness to quality tuning, then to dataset-specific fixes (R2) and mesh tooling.
 - The main blockers are scale identifiability and R2 dataset non-equivalence, which both undermine downstream mesh quality.
+
+## Recent Updates (2026-01-27)
+- Single-frame R2 run recorded (see snapshots) showed good surfel alignment but TSDF meshes outside FOV and often empty; Poisson meshes succeeded.
+- Added `SONAR_NUM_FRAMES` env override in `debug_multiframe.py` to control training frame count.
+- Fixed Poisson filtering alignment bug when applying opacity + scale filters sequentially.
+- Recorded mesh extraction notes and sonar-native TSDF plan in snapshots for future implementation.

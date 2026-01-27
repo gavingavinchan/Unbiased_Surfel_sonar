@@ -453,6 +453,9 @@ def save_poisson_mesh(points, normals, output_dir, filename, opacities=None, sca
         print("  Skipping Poisson mesh (no points)")
         return
 
+    if scales is not None:
+        scales = np.asarray(scales)
+
     if opacities is not None:
         opacities = np.asarray(opacities).reshape(-1)
         min_opacity = POISSON_MIN_OPACITY
@@ -461,10 +464,11 @@ def save_poisson_mesh(points, normals, output_dir, filename, opacities=None, sca
         keep_mask = opacities >= opacity_cutoff
         points = points[keep_mask]
         normals = normals[keep_mask]
+        if scales is not None:
+            scales = scales[keep_mask]
         print(f"  Poisson filter: opacity >= {opacity_cutoff:.4f} (kept {keep_mask.sum()}/{len(keep_mask)})")
 
     if scales is not None:
-        scales = np.asarray(scales)
         if scales.ndim == 2:
             scales = np.max(scales, axis=1)
         max_scale = np.quantile(scales, POISSON_SCALE_PERCENTILE)
@@ -700,7 +704,7 @@ INIT_SCALE_FACTOR = INIT_SCALE_FACTORS[DATASET_KEY]
 
 OUTPUT_DIR_BASE = f"./output/debug_multiframe_{DATASET_KEY}"
 OUTPUT_DIR_OVERRIDE = os.environ.get("SONAR_OUTPUT_DIR")
-NUM_TRAINING_FRAMES = 500  # Number of frames to use for training
+NUM_TRAINING_FRAMES_DEFAULT = 500  # Number of frames to use for training
 PYRAMID_DEPTH = 0.5
 
 def env_float(name, default):
@@ -735,6 +739,7 @@ POISSON_OPACITY_PERCENTILE = env_float("POISSON_OPACITY_PERCENTILE", POISSON_OPA
 POISSON_SCALE_PERCENTILE = env_float("POISSON_SCALE_PERCENTILE", POISSON_SCALE_PERCENTILE)
 
 STAGE2_ITERATIONS = env_int("SONAR_STAGE2_ITERS", STAGE2_ITERATIONS)
+NUM_TRAINING_FRAMES = env_int("SONAR_NUM_FRAMES", NUM_TRAINING_FRAMES_DEFAULT)
 
 # Create output folder
 if OUTPUT_DIR_OVERRIDE:
