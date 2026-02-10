@@ -41,6 +41,8 @@ Side view (looking along azimuth direction):
        sonar origin
 ```
 
+Sign convention note: the sketch is geometric intuition only. For implementation, elevation uses the camera/view frame convention defined later (`+X right, +Y down, +Z forward`), so `+elevation` points toward `+Y` (down in image coordinates) and `-elevation` points toward `-Y`.
+
 ### Projection Asymmetry
 
 **Forward projection is many-to-one:**
@@ -83,10 +85,9 @@ Frame A (pose 1)                    Frame B (pose 2)
 
 ---
 
-## Authorship Marker
+## Authorship
 
-- **opus4.5**: Content above this marker (original plan text)
-- **gpt-5.2-codex**: Content below this marker (addendum)
+This plan was developed collaboratively by **opus4.5** and **gpt-5.2-codex**, with user input. Sections are attributed inline where relevant.
 
 ---
 
@@ -108,8 +109,8 @@ Frame A (pose 1)                    Frame B (pose 2)
 
 ### 3) Two-stage elevation solver
 
-- Stage 1 (geometry-first): estimate elevation per surfel (or per region) using multi-view arc consistency, with minimal photometric reliance.
-- Stage 2 (photometric): freeze or lightly regularize elevation and run standard training to refine appearance and geometry.
+- Phase A (geometry-first): estimate elevation per surfel (or per region) using multi-view arc consistency, with minimal photometric reliance.
+- Phase B (photometric): freeze or lightly regularize elevation and run standard training to refine appearance and geometry.
 - Benefit: decouples elevation resolution from appearance; risk: needs decent initialization or it can lock in errors.
 
 ---
@@ -666,19 +667,188 @@ Multi-view loss creates gradient in y!
 
 ---
 
+## Note: Missing High-Level Decisions
+
+Two areas are not yet planned at a high level and should be called out explicitly:
+
+1. **Loss formulation**: which elevation-aware loss (arc-intersection, multi-view likelihood, surfel-to-expected-point anchor, variance, etc.) is the primary driver, and how it is staged/weighted.
+2. **Normals path**: whether normals remain elevation-agnostic (elevation=0) during early stages, or if/when they should use learned elevation.
+
+---
+
+## Plan Response: Loss + Normals (gpt-5.2-codex)
+
+### Guiding objective
+
+- **End goal**: prioritize geometric correctness of mesh extraction; elevation-aware losses and normals handling should be evaluated by downstream mesh fidelity, not just image loss.
+
+### Loss formulation (high-level)
+
+- **Primary driver in Stage 1**: GT-anchored elevation distribution likelihood (bins) with entropy/temperature annealing.
+- **Optional stabilizer**: keep arc loss available only as a low-weight term when extra stabilization is needed.
+- **Always-on baseline**: existing photometric + bright-pixel loss stays active, but elevation-aware losses remain separate and weighted to avoid destabilizing scale or appearance.
+- **Stage 2 (optional)**: densification uses multi-view agreement scoring rather than adding a new global loss term.
+
+### Normals path (high-level)
+
+- **Early Stage 1**: allow normals to update via photometric loss, but keep any explicit normal-based regularization losses very low-weight and ramp them up gradually; avoid hard coupling to uncertain elevation early.
+- **Late Stage 1 onward**: recompute normals using expected elevation (from bins) once distributions are stable; enable stronger normal-based regularizers after convergence.
+- **Throughout training**: geometric correctness of normals matters because mesh export is the end goal. Multi-view training naturally constrains normals; the staged approach controls HOW STRONGLY we regularize, not WHETHER normals matter.
+
+### Priority note (gpt-5.2-codex)
+
+- **Mesh quality focus**: prioritize surfel positions and sizes over normals for final mesh fidelity; normals are secondary and should not destabilize geometry.
+
+### Decision: Fixed opacity for sonar (opus4.5, user)
+
+**Default: All surfels are fully opaque (opacity = 1.0).** Configurable toggle to re-enable learnable opacity if needed.
+
+**Physical reasoning**: Sonar images underwater hard surfaces (metal, concrete, rock, seabed). Unlike light interacting with glass or fog, sound waves at these frequencies reflect off hard surfaces — they do not pass through. There is no physical basis for partial opacity in this domain. Every surface is either there (fully opaque) or not there (no surfel).
+
+**Impact on the intensity model**:
+```
+Before (learnable opacity):
+  intensity = opacity × max(0, normal · view_direction)
+  Three degrees of freedom: opacity, normal, view_direction(position)
+  Optimizer can trade off wrong normal ↔ wrong opacity to match brightness
+
+After (fixed opacity = 1.0):
+  intensity = max(0, normal · view_direction)
+  Two degrees of freedom: normal, view_direction(position)
+  Normal is directly constrained by brightness — less room to cheat
+```
+
+**Why this helps geometric correctness**:
+- Removes one degree of freedom the optimizer could exploit
+- Normal orientation is more tightly constrained by the photometric loss
+- If brightness is wrong, the optimizer MUST fix the normal or position — it can't compensate with opacity
+- Fewer learnable parameters = simpler optimization
+
+### Normals concern: appearance vs geometric correctness (opus4.5)
+
+**Mesh export is the end goal**, so geometric correctness of normals matters throughout training, not just at export time.
+
+**The problem**: The photometric loss only sees rendered pixel values. With fixed opacity, the current intensity model is:
+```
+intensity = max(0, normal · view_direction)
+```
+
+Note: this model is **physically incomplete** — see "Sonar intensity physics" section below for the full model. But even with a corrected model, the optimizer could still find wrong-position + wrong-normal combos that produce correct brightness from one viewpoint.
+
+**Why multi-view helps**: A "cheated" normal might look right from one viewing angle but wrong from another. With orbiting frames, a surfel is seen from many angles — this naturally constrains both position and normal. This is the primary defense against appearance-geometric divergence.
+
+**Why fixing normals only at export is risky**: If normals are "appearance-correct" but not "geometry-correct" during training, surfel positions may also be wrong (they co-adapted with the wrong normals). Swapping in correct normals at export doesn't fix the positions.
+
+**Implication**: Normal geometric correctness should be considered during training, not deferred to export.
+
+**Possible approaches**:
+1. **Neighbor normal consistency (smoothness prior)**: nearby surfels should have similar normals. Needs a tunable smoothness weight. **Edge-aware caveat**: a naive KNN approach would incorrectly smooth normals across sharp edges (e.g., two walls meeting at 90°). Two surfels can be spatially close but on different surfaces with legitimately different normals. Mitigations:
+   - **Normal-gated smoothness**: only apply the smoothness loss between neighbors whose normals are already within some angular threshold (e.g., < 45°). If normals differ by > 45°, assume they're on different surfaces and skip the penalty.
+   - **Clustering / segmentation**: group surfels into surface patches first, only smooth within patches.
+   - **Anisotropic weighting**: weight smoothness by both spatial distance AND normal similarity — large normal difference → low weight.
+2. **Multi-view normal consistency**: a surfel seen from many angles naturally constrains its normal. This should always be active — the more frames we train with, the stronger this constraint.
+3. **Elevation-derived normals**: once elevation distributions are available, compute expected normal from local surface geometry (finite differences of surfel positions). Penalize deviation from quaternion normal.
+
+### Sonar intensity physics (opus4.5, user)
+
+**Current model** (in render_sonar):
+```
+intensity = max(0, normal · view_direction)
+```
+
+**Target model** — includes **inverse square law** for physically correct distance falloff:
+```
+intensity = max(0, normal · view_direction) / distance²
+```
+
+Where `distance` is the range from the surfel to the sonar origin. This matters because:
+- A surfel at 3m returns much less intensity than the same surfel at 0.5m
+- The current model treats both equally, which is physically wrong
+- This could cause the optimizer to compensate with wrong normals for distant surfels
+
+**Decision**: Use a stabilized inverse-distance family model for training:
+`intensity = max(0, normal · view_direction) * gain / (max(distance, r0)^p + eps)`.
+For this project, the saved sonar images are treated as raw amplitudes (no range/gain compensation in data), so distance attenuation stays enabled by default. Start with `p=2.0`, keep `r0` (near-range floor) to avoid dynamic-range blow-up, and tune exponent/gain using mesh-first ablations.
+
+**Implementation note**: This requires modifying `render_sonar()` to include distance-based attenuation.
+
+### Surface scattering: deliberately ignored for now (user)
+
+**The physical environment**: The dataset is a **swimming pool**. Surfaces include:
+- **Tiles**: smooth — specular reflection (sound bounces like a mirror, strong return only at specific angles)
+- **Grout between tiles**: rough — diffuse scattering (sound scatters in all directions, more uniform return)
+- **Drain covers**: different material/geometry, likely mixed reflection
+
+The Lambertian model (pure diffuse) is a rough approximation. In reality the pool is dominated by smooth tiles which are more specular than diffuse. The scattering behavior depends on surface roughness relative to the acoustic wavelength.
+
+**Decision**: Ignore scattering physics for now. Use a single Lambertian reflectance model for all surfaces. The structure of interest is a PVC cube so all its surfaces are uniform in texture.
+
+**Known limitation**: Tiles may produce specular highlights (strong returns at mirror angles, weak returns elsewhere) that the Lambertian model cannot explain. The optimizer may compensate by distorting normals to "explain" specular highlights as diffuse returns. This is an acceptable tradeoff for the current stage of development.
+
+**Future importance**: To handle mixed tile/grout surfaces properly, would need per-surfel reflectance parameters (specular vs diffuse ratio, roughness) — similar to BRDF in standard rendering. Could also help with drain covers and other non-uniform features.
+
+---
+
 ## Open Questions
 
-1. **Correspondence mechanism**: How exactly to match pixels across frames for multi-view losses?
+1. **Hardware budget**: 8GB VRAM (4070 laptop), Intel i9 13th gen, 32GB RAM. Priority is to make it run first, optimize later.
 
-2. **Continuous vs discrete**:
-   - Optimize elevation as continuous variable?
-   - Or use discrete bins (K=20)?
+---
 
-3. **Distribution family**: For Idea A, use Gaussian, categorical, or mixture?
+## Correspondence Mechanism (opus4.5)
 
-4. **Initialization**: Start distributions as uniform? Or peaked at elevation=0?
+**Question**: How do we match pixels across frames for multi-view losses?
 
-5. **Computational budget**: What's acceptable iteration time increase?
+### Options Considered
+
+**Option A: Surfel-Anchored Correspondence**
+
+Use existing surfels as the bridge between frames.
+```
+Surfel S at position (x, y, z)
+    ├──► Forward project to Frame A → pixel_A
+    └──► Forward project to Frame B → pixel_B
+
+These pixels correspond because they both come from surfel S.
+```
+- Pros: No extra data structures, naturally handles visibility, correspondences update as surfels move
+- Cons: Only works where surfels exist, poor correspondences early in training when surfels are sparse/wrong
+
+**Option B: Elevation Arc Projection**
+
+For a pixel in Frame A, project its elevation arc to Frame B.
+```
+Frame A pixel → back-project with elevation e → 3D point P(e) → forward-project to Frame B
+```
+Different elevations land on different Frame B pixels — test all K bins, find which has consistent intensity.
+- Pros: Works without surfels, naturally finds correct elevation
+- Cons: Expensive (K projections per pixel per frame pair), assumes visibility
+
+**Option C: Intensity Matching (Classic Stereo)**
+
+Search Frame B for pixels with similar intensity to Frame A pixel, constrained to the epipolar curve (projected elevation arc).
+- Pros: Classic technique
+- Cons: Sonar is low-texture (large uniform regions), needs geometric constraint anyway
+
+**Option D: No Explicit Correspondence (Implicit via Loss)**
+
+Don't compute pixel-to-pixel correspondences. Train with all frames — the photometric loss naturally pushes surfels to multi-view consistent positions.
+- Pros: Simplest, no overhead, already how current training works
+- Cons: Relies on gradient descent, may converge slowly
+
+### Decision
+
+**Use Option D first** — no explicit correspondence. Multi-view consistency emerges implicitly from training with many frames (500 frames with overlapping FOV).
+
+If convergence is slow or geometry is poor, can add **Option A** (surfel-anchored) as an explicit multi-view consistency loss:
+```
+For surfel S visible in frames A and B:
+    pixel_A = forward_project(S, frame_A)
+    pixel_B = forward_project(S, frame_B)
+    Loss += (GT_A[pixel_A] - GT_B[pixel_B])²
+```
+
+**Note**: Option B (arc projection) is essentially what Idea A's "multi-view belief update" does — it's baked into the elevation distribution approach rather than being a separate correspondence step.
 
 ---
 
@@ -686,26 +856,25 @@ Multi-view loss creates gradient in y!
 
 ### Summary
 
-- **Stage 1 (geometry-first)**: Use surfel-centric arc constraints or soft arc-intersection loss to inject elevation gradients with minimal extra parameters (aligns with opus4.5 Option 1B / Option 2).
-- **Stage 2 (probabilistic elevation)**: Replace fixed elevation with a small distribution (K≈5–9 bins) or 2–4 stochastic samples; apply entropy/temperature annealing to sharpen over time (aligns with opus4.5 Idea A + my stochastic sampling).
-- **Stage 3 (optional densification)**: If specific regions remain high-error, add surfels along elevation arcs at multi-view agreement peaks (aligns with opus4.5 Option 3).
+- **Stage 0 (initialization)**: Random elevation-aware initialization.
+- **Stage 1 (probabilistic elevation)**: Use GT-anchored multi-view likelihood with a small elevation distribution (K≈5–9 bins) and entropy/temperature annealing as the primary driver.
+- **Stage 2 (optional densification)**: If specific regions remain high-error, add surfels along elevation arcs at multi-view agreement peaks (aligns with opus4.5 Option 3).
 
 ### Rationale
 
-- Low VRAM footprint and stable early training (Stage 1).
-- Resolves one-to-many ambiguity without per-pixel parameter explosion (Stage 2).
-- Targeted complexity only where needed (Stage 3).
+- Low VRAM footprint with a single primary optimization stage after initialization.
+- Resolves one-to-many ambiguity without per-pixel parameter explosion.
+- Keeps extra complexity targeted to optional densification only where needed.
 
 ---
 
 ## Feedback to Incorporate (opus4.5)
 
-- **Stage 1 init**: Randomize surfel elevation at initialization instead of setting all to elevation=0.
-- **Stage 2 bins**: Keep K small for first pass (K=5–9), but make K configurable for later increases (e.g., K=21).
-- **Stage 2 preference**: Start with discrete bins rather than stochastic sampling for stability and debuggability.
-- **Stage 3**: Keep densification optional and only use where needed.
-- **Alternative**: Consider running Stage 1 + Stage 2 together from the start (small K), to avoid a hard switch.
-- **Stage transition triggers**: Define how to move from Stage 1 → Stage 2 if sequential.
+- **Stage 0 init**: Randomize surfel elevation at initialization instead of setting all to elevation=0.
+- **Stage 1 bins**: Keep K small for first pass (K=5–9), but make K configurable for later increases (e.g., K=21).
+- **Stage 1 preference**: Start with discrete bins rather than stochastic sampling for stability and debuggability.
+- **Stage 2**: Keep densification optional and only use where needed.
+- **Schedule triggers**: Define thresholds/schedules for temperature annealing, coupling ramp, and support-pruning strictness.
 
 ---
 
@@ -713,6 +882,209 @@ Multi-view loss creates gradient in y!
 
 - **Accept random elevation init** with uniform sampling across the full elevation FOV by default (aligns with physical sonar ambiguity; keep range configurable if needed).
 - **Use discrete bins first**, keep K configurable from the start; target K=5–9 for dev, higher later.
-- **Keep Stage 3 optional**; only enable for persistent high-error regions.
-- **Start sequential for clarity**, but allow a combined Stage 1+2 mode as a config flag.
-- **Stage transition default**: fixed iteration count with optional early switch if arc-residual falls below a threshold (manual override still possible).
+- **Keep Stage 2 optional**; only enable for persistent high-error regions.
+- **Use one primary training stage after initialization** (bin likelihood + mandatory coupling), with optional low-weight arc stabilizer as a config flag.
+- **Progression default**: fixed schedules with optional early tightening based on entropy/support metrics (manual override still possible).
+
+---
+
+## Decision Update (2026-02-06): Remove Arc-Only Stage 1, Enforce Multi-View Support
+
+This update supersedes the earlier recommendation that used a geometry-first arc-consistency Stage 1 as the primary entry point.
+
+### Why
+
+- Arc loss built only from `surfel -> project -> arc` can be self-referential: the same surfel that generated the pixel also lies on that pixel's arc.
+- In that form, the loss can be minimized without adding real data-driven elevation correction.
+
+### Updated training path
+
+- Keep **Stage 0**: random elevation-aware initialization.
+- Make bin-likelihood the first primary training stage (previously Stage 2): GT-anchored, multi-view, with temperature/entropy schedule.
+- Keep optional arc loss only as a low-weight stabilizer if needed, not as the primary driver.
+- Keep optional densification stage for persistent high-error regions.
+
+### New surfel retention policy
+
+- Do not keep/prune surfels based on FOV overlap alone.
+- A surfel is considered supported by a frame only if it is:
+  - validly projected (in-FOV, in-front, in-bounds),
+  - lands on meaningful GT return,
+  - and passes residual consistency checks.
+- Require support from multiple frames with **viewpoint diversity** (avoid counting many near-duplicate views as strong support).
+- Use warmup then soft-to-hard **ratio thresholds** with count floors and EMA/hysteresis before pruning:
+  - `support_ratio = support_count / max(1, diverse_candidate_count)`
+  - mid: `support_ratio >= 0.25` with floor `support_count >= 2`
+  - late: `support_ratio >= 0.45` with floor `support_count >= 4`
+
+---
+
+## Decision Update (2026-02-06): Mandatory Belief-to-Geometry Coupling
+
+### Problem
+
+- Pixel-level elevation bins/logits can improve (lower entropy, better likelihood) without sufficiently moving surfel geometry.
+- That creates a failure mode where the inference head looks good but mesh geometry does not improve enough.
+
+### Decision
+
+- Add a required coupling term from pixel elevation belief to surfel state.
+- For selected anchor pixels:
+  - compute expected 3D point from bin probabilities,
+  - associate expected points to candidate surfels on-the-fly,
+  - apply a robust attraction loss to surfel positions.
+- Keep associations soft and ephemeral each iteration (no persistent global hard map).
+
+### Practical policy
+
+- Use projection and depth residual gates before coupling.
+- Use Huber/robust loss and a warmup ramp for coupling weight.
+- Increase coupling strength as elevation entropy falls.
+- Track coupling residual metrics and verify mesh gains, not only likelihood gains.
+
+---
+
+## Decision Update (2026-02-06): Robust Normalized Likelihood Model
+
+### Problem
+
+- Raw `log(intensity)` as likelihood evidence is fragile under sonar gain variation, speckle, and dropouts.
+- Out-of-FOV samples should not automatically become strong negative evidence.
+
+### Decision
+
+- Use robust normalized amplitude likelihood as default:
+  - percentile-normalize intensity per frame on valid returns (default P10-P99),
+  - compute clipped log-evidence on normalized intensity,
+  - treat invalid/out-of-FOV projections as neutral evidence,
+  - apply frame reliability weights.
+
+### Why
+
+- Retains amplitude information needed for elevation disambiguation.
+- Improves training stability across frame-to-frame gain/contrast changes.
+- Reduces false penalties from visibility limits.
+- Keeps implementation lightweight and debuggable.
+
+### Fallbacks (optional)
+
+- Binary hit/miss likelihood.
+- Hybrid amplitude + hit/miss likelihood.
+
+---
+
+## Decision Update (2026-02-07): Raw Sonar Data Assumption
+
+### Fact recorded
+
+- Training sonar images are raw amplitude data (no explicit range/gain compensation in stored frames).
+
+### Planning impact
+
+- Keep distance attenuation enabled by default in rendering.
+- Treat attenuation-off mode as ablation/diagnostic only.
+- Continue using robust per-frame normalization in likelihood for numerical stability, not as a replacement for physics.
+
+---
+
+## Decision Update (2026-02-07): Attenuation Dynamic-Range Stabilization
+
+### Problem
+
+- Raw-data attenuation is required, but plain `1/r^2` with clamp can overemphasize near returns and suppress far returns.
+- This can bias training toward near geometry and weaken far-surface elevation recovery.
+
+### Decision
+
+- Use stabilized attenuation in renderer:
+  - `I = lambert * gain / (max(r, r0)^p + eps)`
+  - default: `p=2.0`, `r0=0.35 m`, `eps=1e-6`, configurable `gain`.
+- Keep `SONAR_USE_RANGE_ATTEN=1` as default; attenuation-off remains diagnostic only.
+
+### Why
+
+- Preserves physical distance falloff for raw sonar amplitudes.
+- Near-range floor prevents saturation blow-up and improves optimization stability.
+- Tunable exponent/gain allows calibration without discarding physical structure.
+
+### Validation policy
+
+- Run fixed-seed exponent ablation on `p in {1.5, 2.0, 2.5}`.
+- Track near-range saturation and far-range response statistics in addition to mesh metrics.
+
+---
+
+## Decision Update (2026-02-07): Canonical Sonar-to-Camera Mount
+
+### Fact recorded
+
+- Physical mount on ROV is fixed as:
+  - `8 cm` behind camera,
+  - `10 cm` above camera,
+  - `5 deg` downward pitch.
+
+### Canonical implementation constants
+
+- Camera-frame translation: `[0.0, -0.10, -0.08]` meters.
+- Rotation: `+5 deg` pitch about camera X-axis.
+
+### Planning impact
+
+- Treat these as the default extrinsic constants across all training paths.
+- Resolve doc/code mismatches against this tuple.
+- Include active extrinsic values in run-header logging to prevent silent branch drift.
+
+---
+
+## Decision Update (2026-02-07): Coordinate Convention Contract
+
+### Problem
+
+- Multiple modules use mixed frame descriptions (camera-frame vs sonar-frame notation).
+- Translation storage/read conventions (row vs column) can silently diverge across branches.
+
+### Decision
+
+- Canonical compute frame for projection/back-projection: camera/view frame `(+X right, +Y down, +Z forward)`.
+- Canonical image convention: azimuth columns (`left=+`, `right=-`), range rows (`top=near`, `bottom=far`).
+- Canonical elevation-angle sign: `+elevation -> +Y` (down), `-elevation -> -Y` (up), measured in the camera/view frame.
+- Canonical mount tuple remains camera-frame: `[0.0, -0.10, -0.08]` m with `+5 deg` pitch about X.
+- Canonical transform layout for `world_view_transform`-compatible paths: translation in row 3 (`T[3, :3]`).
+
+### Why
+
+- Prevents silent sign/axis bugs that mimic optimization failure.
+- Removes row/column ambiguity already seen in branch history.
+- Makes debug and training paths comparable by construction.
+
+### Enforcement policy
+
+- Add startup logging of active convention and extrinsic tuple.
+- Add small known-point tests (azimuth sign, lateral sign, transform roundtrip identity).
+- Add elevation sign test at boresight/range anchor (`+elevation` gives `y>0`, `-elevation` gives `y<0` in camera/view frame).
+- Keep assertions enabled in debug runs by default.
+
+---
+
+## Decision Update (2026-02-09): Frame Filtering Belongs to Dataset Preparation
+
+### Scope decision
+
+- Filtering of candidate sonar frames is a dataset-preparation step, not a training-loop step.
+
+### Context
+
+- Typical training subsets use about `500` frames sampled from `>2000` matched sonar+pose frames.
+- Legacy and R2 datasets did not use the filtering pipeline below when those 500-frame subsets were produced.
+
+### Dataset-prep filtering pipeline
+
+1. **Quality gate**: reject weak/noisy frames using per-frame valid-return ratio and high-percentile intensity.
+2. **Pose dedup**: remove near-identical poses using translation + heading thresholds.
+3. **Diverse subsample**: choose target count via greedy farthest-point sampling in pose space.
+4. **Connectivity check**: ensure selected frames have enough multi-view neighbors; replace isolated frames.
+
+### Output contract
+
+- Save selected frame IDs/names as part of dataset split metadata.
+- Training consumes this precomputed list directly.

@@ -109,7 +109,7 @@ python render.py -m <trained_model_path> -s <dataset_path>
 - `get_log_scale_grad()` for monitoring convergence
 
 **SonarExtrinsic**: Camera-to-sonar transform
-- Y = -0.10m (10cm up in camera Y-down convention), pitch = +5° down, no Z offset
+- Camera-frame translation = `[0.0, -0.10, -0.08]` m (8cm back, 10cm up in camera Y-down convention), pitch = +5° down about X-axis
 - `get_camera_to_sonar_transform()`, `apply_camera_to_sonar_extrinsic()`
 
 **Projection Functions**:
