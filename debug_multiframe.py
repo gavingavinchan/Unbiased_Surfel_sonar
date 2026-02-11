@@ -40,7 +40,11 @@ from scene import Scene, GaussianModel
 from scene.dataset_readers import readColmapCameras, readColmapSceneInfo, getNerfppNorm
 from gaussian_renderer import render_sonar, render, quaternion_to_normal
 from utils.sonar_utils import (SonarConfig, SonarScaleFactor, SonarExtrinsic,
-                                sonar_frame_to_points, sonar_frames_to_point_cloud)
+                                sonar_frame_to_points, sonar_frames_to_point_cloud,
+                                back_project_bins,
+                                SONAR_CAMERA_FRAME_CONVENTION, SONAR_IMAGE_CONVENTION,
+                                SONAR_MOUNT_TRANSLATION_CAM, SONAR_MOUNT_PITCH_DEG,
+                                run_sonar_convention_asserts)
 from utils.graphics_utils import BasicPointCloud
 from utils.loss_utils import l1_loss, ssim
 from utils.mesh_utils import GaussianExtractor
@@ -437,13 +441,39 @@ def close_logs():
         LOG_FILE.close()
 
 
+def print_sonar_diagnostics(diag, prefix=""):
+    if not diag:
+        return
+    gain_mode = diag.get("attenuation_gain_mode", "unknown")
+    enabled = diag.get("attenuation_enabled", False)
+    effective_gain = diag.get("attenuation_effective_gain", 0.0)
+    exp = diag.get("attenuation_exp", 0.0)
+    r0 = diag.get("attenuation_r0", 0.0)
+    eps = diag.get("attenuation_eps", 0.0)
+    near_mean = diag.get("near_range_mean_intensity", 0.0)
+    far_mean = diag.get("far_range_mean_intensity", 0.0)
+    ratio = diag.get("far_over_near_ratio", 0.0)
+    sat = diag.get("near_range_saturation_rate", 0.0)
+    nan_inf = diag.get("nan_inf_count", 0)
+
+    print(
+        f"{prefix}attenuation enabled={enabled} mode={gain_mode} "
+        f"gain={effective_gain:.6f} exp={exp:.3f} r0={r0:.3f} eps={eps:.1e}"
+    )
+    print(
+        f"{prefix}near_mean={near_mean:.6f}, far_mean={far_mean:.6f}, "
+        f"far/near={ratio:.6f}, near_sat={sat:.6f}, nan_inf={nan_inf}"
+    )
+
+
 def render_sonar_for_mesh(sonar_config, scale_factor, sonar_extrinsic=None):
     def _render(viewpoint_cam, gaussians, pipe, bg_color):
         return render_sonar(
             viewpoint_cam, gaussians, bg_color,
             sonar_config=sonar_config,
             scale_factor=scale_factor,
-            sonar_extrinsic=sonar_extrinsic
+            sonar_extrinsic=sonar_extrinsic,
+            **SONAR_RENDER_KWARGS,
         )
     return _render
 
@@ -553,9 +583,13 @@ def save_comparison_images(training_frames, gaussians, background, sonar_config,
                 cam, gaussians, background,
                 sonar_config=sonar_config,
                 scale_factor=scale_factor,
-                sonar_extrinsic=None
+                sonar_extrinsic=None,
+                **SONAR_RENDER_KWARGS,
             )
             rendered = render_pkg["render"]
+
+        if i == 0:
+            print_sonar_diagnostics(render_pkg.get("sonar_diagnostics"), prefix="    ")
 
         gt_np = (gt_image[0].cpu().numpy() * 255).astype(np.uint8)
         rendered_np = (np.clip(rendered[0].cpu().numpy(), 0, 1) * 255).astype(np.uint8)
@@ -595,7 +629,8 @@ def save_raw_comparison_images(training_frames, gaussians, background, sonar_con
                 cam, gaussians, background,
                 sonar_config=sonar_config,
                 scale_factor=scale_factor,
-                sonar_extrinsic=None
+                sonar_extrinsic=None,
+                **SONAR_RENDER_KWARGS,
             )
             rendered = render_pkg["render"]
 
@@ -717,6 +752,13 @@ def env_int(name, default):
     return int(value) if value not in (None, "") else default
 
 
+def env_bool(name, default):
+    value = os.environ.get(name)
+    if value in (None, ""):
+        return default
+    return value.lower() not in ("0", "false", "no", "off")
+
+
 # Curriculum learning parameters
 STAGE1_ITERATIONS = 0   # Learn scale only (surfels frozen) - DISABLED, using known scale
 STAGE2_ITERATIONS = 1000  # Learn surfels only (scale frozen)
@@ -740,6 +782,30 @@ POISSON_SCALE_PERCENTILE = env_float("POISSON_SCALE_PERCENTILE", POISSON_SCALE_P
 
 STAGE2_ITERATIONS = env_int("SONAR_STAGE2_ITERS", STAGE2_ITERATIONS)
 NUM_TRAINING_FRAMES = env_int("SONAR_NUM_FRAMES", NUM_TRAINING_FRAMES_DEFAULT)
+
+SONAR_CONVENTION_ASSERTS = env_bool("SONAR_CONVENTION_ASSERTS", True)
+SONAR_USE_RANGE_ATTEN = env_bool("SONAR_USE_RANGE_ATTEN", True)
+SONAR_RANGE_ATTEN_EXP = env_float("SONAR_RANGE_ATTEN_EXP", 2.0)
+SONAR_RANGE_ATTEN_GAIN = env_float("SONAR_RANGE_ATTEN_GAIN", 1.0)
+SONAR_RANGE_ATTEN_R0 = env_float("SONAR_RANGE_ATTEN_R0", 0.35)
+SONAR_RANGE_ATTEN_EPS = env_float("SONAR_RANGE_ATTEN_EPS", 1e-6)
+SONAR_RANGE_ATTEN_AUTO_GAIN = env_bool("SONAR_RANGE_ATTEN_AUTO_GAIN", False)
+
+if not SONAR_USE_RANGE_ATTEN:
+    SONAR_ATTENUATION_MODE = "off"
+elif SONAR_RANGE_ATTEN_AUTO_GAIN:
+    SONAR_ATTENUATION_MODE = "auto"
+else:
+    SONAR_ATTENUATION_MODE = "manual"
+
+SONAR_RENDER_KWARGS = {
+    "use_range_attenuation": SONAR_USE_RANGE_ATTEN,
+    "range_atten_exp": SONAR_RANGE_ATTEN_EXP,
+    "range_atten_gain": SONAR_RANGE_ATTEN_GAIN,
+    "range_atten_r0": SONAR_RANGE_ATTEN_R0,
+    "range_atten_eps": SONAR_RANGE_ATTEN_EPS,
+    "range_atten_auto_gain": SONAR_RANGE_ATTEN_AUTO_GAIN,
+}
 
 # Create output folder
 if OUTPUT_DIR_OVERRIDE:
@@ -772,6 +838,22 @@ print(f"Init scale: {INIT_SCALE_FACTOR}")
 print(f"Num training frames: {NUM_TRAINING_FRAMES}")
 print(f"Curriculum: Stage1={STAGE1_ITERATIONS} (scale), Stage2={STAGE2_ITERATIONS} (surfels), Stage3={STAGE3_ITERATIONS} (joint)")
 print(f"FOV pruning interval: {FOV_PRUNE_INTERVAL} iterations")
+print(f"Convention asserts: {SONAR_CONVENTION_ASSERTS}")
+print(f"Camera/view convention: {SONAR_CAMERA_FRAME_CONVENTION}")
+print(f"Sonar image convention: {SONAR_IMAGE_CONVENTION}")
+print(f"Mount extrinsic (camera frame): translation={SONAR_MOUNT_TRANSLATION_CAM}, pitch_deg={SONAR_MOUNT_PITCH_DEG}")
+if SONAR_ATTENUATION_MODE == "off":
+    print("Range attenuation: OFF (all attenuation parameters ignored)")
+elif SONAR_ATTENUATION_MODE == "auto":
+    print(
+        f"Range attenuation: AUTO gain (seed={SONAR_RANGE_ATTEN_GAIN:.4f}, "
+        f"exp={SONAR_RANGE_ATTEN_EXP:.3f}, r0={SONAR_RANGE_ATTEN_R0:.3f}, eps={SONAR_RANGE_ATTEN_EPS:.1e})"
+    )
+else:
+    print(
+        f"Range attenuation: MANUAL gain={SONAR_RANGE_ATTEN_GAIN:.4f}, "
+        f"exp={SONAR_RANGE_ATTEN_EXP:.3f}, r0={SONAR_RANGE_ATTEN_R0:.3f}, eps={SONAR_RANGE_ATTEN_EPS:.1e}"
+    )
 print(f"Output: {OUTPUT_DIR}")
 print("=" * 60)
 
@@ -853,6 +935,40 @@ print(f"\nSonar config:")
 print(f"  Image size: {sonar_config.image_width}x{sonar_config.image_height}")
 print(f"  Azimuth FOV: {sonar_config.azimuth_fov}deg")
 print(f"  Range: {sonar_config.range_min}m - {sonar_config.range_max}m")
+
+if SONAR_CONVENTION_ASSERTS:
+    report = run_sonar_convention_asserts(sonar_config, sample_camera=sample_cam, device="cuda")
+    print("  Convention checks: PASS")
+    print(f"    azimuth left={report.azimuth_left_rad:.6f} rad, right={report.azimuth_right_rad:.6f} rad")
+    print(f"    elevation + -> y={report.positive_elevation_y:.6f}, - -> y={report.negative_elevation_y:.6f}")
+    print(
+        f"    transform roundtrip max_abs={report.extrinsic_roundtrip_max_abs:.3e}, "
+        f"layout max_abs={report.layout_roundtrip_max_abs:.3e}"
+    )
+else:
+    print("  Convention checks: DISABLED (SONAR_CONVENTION_ASSERTS=0)")
+
+probe_rows = torch.tensor([10, sonar_config.image_height // 2], device="cuda", dtype=torch.long)
+probe_cols = torch.tensor([0, sonar_config.image_width - 1], device="cuda", dtype=torch.long)
+probe_elev_bins = torch.tensor(
+    [-sonar_config.half_elevation_rad, 0.0, sonar_config.half_elevation_rad],
+    device="cuda",
+)
+probe_points = back_project_bins(
+    frame_idx=0,
+    rows=probe_rows,
+    cols=probe_cols,
+    elev_bins=probe_elev_bins,
+    cameras=training_frames,
+    sonar_config=sonar_config,
+    scale_factor=None,
+)
+if probe_points.shape != (probe_rows.shape[0], probe_elev_bins.shape[0], 3):
+    raise RuntimeError(
+        f"back_project_bins contract failed: expected {(probe_rows.shape[0], probe_elev_bins.shape[0], 3)}, "
+        f"got {tuple(probe_points.shape)}"
+    )
+print(f"  back_project_bins contract: PASS shape={tuple(probe_points.shape)}")
 
 # =============================================================================
 # Generate Pose Pyramids for All Training Frames
@@ -990,6 +1106,19 @@ print("=" * 60)
 bg_color = [0, 0, 0]
 background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
+with torch.no_grad():
+    header_render = render_sonar(
+        training_frames[0],
+        gaussians,
+        background,
+        sonar_config=sonar_config,
+        scale_factor=temp_scale,
+        sonar_extrinsic=None,
+        **SONAR_RENDER_KWARGS,
+    )
+print("  Initial sonar render diagnostics:")
+print_sonar_diagnostics(header_render.get("sonar_diagnostics"), prefix="    ")
+
 NUM_CAMERAS_FOR_MESH = 50
 mesh_cameras = train_cameras[:NUM_CAMERAS_FOR_MESH]
 gaussExtractor = GaussianExtractor(
@@ -1077,8 +1206,8 @@ print("Testing loss at different scale values:")
 w2c = viewpoint_test.world_view_transform
 print(f"  Camera transform: device={w2c.device}, dtype={w2c.dtype}, requires_grad={w2c.requires_grad}")
 print(f"  Full w2c matrix:\n{w2c.cpu().numpy()}")
-t_w2v = w2c[:3, 3]
-print(f"  t_w2v (col 3) = {t_w2v.cpu().numpy()}")
+t_w2v = w2c[3, :3]
+print(f"  t_w2v (row 3) = {t_w2v.cpu().numpy()}")
 
 # Check other camera properties
 print(f"  viewpoint.R:\n{viewpoint_test.R}")
@@ -1096,7 +1225,8 @@ for test_scale in test_scales:
             viewpoint_test, gaussians, background,
             sonar_config=sonar_config,
             scale_factor=test_sf,
-            sonar_extrinsic=None
+            sonar_extrinsic=None,
+            **SONAR_RENDER_KWARGS,
         )
         rendered = render_pkg["render"]
 
@@ -1133,7 +1263,8 @@ if STAGE1_ITERATIONS > 0:
             viewpoint_cam, gaussians, background,
             sonar_config=sonar_config,
             scale_factor=sonar_scale_factor,  # Scale factor enabled
-            sonar_extrinsic=None
+            sonar_extrinsic=None,
+            **SONAR_RENDER_KWARGS,
         )
         rendered = render_pkg["render"]
 
@@ -1267,7 +1398,8 @@ if STAGE2_ITERATIONS > 0:
             viewpoint_cam, gaussians, background,
             sonar_config=sonar_config,
             scale_factor=sonar_scale_factor,
-            sonar_extrinsic=None
+            sonar_extrinsic=None,
+            **SONAR_RENDER_KWARGS,
         )
         rendered = render_pkg["render"]
 
@@ -1367,7 +1499,8 @@ if STAGE3_ITERATIONS > 0:
             viewpoint_cam, gaussians, background,
             sonar_config=sonar_config,
             scale_factor=sonar_scale_factor,
-            sonar_extrinsic=None
+            sonar_extrinsic=None,
+            **SONAR_RENDER_KWARGS,
         )
         rendered = render_pkg["render"]
 

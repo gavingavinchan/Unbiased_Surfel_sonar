@@ -6,6 +6,241 @@
 import torch
 import torch.nn as nn
 import math
+from dataclasses import dataclass
+from typing import Dict
+
+
+SONAR_CAMERA_FRAME_CONVENTION = "+X right, +Y down, +Z forward"
+SONAR_IMAGE_CONVENTION = "columns: left=+azimuth right=-azimuth; rows: top=near bottom=far"
+SONAR_MOUNT_TRANSLATION_CAM = (0.0, -0.10, -0.08)
+SONAR_MOUNT_PITCH_DEG = 5.0
+
+
+@dataclass
+class ConventionCheckReport:
+    azimuth_left_rad: float
+    azimuth_right_rad: float
+    positive_elevation_y: float
+    negative_elevation_y: float
+    extrinsic_roundtrip_max_abs: float
+    layout_roundtrip_max_abs: float
+
+
+def sonar_polar_to_points(azimuth: torch.Tensor, elevation: torch.Tensor, range_vals: torch.Tensor) -> torch.Tensor:
+    """
+    Convert sonar polar bins into camera/view-frame 3D points.
+
+    Canonical convention:
+      - +X right, +Y down, +Z forward
+      - left image columns correspond to positive azimuth
+      - positive elevation maps to +Y (down)
+    """
+    x = -range_vals * torch.sin(azimuth) * torch.cos(elevation)
+    y = range_vals * torch.sin(elevation)
+    z = range_vals * torch.cos(azimuth) * torch.cos(elevation)
+    return torch.stack([x, y, z], dim=-1)
+
+
+def get_scaled_world_to_view_transform(viewpoint_camera, scale_factor=None, sonar_extrinsic=None) -> torch.Tensor:
+    """
+    Build world->view transform using repository row-major layout.
+
+    Layout contract:
+      - rotation in [:3, :3]
+      - translation in [3, :3]
+      - first three entries of [:3, 3] expected to be 0
+    """
+    w2v = viewpoint_camera.world_view_transform.clone()
+    if scale_factor is not None:
+        w2v[3, :3] = scale_factor.scale * w2v[3, :3]
+    if sonar_extrinsic is not None:
+        w2v = sonar_extrinsic(w2v)
+    return w2v
+
+
+def view_points_to_world(points_view: torch.Tensor, w2v: torch.Tensor, scale_factor=None) -> torch.Tensor:
+    """Convert view-frame points to world-frame points under row-major transform semantics."""
+    R_w2v = w2v[:3, :3]
+    t_w2v = w2v[3, :3]
+    points_world_scaled = (points_view - t_w2v.unsqueeze(0)) @ R_w2v
+    if scale_factor is not None:
+        points_world = points_world_scaled / scale_factor.scale
+    else:
+        points_world = points_world_scaled
+    return points_world
+
+
+def back_project_bins(
+    frame_idx: int,
+    rows: torch.Tensor,
+    cols: torch.Tensor,
+    elev_bins: torch.Tensor,
+    *,
+    cameras,
+    sonar_config,
+    scale_factor,
+    sonar_extrinsic=None,
+) -> torch.Tensor:
+    """
+    Back-project selected sonar bins into world-frame points.
+
+    Contract:
+      - rows/cols are [P]
+      - elev_bins is [K] (radians, +elevation -> +Y)
+      - output is [P, K, 3] in world coordinates (COLMAP scale)
+    """
+    if frame_idx < 0 or frame_idx >= len(cameras):
+        raise IndexError(f"frame_idx={frame_idx} out of range for {len(cameras)} cameras")
+
+    if rows.dim() != 1 or cols.dim() != 1:
+        raise ValueError("rows and cols must be 1D tensors")
+    if rows.shape[0] != cols.shape[0]:
+        raise ValueError(f"rows/cols length mismatch: {rows.shape[0]} vs {cols.shape[0]}")
+    if elev_bins.dim() != 1:
+        raise ValueError("elev_bins must be a 1D tensor")
+
+    device = rows.device
+    camera = cameras[frame_idx]
+    rows_f = rows.to(dtype=torch.float32)
+    cols_f = cols.to(dtype=torch.float32)
+    elev_bins = elev_bins.to(device=device, dtype=torch.float32)
+
+    azimuth, range_vals = sonar_config.pixel_to_polar(cols_f, rows_f)
+    P = rows.shape[0]
+    K = elev_bins.shape[0]
+
+    azimuth_pk = azimuth[:, None].expand(P, K)
+    range_pk = range_vals[:, None].expand(P, K)
+    elevation_pk = elev_bins[None, :].expand(P, K)
+
+    points_view = sonar_polar_to_points(
+        azimuth_pk.reshape(-1),
+        elevation_pk.reshape(-1),
+        range_pk.reshape(-1),
+    )
+
+    w2v = get_scaled_world_to_view_transform(camera, scale_factor=scale_factor, sonar_extrinsic=sonar_extrinsic)
+    points_world = view_points_to_world(points_view, w2v, scale_factor=scale_factor)
+    return points_world.reshape(P, K, 3)
+
+
+def _raise_convention_error(name: str, details: str):
+    raise RuntimeError(
+        f"[SONAR_CONVENTION_ASSERT] {name} failed: {details}. "
+        "Set SONAR_CONVENTION_ASSERTS=0 to bypass (not recommended)."
+    )
+
+
+def assert_azimuth_sign_convention(sonar_config, atol: float = 1e-6) -> Dict[str, float]:
+    """Validate left=+azimuth, right=-azimuth image convention."""
+    device = sonar_config.azimuth_grid.device
+    row_mid = torch.tensor([sonar_config.image_height / 2.0], device=device)
+    col_left = torch.tensor([0.0], device=device)
+    col_right = torch.tensor([float(sonar_config.image_width - 1)], device=device)
+
+    az_left, _ = sonar_config.pixel_to_polar(col_left, row_mid)
+    az_right, _ = sonar_config.pixel_to_polar(col_right, row_mid)
+    left_ok = az_left.item() > atol
+    right_ok = az_right.item() < -atol
+
+    if not (left_ok and right_ok):
+        _raise_convention_error(
+            "azimuth_sign",
+            f"expected left>0 and right<0 but got left={az_left.item():.6f}, right={az_right.item():.6f}",
+        )
+    return {
+        "azimuth_left_rad": az_left.item(),
+        "azimuth_right_rad": az_right.item(),
+    }
+
+
+def assert_elevation_sign_convention(device: str = "cuda", atol: float = 1e-6) -> Dict[str, float]:
+    """Validate +elevation -> +Y and -elevation -> -Y in camera/view frame."""
+    elev = torch.tensor([0.1, -0.1], device=device)
+    azimuth = torch.zeros_like(elev)
+    range_vals = torch.ones_like(elev)
+    points = sonar_polar_to_points(azimuth, elev, range_vals)
+
+    pos_y = points[0, 1].item()
+    neg_y = points[1, 1].item()
+    if not (pos_y > atol and neg_y < -atol):
+        _raise_convention_error(
+            "elevation_sign",
+            f"expected +elev->+Y and -elev->-Y but got +elev Y={pos_y:.6f}, -elev Y={neg_y:.6f}",
+        )
+    return {
+        "positive_elevation_y": pos_y,
+        "negative_elevation_y": neg_y,
+    }
+
+
+def assert_transform_roundtrip(sample_camera=None, device: str = "cuda", atol: float = 1e-5) -> Dict[str, float]:
+    """Validate row-major transform contract and camera->sonar->camera roundtrip."""
+    T_c2s = get_camera_to_sonar_transform(device=device)
+    if torch.max(torch.abs(T_c2s[:3, 3])).item() > atol:
+        _raise_convention_error(
+            "extrinsic_layout",
+            f"translation must be stored in row 3 but max(abs(T[:3,3]))={torch.max(torch.abs(T_c2s[:3, 3])).item():.6e}",
+        )
+
+    T_s2c = torch.inverse(T_c2s)
+    pts = torch.tensor(
+        [[0.20, -0.10, 1.30], [-0.30, 0.05, 2.00], [0.05, 0.20, 0.60]],
+        device=device,
+        dtype=T_c2s.dtype,
+    )
+    ones = torch.ones(pts.shape[0], 1, device=device, dtype=T_c2s.dtype)
+    pts_h = torch.cat([pts, ones], dim=1)
+    pts_rt = ((pts_h @ T_c2s) @ T_s2c)[:, :3]
+    extrinsic_roundtrip_max_abs = torch.max(torch.abs(pts_rt - pts)).item()
+    if extrinsic_roundtrip_max_abs > atol:
+        _raise_convention_error(
+            "extrinsic_roundtrip",
+            f"max abs error {extrinsic_roundtrip_max_abs:.6e} exceeds atol={atol}",
+        )
+
+    layout_roundtrip_max_abs = 0.0
+    if sample_camera is not None:
+        w2v = sample_camera.world_view_transform
+        if torch.max(torch.abs(w2v[:3, 3])).item() > atol:
+            _raise_convention_error(
+                "world_view_layout",
+                f"expected translation in row 3 but max(abs(T[:3,3]))={torch.max(torch.abs(w2v[:3, 3])).item():.6e}",
+            )
+
+        R_w2v = w2v[:3, :3]
+        t_w2v = w2v[3, :3]
+        pts_cam = pts.to(device=w2v.device, dtype=w2v.dtype)
+        # Validate transform roundtrip under renderer semantics:
+        # p_view = p_world @ R.T + t; p_world = (p_view - t) @ R
+        pts_view = pts_cam @ R_w2v.T + t_w2v
+        pts_recovered = (pts_view - t_w2v) @ R_w2v
+        layout_roundtrip_max_abs = torch.max(torch.abs(pts_recovered - pts_cam)).item()
+        if layout_roundtrip_max_abs > atol:
+            _raise_convention_error(
+                "world_view_transform_contract",
+                f"renderer-semantic roundtrip differs by {layout_roundtrip_max_abs:.6e}",
+            )
+
+    return {
+        "extrinsic_roundtrip_max_abs": extrinsic_roundtrip_max_abs,
+        "layout_roundtrip_max_abs": layout_roundtrip_max_abs,
+    }
+
+
+def run_sonar_convention_asserts(sonar_config, sample_camera=None, device: str = "cuda", atol: float = 1e-5) -> ConventionCheckReport:
+    """Run fail-fast sonar convention checks and return diagnostics."""
+    azimuth_report = assert_azimuth_sign_convention(sonar_config, atol=atol)
+    elevation_report = assert_elevation_sign_convention(device=device, atol=atol)
+    transform_report = assert_transform_roundtrip(sample_camera=sample_camera, device=device, atol=atol)
+    return ConventionCheckReport(
+        azimuth_left_rad=azimuth_report["azimuth_left_rad"],
+        azimuth_right_rad=azimuth_report["azimuth_right_rad"],
+        positive_elevation_y=elevation_report["positive_elevation_y"],
+        negative_elevation_y=elevation_report["negative_elevation_y"],
+        extrinsic_roundtrip_max_abs=transform_report["extrinsic_roundtrip_max_abs"],
+        layout_roundtrip_max_abs=transform_report["layout_roundtrip_max_abs"],
+    )
 
 
 class SonarScaleFactor(nn.Module):
@@ -200,32 +435,21 @@ def build_sonar_config(args) -> SonarConfig:
 
 def get_camera_to_sonar_transform(device="cuda"):
     """
-    Get the transformation matrix from camera frame to sonar frame.
-    
-    The sonar is mounted:
-    - 10cm above the camera (translation in -Y direction in camera frame)
-    - Pitched down 5 degrees (rotation around X-axis)
-    
-    Camera frame convention (OpenCV/COLMAP):
-    - +X = right
-    - +Y = down
-    - +Z = forward (optical axis)
-    
-    Sonar frame convention:
-    - +X = forward (boresight)
-    - +Y = right
-    - +Z = down
-    
+    Get row-major camera->sonar extrinsic transform.
+
+    Contract:
+      - Translation is stored in row 3 (T[3, :3]).
+      - Intended for row-vector transforms: p_out = p_in @ R.T + t.
+      - Mount tuple in camera frame is SONAR_MOUNT_TRANSLATION_CAM.
+
     Returns:
-        T_cam_to_sonar: 4x4 homogeneous transformation matrix
+        T_cam_to_sonar: [4, 4] row-major homogeneous transform.
     """
-    # Translation: sonar is 10cm above camera (in camera frame: -Y direction)
-    # In camera frame coordinates: [0, -0.1, 0] (up is -Y)
-    translation = torch.tensor([0.0, -0.1, 0.0], device=device)
+    dtype = torch.float32
+    translation_cam = torch.tensor(SONAR_MOUNT_TRANSLATION_CAM, device=device, dtype=dtype)
     
-    # Rotation: sonar is pitched down 5 degrees relative to camera
-    # Pitch down = rotation around X-axis by +5 degrees (in camera frame)
-    pitch_rad = math.radians(5.0)
+    # Pitch down = +rotation around camera X in camera convention
+    pitch_rad = math.radians(SONAR_MOUNT_PITCH_DEG)
     cos_p = math.cos(pitch_rad)
     sin_p = math.sin(pitch_rad)
     
@@ -234,7 +458,7 @@ def get_camera_to_sonar_transform(device="cuda"):
         [1.0,    0.0,     0.0],
         [0.0,  cos_p, -sin_p],
         [0.0,  sin_p,  cos_p]
-    ], device=device)
+    ], device=device, dtype=dtype)
     
     # Also need to transform from camera convention to sonar convention
     # Camera: +Z forward, +X right, +Y down
@@ -244,15 +468,18 @@ def get_camera_to_sonar_transform(device="cuda"):
         [0.0, 0.0, 1.0],  # sonar_X = cam_Z
         [1.0, 0.0, 0.0],  # sonar_Y = cam_X
         [0.0, 1.0, 0.0]   # sonar_Z = cam_Y
-    ], device=device)
+    ], device=device, dtype=dtype)
     
-    # Combined rotation: first apply pitch, then convention change
+    # Combined rotation: apply pitch in camera frame, then convert convention.
     R_cam_to_sonar = R_convention @ R_pitch
+
+    # t = -R * p_mount_cam for camera->sonar point transform.
+    t_cam_to_sonar = -R_cam_to_sonar @ translation_cam
     
-    # Build 4x4 homogeneous transform
-    T_cam_to_sonar = torch.eye(4, device=device)
+    # Build row-major homogeneous transform (translation in row 3).
+    T_cam_to_sonar = torch.eye(4, device=device, dtype=dtype)
     T_cam_to_sonar[:3, :3] = R_cam_to_sonar
-    T_cam_to_sonar[:3, 3] = R_convention @ translation  # Transform translation to sonar frame
+    T_cam_to_sonar[3, :3] = t_cam_to_sonar
     
     return T_cam_to_sonar
 
@@ -261,8 +488,8 @@ def apply_camera_to_sonar_extrinsic(camera_pose_w2c, device="cuda"):
     """
     Transform a camera pose (world-to-camera) to sonar pose (world-to-sonar).
     
-    Given the world-to-camera transform T_w2c, compute world-to-sonar as:
-        T_w2s = T_c2s @ T_w2c
+    Given row-major world-to-camera transform T_w2c, compute world-to-sonar as:
+        T_w2s = T_w2c @ T_c2s
     
     Args:
         camera_pose_w2c: 4x4 world-to-camera transformation matrix
@@ -271,8 +498,8 @@ def apply_camera_to_sonar_extrinsic(camera_pose_w2c, device="cuda"):
     Returns:
         sonar_pose_w2s: 4x4 world-to-sonar transformation matrix
     """
-    T_c2s = get_camera_to_sonar_transform(device)
-    T_w2s = T_c2s @ camera_pose_w2c
+    T_c2s = get_camera_to_sonar_transform(device=camera_pose_w2c.device).to(dtype=camera_pose_w2c.dtype)
+    T_w2s = camera_pose_w2c @ T_c2s
     return T_w2s
 
 
@@ -280,7 +507,7 @@ class SonarExtrinsic(nn.Module):
     """
     Camera-to-sonar extrinsic calibration.
     
-    The sonar is mounted 10cm above the camera and pitched down 5 degrees.
+    The sonar is mounted with SONAR_MOUNT_TRANSLATION_CAM and SONAR_MOUNT_PITCH_DEG.
     This module stores the fixed extrinsic transform and can apply it to camera poses.
     """
     
@@ -300,7 +527,7 @@ class SonarExtrinsic(nn.Module):
         Returns:
             [4, 4] world-to-sonar transformation
         """
-        return self.T_cam_to_sonar @ camera_pose_w2c
+        return camera_pose_w2c @ self.T_cam_to_sonar
     
     def inverse_transform(self, sonar_pose_w2s):
         """
@@ -313,7 +540,7 @@ class SonarExtrinsic(nn.Module):
             [4, 4] world-to-camera transformation
         """
         T_s2c = torch.inverse(self.T_cam_to_sonar)
-        return T_s2c @ sonar_pose_w2s
+        return sonar_pose_w2s @ T_s2c
 
 
 # =============================================================================

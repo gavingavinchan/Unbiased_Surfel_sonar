@@ -12,10 +12,12 @@
 import torch
 import torch.nn.functional as F
 import math
+from dataclasses import dataclass
 from diff_surfel_rasterization import GaussianRasterizationSettings, GaussianRasterizer
 from scene.gaussian_model import GaussianModel
 from utils.sh_utils import eval_sh
 from utils.point_utils import depth_to_normal, sonar_ranges_to_points, sonar_points_to_normals
+from utils.sonar_utils import get_scaled_world_to_view_transform
 
 def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None):
     """
@@ -157,6 +159,141 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
 # Sonar Forward Projection (Polar Geometry)
 # =============================================================================
 
+
+@dataclass
+class SonarProjection:
+    row: torch.Tensor
+    col: torch.Tensor
+    range_vals: torch.Tensor
+    azimuth: torch.Tensor
+    in_fov: torch.Tensor
+    in_front: torch.Tensor
+    in_bounds: torch.Tensor
+    valid: torch.Tensor
+
+
+def _transform_world_points_to_sonar_frame(points_world, viewpoint_camera, scale_factor=None, sonar_extrinsic=None):
+    """Transform world points to sonar/view frame under row-major transform contract."""
+    w2v = get_scaled_world_to_view_transform(
+        viewpoint_camera,
+        scale_factor=scale_factor,
+        sonar_extrinsic=sonar_extrinsic,
+    )
+    R_w2v = w2v[:3, :3]
+    t_w2v = w2v[3, :3]
+
+    if scale_factor is not None:
+        points_world_scaled = scale_factor.scale * points_world
+    else:
+        points_world_scaled = points_world
+
+    points_view = points_world_scaled @ R_w2v.T + t_w2v
+    return points_view, w2v
+
+
+def sonar_project_points(points_world, viewpoint_camera, sonar_config, scale_factor=None, sonar_extrinsic=None):
+    """
+    Project world points into sonar image bins.
+
+    Returns SonarProjection with explicit validity fields:
+      - in_fov: azimuth/elevation/range constraints
+      - in_front: forward > 0
+      - in_bounds: pixel bounds check
+      - valid: in_fov & in_front & in_bounds
+    """
+    points_sonar, _ = _transform_world_points_to_sonar_frame(
+        points_world,
+        viewpoint_camera,
+        scale_factor=scale_factor,
+        sonar_extrinsic=sonar_extrinsic,
+    )
+
+    right = points_sonar[:, 0]
+    down = points_sonar[:, 1]
+    forward = points_sonar[:, 2]
+
+    azimuth = -torch.atan2(right, forward)
+    range_vals = torch.sqrt(right**2 + down**2 + forward**2)
+    horiz_dist = torch.sqrt(right**2 + forward**2)
+    elevation = torch.atan2(down, horiz_dist.clamp_min(1e-8))
+
+    in_fov = (
+        (torch.abs(azimuth) <= sonar_config.half_azimuth_rad)
+        & (torch.abs(elevation) <= sonar_config.half_elevation_rad)
+        & (range_vals >= sonar_config.range_min)
+        & (range_vals <= sonar_config.range_max)
+    )
+    in_front = forward > 0
+
+    H = viewpoint_camera.image_height
+    W = viewpoint_camera.image_width
+    col = (-azimuth / sonar_config.half_azimuth_rad + 1) * (W / 2)
+    row = (range_vals - sonar_config.range_min) / (sonar_config.range_max - sonar_config.range_min) * H
+    in_bounds = (col >= 0) & (col <= W - 1) & (row >= 0) & (row <= H - 1)
+    valid = in_fov & in_front & in_bounds
+
+    return SonarProjection(
+        row=row,
+        col=col,
+        range_vals=range_vals,
+        azimuth=azimuth,
+        in_fov=in_fov,
+        in_front=in_front,
+        in_bounds=in_bounds,
+        valid=valid,
+    )
+
+
+def compute_sonar_range_attenuation(
+    range_vals,
+    use_range_attenuation=True,
+    range_atten_exp=2.0,
+    range_atten_gain=1.0,
+    range_atten_r0=0.35,
+    range_atten_eps=1e-6,
+    range_atten_auto_gain=False,
+):
+    """Compute stabilized sonar range attenuation with deterministic precedence."""
+    if not use_range_attenuation:
+        attenuation = torch.ones_like(range_vals)
+        return attenuation, {
+            "enabled": False,
+            "gain_mode": "off",
+            "effective_gain": 1.0,
+            "exp": float(range_atten_exp),
+            "r0": float(range_atten_r0),
+            "eps": float(range_atten_eps),
+        }
+
+    r0 = max(float(range_atten_r0), 0.0)
+    eps = max(float(range_atten_eps), 1e-12)
+    exp = float(range_atten_exp)
+    gain_seed = float(range_atten_gain)
+
+    r_eff = torch.clamp(range_vals, min=r0)
+    atten_base = 1.0 / (torch.pow(r_eff, exp) + eps)
+
+    if range_atten_auto_gain:
+        if atten_base.numel() > 0:
+            base_mean = atten_base.detach().mean().clamp_min(1e-8)
+            effective_gain = float(gain_seed / base_mean.item())
+        else:
+            effective_gain = gain_seed
+        gain_mode = "auto"
+    else:
+        effective_gain = gain_seed
+        gain_mode = "manual"
+
+    attenuation = atten_base * range_vals.new_tensor(effective_gain)
+    return attenuation, {
+        "enabled": True,
+        "gain_mode": gain_mode,
+        "effective_gain": effective_gain,
+        "exp": exp,
+        "r0": r0,
+        "eps": eps,
+    }
+
 def compute_fov_margin(range_vals, azimuth, elevation, sonar_config):
     """
     Compute distance from each point to nearest FOV boundary.
@@ -190,8 +327,21 @@ def compute_fov_margin(range_vals, azimuth, elevation, sonar_config):
     return margin
 
 
-def render_sonar(viewpoint_camera, pc: GaussianModel, bg_color: torch.Tensor, 
-                 sonar_config, scale_factor=None, sonar_extrinsic=None, scaling_modifier=1.0):
+def render_sonar(
+    viewpoint_camera,
+    pc: GaussianModel,
+    bg_color: torch.Tensor,
+    sonar_config,
+    scale_factor=None,
+    sonar_extrinsic=None,
+    scaling_modifier=1.0,
+    use_range_attenuation=True,
+    range_atten_exp=2.0,
+    range_atten_gain=1.0,
+    range_atten_r0=0.35,
+    range_atten_eps=1e-6,
+    range_atten_auto_gain=False,
+):
     """
     Render the scene using sonar polar projection.
     
@@ -208,6 +358,12 @@ def render_sonar(viewpoint_camera, pc: GaussianModel, bg_color: torch.Tensor,
         scale_factor: Optional SonarScaleFactor for pose scaling
         sonar_extrinsic: Optional SonarExtrinsic for camera-to-sonar transform
         scaling_modifier: Scaling modifier for surfel sizes (default 1.0)
+        use_range_attenuation: Enable range attenuation path
+        range_atten_exp: Attenuation exponent p in 1/(r^p)
+        range_atten_gain: Manual gain, or auto-gain seed when auto mode is on
+        range_atten_r0: Near-range floor before exponentiation
+        range_atten_eps: Numeric epsilon added to attenuation denominator
+        range_atten_auto_gain: Auto-calibrate gain from current frame attenuation statistics
         
     Returns:
         Dictionary containing:
@@ -218,52 +374,26 @@ def render_sonar(viewpoint_camera, pc: GaussianModel, bg_color: torch.Tensor,
         - viewspace_points: Screen-space point positions for gradients
     """
     device = pc.get_xyz.device
-    
-    # Get camera pose
-    w2c = viewpoint_camera.world_view_transform  # [4, 4] world-to-camera (COLMAP scale)
 
-    # Extract rotation and translation from camera transform
-    # Note: world_view_transform is stored TRANSPOSED (row-major for OpenGL)
-    # Rotation is in top-left 3x3, but translation is in ROW 3 (not column 3)
-    R_w2c = w2c[:3, :3]  # rotation
-    t_w2c = w2c[3, :3]   # translation (COLMAP scale)
-
-    # Scale COLMAP translation to metric BEFORE applying sonar extrinsic
-    if scale_factor is not None:
-        t_w2c_metric = scale_factor.scale * t_w2c
-    else:
-        t_w2c_metric = t_w2c
-
-    # Rebuild w2c with scaled translation
-    w2c_scaled = w2c.clone()
-    w2c_scaled[3, :3] = t_w2c_metric
-
-    # Now apply camera-to-sonar extrinsic transform (metric offset added to metric translation)
-    if sonar_extrinsic is not None:
-        w2v = sonar_extrinsic(w2c_scaled)  # world-to-sonar (metric scale)
-    else:
-        w2v = w2c_scaled  # Use camera pose directly
-
-    # Extract rotation and translation from world-to-sonar transform
-    R_w2v = w2v[:3, :3]
-    t_w2v_scaled = w2v[3, :3]   # translation (metric scale)
-
-    # Reconstruct the scaled transform for point transformation
-    w2v_scaled = w2v.clone()
-    w2v_scaled[:3, 3] = t_w2v_scaled
-
-    # Compute sonar origin in world coordinates WITHOUT torch.inverse()
-    # For transform [R|t], the camera/sonar center is at -R^T @ t
-    # This avoids numerical instability from inverse()
-    R_v2w = R_w2v.T  # transpose = inverse for orthogonal rotation matrix
-    sonar_origin = -R_v2w @ t_w2v_scaled  # [3]
-
-    # Get surfel positions and scale to metric
+    # Get surfel positions and transform to sonar frame under row-major contract.
     means3D = pc.get_xyz  # [N, 3]
+    points_sonar, w2v = _transform_world_points_to_sonar_frame(
+        means3D,
+        viewpoint_camera,
+        scale_factor=scale_factor,
+        sonar_extrinsic=sonar_extrinsic,
+    )
+
     if scale_factor is not None:
         means3D_scaled = scale_factor.scale * means3D
     else:
         means3D_scaled = means3D
+
+    R_w2v = w2v[:3, :3]
+    t_w2v_scaled = w2v[3, :3]
+    R_v2w = R_w2v.T
+    sonar_origin_scaled = -R_v2w @ t_w2v_scaled
+
     N = means3D.shape[0]
     
     # Create screenspace points tensor for gradient tracking
@@ -273,36 +403,23 @@ def render_sonar(viewpoint_camera, pc: GaussianModel, bg_color: torch.Tensor,
     except:
         pass
     
-    # Transform surfel positions to sonar frame using scaled transform
-    # p_sonar = R @ p_world_scaled + t_scaled (both in metric)
-    points_sonar = (means3D_scaled @ R_w2v.T) + t_w2v_scaled  # [N, 3]
-    
-    # Compute polar coordinates in CAMERA frame (OpenCV convention)
-    # Camera frame: +X = right, +Y = down, +Z = forward
+    # Compute polar coordinates in camera/view frame.
     right = points_sonar[:, 0]   # +X in camera frame
     down = points_sonar[:, 1]    # +Y in camera frame  
     forward = points_sonar[:, 2] # +Z in camera frame
-    
-    # Compute azimuth (angle from forward direction in horizontal plane)
-    # azimuth = atan2(right, forward)
-    # Convention: positive azimuth = left side of image, negative azimuth = right side
-    # This matches backward projection: col=0 → +azimuth, col=W → -azimuth
-    # So we negate: -atan2(right, forward) gives +azimuth for left (-right), -azimuth for right (+right)
-    azimuth = -torch.atan2(right, forward)  # [N]
-    
-    # Compute range (3D distance from sonar origin)
-    range_vals = torch.sqrt(right**2 + down**2 + forward**2)  # [N]
-    
-    # Compute elevation (angle from horizontal XZ plane)
-    # Positive elevation = below horizontal (down), negative = above
+
+    projection = sonar_project_points(
+        means3D,
+        viewpoint_camera,
+        sonar_config,
+        scale_factor=scale_factor,
+        sonar_extrinsic=sonar_extrinsic,
+    )
+    azimuth = projection.azimuth
+    range_vals = projection.range_vals
     horiz_dist = torch.sqrt(right**2 + forward**2)
-    elevation = torch.atan2(down, horiz_dist)  # [N]
-    
-    # Check which surfels are within sonar FOV (center-based check)
-    valid_azimuth = torch.abs(azimuth) <= sonar_config.half_azimuth_rad
-    valid_elevation = torch.abs(elevation) <= sonar_config.half_elevation_rad
-    valid_range = (range_vals >= sonar_config.range_min) & (range_vals <= sonar_config.range_max)
-    center_in_fov = valid_azimuth & valid_elevation & valid_range & (forward > 0)
+    elevation = torch.atan2(down, horiz_dist.clamp_min(1e-8))
+    center_in_fov = projection.in_fov & projection.in_front
 
     # Size-aware FOV check: surfel must be FULLY inside FOV (center + size extent)
     # Get surfel radius (max of scaling dimensions)
@@ -322,14 +439,8 @@ def render_sonar(viewpoint_camera, pc: GaussianModel, bg_color: torch.Tensor,
     # Use actual image dimensions from viewpoint (may be downscaled)
     H = viewpoint_camera.image_height
     W = viewpoint_camera.image_width
-    
-    # Negate azimuth for column mapping: positive azimuth → lower column (left)
-    col = (-azimuth / sonar_config.half_azimuth_rad + 1) * (W / 2)  # [N]
-    row = (range_vals - sonar_config.range_min) / (sonar_config.range_max - sonar_config.range_min) * H  # [N]
-    
-    # Clamp to image bounds
-    col = torch.clamp(col, 0, W - 1)
-    row = torch.clamp(row, 0, H - 1)
+    col = torch.clamp(projection.col, 0, W - 1)
+    row = torch.clamp(projection.row, 0, H - 1)
     
     # Get surfel normals in world space (from rotation quaternions)
     rotations = pc.get_rotation  # [N, 4] quaternions
@@ -337,23 +448,33 @@ def render_sonar(viewpoint_camera, pc: GaussianModel, bg_color: torch.Tensor,
     
     # Compute direction from surfel to sonar origin (for Lambertian intensity)
     # Add eps to avoid nan from normalizing zero vectors when surfel is at sonar origin
-    diff_to_sonar = sonar_origin.unsqueeze(0) - means3D  # [N, 3]
+    diff_to_sonar = sonar_origin_scaled.unsqueeze(0) - means3D_scaled  # [N, 3]
     dist_to_sonar = torch.norm(diff_to_sonar, dim=-1, keepdim=True) + 1e-8  # [N, 1]
     dir_to_sonar = diff_to_sonar / dist_to_sonar  # [N, 3]
     
     # Lambertian intensity: I = max(0, n · d)
     lambertian = torch.clamp(torch.sum(normals_world * dir_to_sonar, dim=-1), min=0)  # [N]
     
-    # Get surfel opacity and combine with Lambertian
+    # Base intensity from surfel opacity and Lambertian response.
     opacity = pc.get_opacity.squeeze(-1)  # [N]
-    intensity = opacity * lambertian  # [N]
+    base_intensity = opacity * lambertian  # [N]
+
+    attenuation, attenuation_diag = compute_sonar_range_attenuation(
+        range_vals,
+        use_range_attenuation=use_range_attenuation,
+        range_atten_exp=range_atten_exp,
+        range_atten_gain=range_atten_gain,
+        range_atten_r0=range_atten_r0,
+        range_atten_eps=range_atten_eps,
+        range_atten_auto_gain=range_atten_auto_gain,
+    )
+    intensity = base_intensity * attenuation
     
     # Initialize output images (use actual viewpoint dimensions)
     out_H = viewpoint_camera.image_height
     out_W = viewpoint_camera.image_width
     rendered_image = torch.zeros(1, out_H, out_W, device=device)
     range_image = torch.zeros(1, out_H, out_W, device=device)
-    alpha_image = torch.zeros(1, out_H, out_W, device=device)
     weight_sum = torch.zeros(out_H, out_W, device=device)
     
     # Splat each surfel to its pixel bin using differentiable scatter operations
@@ -455,6 +576,30 @@ def render_sonar(viewpoint_camera, pc: GaussianModel, bg_color: torch.Tensor,
         sonar_ranges_to_points(viewpoint_camera, range_image, sonar_config, scale_factor),
         range_image
     ).permute(2, 0, 1)  # [3, H, W]
+
+    range_span = max(float(sonar_config.range_max - sonar_config.range_min), 1e-6)
+    near_thresh = float(sonar_config.range_min + 0.2 * range_span)
+    far_thresh = float(sonar_config.range_min + 0.8 * range_span)
+    near_mask = in_fov & (range_vals <= near_thresh)
+    far_mask = in_fov & (range_vals >= far_thresh)
+    near_mean = float(intensity[near_mask].detach().mean().item()) if near_mask.any() else 0.0
+    far_mean = float(intensity[far_mask].detach().mean().item()) if far_mask.any() else 0.0
+    saturation_rate = float((rendered_image > 0.95).float().mean().item())
+    nan_inf_count = int((~torch.isfinite(rendered_image)).sum().item() + (~torch.isfinite(range_image)).sum().item())
+    sonar_diagnostics = {
+        "attenuation_enabled": bool(attenuation_diag["enabled"]),
+        "attenuation_gain_mode": attenuation_diag["gain_mode"],
+        "attenuation_effective_gain": float(attenuation_diag["effective_gain"]),
+        "attenuation_exp": float(attenuation_diag["exp"]),
+        "attenuation_r0": float(attenuation_diag["r0"]),
+        "attenuation_eps": float(attenuation_diag["eps"]),
+        "visible_surfel_ratio": float(in_fov.float().mean().item()) if N > 0 else 0.0,
+        "near_range_mean_intensity": near_mean,
+        "far_range_mean_intensity": far_mean,
+        "far_over_near_ratio": far_mean / max(near_mean, 1e-8),
+        "near_range_saturation_rate": saturation_rate,
+        "nan_inf_count": nan_inf_count,
+    }
     
     return {
         "render": rendered_image,
@@ -467,6 +612,7 @@ def render_sonar(viewpoint_camera, pc: GaussianModel, bg_color: torch.Tensor,
         "rend_dist": torch.zeros(1, H, W, device=device),
         "surf_depth": range_image,
         "surf_normal": surf_normal,
+        "sonar_diagnostics": sonar_diagnostics,
     }
 
 
