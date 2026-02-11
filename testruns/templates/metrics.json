@@ -1,0 +1,15 @@
+{
+  "run_id": "",
+  "timestamp": "",
+  "commit": "",
+  "status": "in_progress",
+  "final": {
+    "loss_total": null,
+    "loss_lik": null,
+    "loss_couple": null,
+    "loss_entropy": null,
+    "mesh_quality_score": null
+  },
+  "checkpoints": [],
+  "notes": ""
+}

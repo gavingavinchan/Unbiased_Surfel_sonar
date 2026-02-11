@@ -1,8 +1,19 @@
 # Plan: Elevation-Aware Training with Back Projection in Loop
 
-**Date/Time:** 2026-01-28
+**Date/Time:** 2026-01-28 (updated 2026-02-10)
 **Git Commit:** 88b210c
-**Status:** Design exploration (not yet implemented)
+**Status:** Design exploration with decision addenda (not yet implemented)
+
+---
+
+## Session Note Procedure (2026-02-10)
+
+To keep future sessions consistent and avoid decision/implementation drift:
+
+1. Track issues point-by-point in `scratchpad.md` with file references.
+2. Resolve each issue by updating the detailed plan first with executable contracts.
+3. Add only a short decision summary in this base plan and link to the detailed plan for formulas/interfaces/defaults.
+4. Keep this base plan focused on decisions and status; keep implementation mechanics in the detailed plan.
 
 ---
 
@@ -25,17 +36,17 @@ pixel (col, row) → arc of points with same (azimuth, range), varying elevation
 ```
 Side view (looking along azimuth direction):
 
-         elevation = +10°
-              ↗ ·
-            ·
-          ·        ← All these points produce
-        ·             the SAME pixel (col, row)
-      · ← elevation = 0 (current assumption)
-        ·
-          ·
-            ·
-              ↘ ·
-         elevation = -10°
+         geometric up endpoint (camera -Y)
+             ↗ ·
+           ·
+         ·        ← All these points produce
+       ·             the SAME pixel (col, row)
+     · ← elevation = 0 (current assumption)
+       ·
+         ·
+           ·
+             ↘ ·
+         geometric down endpoint (camera +Y)
 
          ↑
        sonar origin
@@ -79,9 +90,19 @@ Frame A (pose 1)                    Frame B (pose 2)
 
 ## Design Constraints
 
-- **When to resolve elevation**: During training only (not initialization)
+- **When to resolve elevation**: No deterministic elevation solving at initialization; Stage 0 may use random prior sampling (default), and elevation is resolved during training (Stage 1+)
 - **Hardware**: Laptop with 8GB VRAM, 500 frames max
 - **Priority**: Make it work first, optimize later
+
+---
+
+## Reader Guide (2026-02-10)
+
+- This file contains both exploration history and final decision updates.
+- For implementation details and executable contracts, use `plans/PLAN_ELEVATION_AWARE_TRAINING_detailed_2026-02-01.md` as source of truth.
+- Option sections below (1A/1B/2/3/A/B/C) are exploratory unless a later "Decision Update" explicitly promotes them.
+- Stage naming in current decisions is elevation Stage 0/1/2 (init, bin-likelihood+c coupling, optional densification).
+- Existing `debug_multiframe.py` curriculum labels should be treated as separate phase names; do not map them 1:1 by number.
 
 ---
 
@@ -149,6 +170,8 @@ Loss: ||P_A - P_B||²
 **Challenge**: How to establish pixel correspondences across frames?
 - Use surfels as anchors: if surfel S renders to pixel_A in frame A and pixel_B in frame B, those pixels correspond
 - Forward-project surfels to find which pixels they hit in each frame
+
+Status note (2026-02-10): surfel-anchored correspondence here is exploratory context only. The current default path (see decision updates) starts with implicit multi-view consistency and GT-anchored bin likelihood, with explicit correspondence only as fallback.
 
 **Gradient flow:**
 ```
@@ -916,6 +939,7 @@ This update supersedes the earlier recommendation that used a geometry-first arc
   - `support_ratio = support_count / max(1, diverse_candidate_count)`
   - mid: `support_ratio >= 0.25` with floor `support_count >= 2`
   - late: `support_ratio >= 0.45` with floor `support_count >= 4`
+- Rationale for strict late floor: the dataset is collected by orbiting and facing the primary object of interest, so true object surfels should have dense multi-view overlap. The stricter late threshold intentionally favors precision (retain consistently observed target structure) and prunes peripheral/side clutter that does not maintain strong overlap.
 
 ---
 
@@ -1000,6 +1024,10 @@ This update supersedes the earlier recommendation that used a geometry-first arc
   - `I = lambert * gain / (max(r, r0)^p + eps)`
   - default: `p=2.0`, `r0=0.35 m`, `eps=1e-6`, configurable `gain`.
 - Keep `SONAR_USE_RANGE_ATTEN=1` as default; attenuation-off remains diagnostic only.
+- Parameter precedence (deterministic):
+  - if `SONAR_USE_RANGE_ATTEN=0`, attenuation is OFF and attenuation parameters are ignored;
+  - else if `SONAR_RANGE_ATTEN_AUTO_GAIN=1`, auto-gain mode is active and `SONAR_RANGE_ATTEN_GAIN` is initialization seed only;
+  - else, manual-gain mode is active and effective gain is `SONAR_RANGE_ATTEN_GAIN`.
 
 ### Why
 
@@ -1088,3 +1116,167 @@ This update supersedes the earlier recommendation that used a geometry-first arc
 
 - Save selected frame IDs/names as part of dataset split metadata.
 - Training consumes this precomputed list directly.
+
+---
+
+## Decision Update (2026-02-10): Overlap Score v1 for `overlap_table`
+
+- Stage 1 neighbor selection uses a pose-only `overlap_score` in v1 (baseline + yaw with hard gates).
+- This choice is for deterministic behavior, low overhead, and reproducible first-pass implementation.
+- The exact scoring/ranking formula and config defaults are defined in:
+  `plans/PLAN_ELEVATION_AWARE_TRAINING_detailed_2026-02-01.md` under `overlap_table` contract.
+
+---
+
+## Decision Update (2026-02-10): Use Full Projection Validity Mask
+
+- Stage-1 likelihood/support gating uses full projection validity (`valid = in_fov & in_front & in_bounds`), not `in_fov` alone.
+- This avoids treating partially invalid projections as evidence.
+- Exact pseudocode contract is defined in:
+  `plans/PLAN_ELEVATION_AWARE_TRAINING_detailed_2026-02-01.md` under `sonar_project_points` return contract and Stage-1 likelihood pseudocode.
+
+---
+
+## Decision Update (2026-02-10): Invalid Likelihood Mode v1
+
+- For v1, invalid projections use neutral evidence only (`ELEV_LIK_INVALID_MODE=neutral`).
+- `penalize` mode is deferred and not part of the current implementation contract.
+- Exact likelihood behavior is defined in:
+  `plans/PLAN_ELEVATION_AWARE_TRAINING_detailed_2026-02-01.md` under `Likelihood Measurement Model (Resolved)`.
+
+---
+
+## Decision Update (2026-02-10): Coupling Sigma Policy v1
+
+- For v1 coupling association, use fixed normalization scales (`sigma_pix`, `sigma_depth`) for deterministic behavior.
+- Adaptive sigma updates are intentionally deferred to a later revision after the fixed-sigma baseline is stable.
+- Exact config names/defaults and association contract are defined in:
+  `plans/PLAN_ELEVATION_AWARE_TRAINING_detailed_2026-02-01.md` under `associate_expected_points_to_surfels` contract and `Configuration / Flags`.
+
+---
+
+## Decision Update (2026-02-10): Stage Boundaries v1
+
+- Stage transitions in v1 use fixed iteration gates for deterministic behavior.
+- Stage 0 remains init-only, Stage 1 starts at iteration 0, and Stage 2 is optional/iteration-gated.
+- Normals ramp is also fixed-iteration gated in v1; hybrid metric+iteration transition logic is deferred to a later revision.
+- Exact stage/normal gate definitions and config defaults are defined in:
+  `plans/PLAN_ELEVATION_AWARE_TRAINING_detailed_2026-02-01.md` under `Stage Boundary Contract (v1 Fixed Gates)` and `Configuration / Flags`.
+
+---
+
+## Decision Update (2026-02-10): Group A Defaults (Frame Pairing and Workload)
+
+- v1 defaults are set for frame pairing/workload controls (`ELEV_FRAMES_PER_ITER`, overlap top-k build/use, baseline/yaw/score gates).
+- Baseline defaults target a balanced compute/coverage profile for first-pass runs on 8GB VRAM.
+- Note: `ELEV_OVERLAP_MAX_YAW_DEG` is expected to be an early tuning knob and will likely need to be increased for wider-orbit coverage.
+- Exact values are defined in:
+  `plans/PLAN_ELEVATION_AWARE_TRAINING_detailed_2026-02-01.md` under `Configuration / Flags` and `overlap_table` contract.
+
+---
+
+## Decision Update (2026-02-10): Group B Defaults (Likelihood Optimization)
+
+- v1 defaults are set for likelihood-logit optimization controls (`ELEV_LOGIT_LR`, `ELEV_LIK_WEIGHT`, `ELEV_ENTROPY_WEIGHT`).
+- Selected values follow a balanced profile: evidence-driven updates with mild entropy sharpening.
+- Exact values are defined in:
+  `plans/PLAN_ELEVATION_AWARE_TRAINING_detailed_2026-02-01.md` under `Configuration / Flags`.
+
+---
+
+## Decision Update (2026-02-10): Group C Defaults (Reliability Normalization)
+
+- v1 defaults are set for frame-reliability normalization controls (`ELEV_REL_FLOOR`, valid-ratio clamp range, dynamic-range clamp range).
+- Selected values follow a balanced profile: downweight weak/noisy frames without over-suppressing usable evidence.
+- Exact values are defined in:
+  `plans/PLAN_ELEVATION_AWARE_TRAINING_detailed_2026-02-01.md` under `Configuration / Flags`.
+
+---
+
+## Decision Update (2026-02-10): Group D Defaults (Coupling Weights and Gates)
+
+- v1 defaults are set for coupling schedule/gating controls (`ELEV_COUPLE_WEIGHT_*`, pixel/depth gates, Huber delta, and minimum association weight).
+- Selected values follow a balanced profile: enough geometry pull to prevent belief-geometry drift while keeping early training stable.
+- Exact values are defined in:
+  `plans/PLAN_ELEVATION_AWARE_TRAINING_detailed_2026-02-01.md` under `Configuration / Flags`.
+
+---
+
+## Decision Update (2026-02-10): Group E Defaults (Support and Pruning Dynamics)
+
+- v1 defaults are set for support/pruning dynamics (`ELEV_SUPPORT_WARMUP_ITERS`, view-angle diversity threshold, residual threshold, EMA decay, prune patience).
+- Current profile is conservative to reduce early over-pruning risk while support statistics stabilize.
+- Exact values are defined in:
+  `plans/PLAN_ELEVATION_AWARE_TRAINING_detailed_2026-02-01.md` under `Configuration / Flags` and `Multi-View Support Policy`.
+
+---
+
+## Decision Update (2026-02-10): Group F Defaults (Secondary Schedule Parameters)
+
+- v1 defaults are set for secondary schedule parameters (`ELEV_BANK_REMAP_MAX_DIST`, decoupled posterior temperature start/end, `ELEV_DENSIFY_INTERVAL`).
+- These are pinned for reproducibility even when related features are disabled by default (`ELEV_BANK_REFRESH_INTERVAL=0`, `ELEV_TEMP_POST_MODE=shared`, `ELEV_DENSIFY=0`).
+- Exact values are defined in:
+  `plans/PLAN_ELEVATION_AWARE_TRAINING_detailed_2026-02-01.md` under `Configuration / Flags`.
+
+---
+
+## Decision Update (2026-02-10): `frame_stats` Lifecycle v1
+
+- `frame_stats` is built once at Stage 1 startup and treated as run-static in v1.
+- No periodic refresh is used because the training frame set and masks are treated as static.
+- Rebuild `frame_stats` only if the active frame list/split changes.
+- Exact data contract and fallback behavior are defined in:
+  `plans/PLAN_ELEVATION_AWARE_TRAINING_detailed_2026-02-01.md` under `Frame stats cache` and `Frame reliability weight REL_B`.
+
+---
+
+## Decision Update (2026-02-10): New-Surfel Grace for Support Pruning v1
+
+- Add a per-surfel age grace gate for densification-enabled runs.
+- Newly created surfels are exempt from hard prune checks for a fixed number of iterations; support still accumulates during grace.
+- This prevents immediate prune of late-born surfels after global warmup has ended.
+- Exact lifecycle and config defaults are defined in:
+  `plans/PLAN_ELEVATION_AWARE_TRAINING_detailed_2026-02-01.md` under `Coupling/support buffers`, `Multi-View Support Policy`, and `Configuration / Flags`.
+
+---
+
+## Decision Update (2026-02-10): ID-Tensor Compaction Policy v1
+
+- Keep ID-keyed support tensors non-compacting in v1 for simpler and safer first-pass implementation.
+- Accept monotonic ID-space growth for current runs.
+- If long-run overhead grows, promote threshold-triggered compaction as a follow-up (for example, sparse-ID trigger based on `next_surfel_id` vs active count).
+- Detailed risk note and follow-up direction are defined in:
+  `plans/PLAN_ELEVATION_AWARE_TRAINING_detailed_2026-02-01.md` under `Coupling/support buffers` and `Risks and Mitigations`.
+
+---
+
+## Decision Update (2026-02-10): Experiment Ledger in `testruns/`
+
+- Adopt an in-repo experiment ledger to track tuning cycles beyond git commit history.
+- Use per-run folders under `testruns/` with run ID, commit hash, and timestamp in the folder name.
+- Required per-run artifacts are `run.md`, `config.env`, and `metrics.json`, plus an index summary entry.
+- Git remains code truth; `testruns/` is the tuning/experiment truth for cross-session continuity.
+- Exact folder schema and lifecycle contract are defined in:
+  `plans/PLAN_ELEVATION_AWARE_TRAINING_detailed_2026-02-01.md` under `Experiment Run Ledger Workflow (v1)`.
+
+---
+
+## Decision Update (2026-02-10): Option Status Map
+
+To reduce ambiguity in this long design document, option status is now explicit:
+
+- **Active path for implementation**:
+  - Stage 0 random elevation-aware initialization,
+  - Stage 1 GT-anchored bin likelihood + mandatory belief-to-geometry coupling,
+  - Stage 2 optional densification,
+  - optional low-weight arc stabilizer only.
+- **Deprecated as primary driver**:
+  - Arc-only geometry-first Stage 1.
+- **Exploratory/reference only unless re-promoted later**:
+  - Option 1A, Option 1B, Option 2,
+  - Idea B (prediction network), Idea C (implicit-only enhanced losses).
+
+Status note: Option 3 content is partially adopted as optional Stage 2 densification (not mandatory baseline).
+
+Implementation contract remains the detailed plan file:
+`plans/PLAN_ELEVATION_AWARE_TRAINING_detailed_2026-02-01.md`.
