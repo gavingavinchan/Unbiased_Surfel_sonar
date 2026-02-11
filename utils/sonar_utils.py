@@ -547,14 +547,22 @@ class SonarExtrinsic(nn.Module):
 # Sonar-Based Point Cloud Generation
 # =============================================================================
 
-def sonar_frame_to_points(camera, sonar_config, intensity_threshold=0.05, mask_top_rows=10,
-                          scale_factor=1.0):
+def sonar_frame_to_points(
+    camera,
+    sonar_config,
+    intensity_threshold=0.05,
+    mask_top_rows=10,
+    scale_factor=1.0,
+    elevation_mode="random",
+    rng=None,
+    return_debug=False,
+):
     """
     Generate 3D points from a single sonar frame via backward projection.
     
     For each valid sonar pixel (intensity > threshold):
     - Convert (col, row) -> (azimuth, range)
-    - Assume elevation = 0 (center of beam)
+    - Select elevation mode (zero or random within sonar elevation FOV)
     - Convert to 3D in sonar frame (metric)
     - Transform to world frame using camera pose (COLMAP scale)
     - Convert to COLMAP scale for downstream consistency
@@ -565,10 +573,14 @@ def sonar_frame_to_points(camera, sonar_config, intensity_threshold=0.05, mask_t
         intensity_threshold: Minimum intensity to consider valid (0-1)
         mask_top_rows: Skip top N rows (closest range, often artifacts)
         scale_factor: COLMAP->metric scale; points returned in COLMAP scale
+        elevation_mode: "random" (default) or "zero"
+        rng: Optional numpy RNG with `uniform()` for deterministic sampling in random mode
+        return_debug: If True, return summary diagnostics as third return value
         
     Returns:
         points: [N, 3] numpy array of 3D points in world coordinates (COLMAP scale)
         colors: [N, 3] numpy array of RGB colors (grayscale from intensity)
+        debug (optional): dict with initialization diagnostics
     """
     import numpy as np
     
@@ -596,7 +608,25 @@ def sonar_frame_to_points(camera, sonar_config, intensity_threshold=0.05, mask_t
     rows, cols = np.where(valid_mask)
     
     if len(rows) == 0:
-        return np.zeros((0, 3)), np.zeros((0, 3))
+        empty_points = np.zeros((0, 3))
+        empty_colors = np.zeros((0, 3))
+        if return_debug:
+            return empty_points, empty_colors, {
+                "num_points": 0,
+                "elevation_mode": elevation_mode,
+                "elevation_min_rad": 0.0,
+                "elevation_max_rad": 0.0,
+                "y_cam_sum": 0.0,
+                "y_cam_sumsq": 0.0,
+                "y_cam_min": 0.0,
+                "y_cam_max": 0.0,
+            }
+        return empty_points, empty_colors
+
+    if elevation_mode not in ("zero", "random"):
+        raise ValueError(
+            f"Invalid elevation_mode='{elevation_mode}'. Expected one of ['zero', 'random']."
+        )
     
     # Convert pixel coords to polar (azimuth, range)
     # Azimuth: center column = 0, left = positive, right = negative
@@ -607,13 +637,20 @@ def sonar_frame_to_points(camera, sonar_config, intensity_threshold=0.05, mask_t
     range_vals_metric = sonar_config.range_min + (rows / H) * (sonar_config.range_max - sonar_config.range_min)
     
     # Convert to 3D in sonar/camera frame (metric)
-    # Assuming elevation = 0 (center of beam)
     # Camera frame: +Z forward, +X right, +Y down
     # Azimuth convention: right side of image = negative azimuth, left = positive
     # So: x = -r * sin(az) to get positive x for right side (negative azimuth)
-    x_cam = -range_vals_metric * np.sin(azimuth)  # lateral (flipped to match +X = right)
-    y_cam = np.zeros_like(range_vals_metric)      # elevation = 0
-    z_cam = range_vals_metric * np.cos(azimuth)   # forward (depth)
+    if elevation_mode == "zero":
+        elevation = np.zeros_like(range_vals_metric)
+    else:
+        half_el_rad = math.radians(sonar_config.elevation_fov / 2)
+        sampler = np.random if rng is None else rng
+        elevation = sampler.uniform(-half_el_rad, half_el_rad, size=range_vals_metric.shape[0])
+
+    cos_elevation = np.cos(elevation)
+    x_cam = -range_vals_metric * np.sin(azimuth) * cos_elevation
+    y_cam = range_vals_metric * np.sin(elevation)
+    z_cam = range_vals_metric * np.cos(azimuth) * cos_elevation
     
     points_cam_metric = np.stack([x_cam, y_cam, z_cam], axis=1)  # [N, 3] metric
     
@@ -639,12 +676,34 @@ def sonar_frame_to_points(camera, sonar_config, intensity_threshold=0.05, mask_t
     intensities = intensity[rows, cols]
     colors = np.stack([intensities, intensities, intensities], axis=1)  # [N, 3]
     
+    if return_debug:
+        y_cam_sum = float(np.sum(y_cam))
+        y_cam_sumsq = float(np.sum(np.square(y_cam)))
+        return points_world, colors, {
+            "num_points": int(y_cam.shape[0]),
+            "elevation_mode": elevation_mode,
+            "elevation_min_rad": float(np.min(elevation)),
+            "elevation_max_rad": float(np.max(elevation)),
+            "y_cam_sum": y_cam_sum,
+            "y_cam_sumsq": y_cam_sumsq,
+            "y_cam_min": float(np.min(y_cam)),
+            "y_cam_max": float(np.max(y_cam)),
+        }
+
     return points_world, colors
 
 
-def sonar_frames_to_point_cloud(cameras, sonar_config, intensity_threshold=0.05, 
-                                 mask_top_rows=10, max_points_per_frame=5000,
-                                 voxel_downsample=None, scale_factor=1.0):
+def sonar_frames_to_point_cloud(
+    cameras,
+    sonar_config,
+    intensity_threshold=0.05,
+    mask_top_rows=10,
+    max_points_per_frame=5000,
+    voxel_downsample=None,
+    scale_factor=1.0,
+    elevation_mode="random",
+    rng=None,
+):
     """
     Generate combined 3D point cloud from multiple sonar frames.
     
@@ -655,6 +714,8 @@ def sonar_frames_to_point_cloud(cameras, sonar_config, intensity_threshold=0.05,
         mask_top_rows: Skip top N rows (artifacts at close range)
         max_points_per_frame: Randomly sample if more points than this (None = no limit)
         voxel_downsample: Voxel size for downsampling final cloud (None = no downsample)
+        elevation_mode: "random" (default) or "zero"
+        rng: Optional numpy RNG used by random elevation sampling
         
     Returns:
         points: [N, 3] numpy array of 3D points in world coordinates
@@ -666,12 +727,16 @@ def sonar_frames_to_point_cloud(cameras, sonar_config, intensity_threshold=0.05,
     all_colors = []
     
     for i, cam in enumerate(cameras):
-        points, colors = sonar_frame_to_points(
+        frame_result = sonar_frame_to_points(
             cam, sonar_config, 
             intensity_threshold=intensity_threshold,
             mask_top_rows=mask_top_rows,
-            scale_factor=scale_factor
+            scale_factor=scale_factor,
+            elevation_mode=elevation_mode,
+            rng=rng,
+            return_debug=False,
         )
+        points, colors = frame_result[0], frame_result[1]
         
         if len(points) == 0:
             continue

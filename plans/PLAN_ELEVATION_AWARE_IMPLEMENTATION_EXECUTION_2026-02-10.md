@@ -144,6 +144,11 @@ Each chunk must pass its gate before moving to the next chunk.
 - Continue training for a short continuation window.
 - Confirm no state-contract breakage (`pixel_logits`, `optim_elev`, support buffers, surfel IDs).
 
+### Manual visual test policy
+
+- For any chunk, add manual visual tests whenever needed to validate geometry/mesh/render quality that cannot be judged reliably from scalar metrics alone.
+- Manual visual checks are allowed in addition to automated gates and should be recorded with artifact paths and a brief pass/fail note.
+
 ---
 
 ## Commit Policy

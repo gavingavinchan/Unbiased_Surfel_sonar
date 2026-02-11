@@ -122,8 +122,9 @@ Output contract:
 ### Stage 0: Elevation-Aware Initialization
 
 - Extend back-projection init to support non-zero elevation.
-- Default: random elevation per valid pixel, uniform in beam range.
-- Keep `zero` mode for ablation.
+- Default migration (repo-wide): random elevation per valid pixel, uniform in beam range.
+- Keep `zero` mode for ablation and regression parity checks.
+- Caller policy: pass explicit mode at initialization call sites for clarity (`random` or `zero`), even though helper default is random.
 
 ### Stage 1: Bin-Likelihood Elevation Update (Primary)
 
@@ -382,7 +383,9 @@ def sonar_polar_to_points(azimuth, elevation, range_vals):
 
 2. Extend `sonar_frame_to_points(...)` with elevation mode:
    - `elevation_mode = "zero" | "random" | "values"`
-   - Preserve legacy behavior when elevation mode is disabled.
+   - Repository default migration: helper default is `elevation_mode="random"`.
+   - Explicit fallback for legacy/ablation: `elevation_mode="zero"`.
+   - Keep deterministic behavior under fixed seed for random mode.
 3. Ensure camera-to-sonar extrinsic defaults match recorded mount:
    - translation `[0.0, -0.10, -0.08]` meters in camera frame,
    - pitch `+5 deg` about camera X.
@@ -417,9 +420,9 @@ intensity = lambert * atten
 ### `debug_multiframe.py`
 
 1. Add elevation and physics env flags (see config section).
-2. During initialization, call elevation-aware back-projection (`random` default).
+2. During initialization, read `ELEV_INIT_MODE` (default `random`) and pass it explicitly to back-projection.
 3. Add optional sonar fixed-opacity path:
-     - when enabled, set surfel opacity to 1 and freeze optimizer for opacity.
+      - when enabled, set surfel opacity to 1 and freeze optimizer for opacity.
 4. Add persistent pixel-logit registry (`nn.ParameterDict`) and dedicated optimizer (`optim_elev`) with explicit refresh/remap policy.
 5. Implement Stage 1 bin-likelihood loss + annealing.
 6. Implement belief-to-geometry coupling loss (`expected-point -> surfel`) with robust weighting.

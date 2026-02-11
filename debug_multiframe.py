@@ -48,6 +48,7 @@ from utils.sonar_utils import (SonarConfig, SonarScaleFactor, SonarExtrinsic,
 from utils.graphics_utils import BasicPointCloud
 from utils.loss_utils import l1_loss, ssim
 from utils.mesh_utils import GaussianExtractor
+from utils.general_utils import inverse_sigmoid
 import open3d as o3d
 from PIL import Image
 
@@ -334,6 +335,8 @@ BRIGHT_WEIGHT = 0.5
 BRIGHT_MIN_PIXELS = 32
 LOSS_SMOOTH_WINDOW = 200
 LOSS_LOG_FLUSH_INTERVAL = 100
+GAUSSIAN_OPACITY_LR = 0.05
+FIXED_OPACITY_TARGET = 0.999
 
 
 def preprocess_gt_image(image_tensor, mask_top_rows=10, intensity_threshold=INTENSITY_THRESHOLD):
@@ -379,6 +382,30 @@ def compute_bright_loss(rendered, gt_image, percentile=BRIGHT_PERCENTILE, min_pi
         bright_mask = gt_gray >= torch.quantile(gt_gray, 0.5)
 
     return diff_gray[bright_mask].mean()
+
+
+def apply_opacity_policy(gaussians, fixed_opacity, fixed_target=FIXED_OPACITY_TARGET,
+                         learnable_opacity_lr=GAUSSIAN_OPACITY_LR):
+    """Apply and re-apply opacity policy while keeping optimizer group structure intact."""
+    opacity_group = None
+    for group in gaussians.optimizer.param_groups:
+        if group.get("name") == "opacity":
+            opacity_group = group
+            break
+
+    if opacity_group is None:
+        raise RuntimeError("Gaussian optimizer is missing required 'opacity' param group")
+
+    if fixed_opacity:
+        target_activated = torch.full_like(gaussians._opacity.data, fixed_target)
+        fixed_logits = inverse_sigmoid(target_activated)
+        gaussians._opacity.data.copy_(fixed_logits)
+        gaussians._opacity.requires_grad_(False)
+        gaussians._opacity.grad = None
+        opacity_group["lr"] = 0.0
+    else:
+        gaussians._opacity.requires_grad_(True)
+        opacity_group["lr"] = learnable_opacity_lr
 
 
 class Tee:
@@ -759,6 +786,17 @@ def env_bool(name, default):
     return value.lower() not in ("0", "false", "no", "off")
 
 
+def env_choice(name, default, choices):
+    value = os.environ.get(name)
+    if value in (None, ""):
+        return default
+    normalized = value.strip().lower()
+    if normalized not in choices:
+        options = ", ".join(sorted(choices))
+        raise ValueError(f"Invalid {name}='{value}'. Expected one of: {options}")
+    return normalized
+
+
 # Curriculum learning parameters
 STAGE1_ITERATIONS = 0   # Learn scale only (surfels frozen) - DISABLED, using known scale
 STAGE2_ITERATIONS = 1000  # Learn surfels only (scale frozen)
@@ -790,6 +828,8 @@ SONAR_RANGE_ATTEN_GAIN = env_float("SONAR_RANGE_ATTEN_GAIN", 1.0)
 SONAR_RANGE_ATTEN_R0 = env_float("SONAR_RANGE_ATTEN_R0", 0.35)
 SONAR_RANGE_ATTEN_EPS = env_float("SONAR_RANGE_ATTEN_EPS", 1e-6)
 SONAR_RANGE_ATTEN_AUTO_GAIN = env_bool("SONAR_RANGE_ATTEN_AUTO_GAIN", False)
+ELEV_INIT_MODE = env_choice("ELEV_INIT_MODE", "random", {"random", "zero"})
+SONAR_FIXED_OPACITY = env_bool("SONAR_FIXED_OPACITY", True)
 
 if not SONAR_USE_RANGE_ATTEN:
     SONAR_ATTENUATION_MODE = "off"
@@ -842,6 +882,8 @@ print(f"Convention asserts: {SONAR_CONVENTION_ASSERTS}")
 print(f"Camera/view convention: {SONAR_CAMERA_FRAME_CONVENTION}")
 print(f"Sonar image convention: {SONAR_IMAGE_CONVENTION}")
 print(f"Mount extrinsic (camera frame): translation={SONAR_MOUNT_TRANSLATION_CAM}, pitch_deg={SONAR_MOUNT_PITCH_DEG}")
+print(f"[Stage 0] ELEV_INIT_MODE={ELEV_INIT_MODE}, SONAR_FIXED_OPACITY={int(SONAR_FIXED_OPACITY)}")
+print(f"[Stage 0] Opacity mode: {'FIXED (target=0.999)' if SONAR_FIXED_OPACITY else 'LEARNABLE'}")
 if SONAR_ATTENUATION_MODE == "off":
     print("Range attenuation: OFF (all attenuation parameters ignored)")
 elif SONAR_ATTENUATION_MODE == "auto":
@@ -1006,15 +1048,40 @@ all_points = []
 all_colors = []
 all_normals = []
 
+stage0_rng = np.random.default_rng(SEED)
+stage0_point_count = 0
+stage0_y_sum = 0.0
+stage0_y_sumsq = 0.0
+stage0_y_min = float("inf")
+stage0_y_max = float("-inf")
+stage0_elev_min = float("inf")
+stage0_elev_max = float("-inf")
+
 temp_scale_factor = SonarScaleFactor(init_value=INIT_SCALE_FACTOR).cuda()
 
 for i, cam in enumerate(training_frames):
-    points, colors = sonar_frame_to_points(
+    frame_init = sonar_frame_to_points(
         cam, sonar_config,
         intensity_threshold=INTENSITY_THRESHOLD / 255.0,  # Same threshold as training
         mask_top_rows=10,
-        scale_factor=temp_scale_factor.get_scale_value()
+        scale_factor=temp_scale_factor.get_scale_value(),
+        elevation_mode=ELEV_INIT_MODE,
+        rng=stage0_rng,
+        return_debug=True,
     )
+    if len(frame_init) != 3:
+        raise RuntimeError("sonar_frame_to_points(return_debug=True) must return (points, colors, debug)")
+    points, colors = frame_init[0], frame_init[1]
+    init_debug = frame_init[2]
+
+    if init_debug["num_points"] > 0:
+        stage0_point_count += init_debug["num_points"]
+        stage0_y_sum += init_debug["y_cam_sum"]
+        stage0_y_sumsq += init_debug["y_cam_sumsq"]
+        stage0_y_min = min(stage0_y_min, init_debug["y_cam_min"])
+        stage0_y_max = max(stage0_y_max, init_debug["y_cam_max"])
+        stage0_elev_min = min(stage0_elev_min, init_debug["elevation_min_rad"])
+        stage0_elev_max = max(stage0_elev_max, init_debug["elevation_max_rad"])
 
     if len(points) == 0:
         print(f"  Frame {i}: 0 points (skipped)")
@@ -1040,6 +1107,25 @@ colors = np.concatenate(all_colors, axis=0)
 normals = np.concatenate(all_normals, axis=0)
 
 print(f"Total points: {len(points)}")
+
+if stage0_point_count > 0:
+    stage0_y_mean = stage0_y_sum / stage0_point_count
+    stage0_y_var = max((stage0_y_sumsq / stage0_point_count) - (stage0_y_mean ** 2), 0.0)
+    stage0_y_std = math.sqrt(stage0_y_var)
+    print(
+        f"[Stage 0] Init points: N={stage0_point_count}, "
+        f"Y mean={stage0_y_mean:.4f}, std={stage0_y_std:.4f}, "
+        f"range=[{stage0_y_min:.4f}, {stage0_y_max:.4f}]"
+    )
+    print(
+        f"[Stage 0] Elevation samples: min={stage0_elev_min:.4f} rad ({math.degrees(stage0_elev_min):.2f} deg), "
+        f"max={stage0_elev_max:.4f} rad ({math.degrees(stage0_elev_max):.2f} deg)"
+    )
+    if ELEV_INIT_MODE == "zero" and (abs(stage0_y_mean) > 1e-6 or stage0_y_std > 1e-7):
+        raise RuntimeError(
+            "Zero-mode legacy-parity contract failed: expected near-zero sonar-frame Y spread "
+            f"but got mean={stage0_y_mean:.3e}, std={stage0_y_std:.3e}"
+        )
 
 # Diagnostic: Print range statistics of generated points
 # Compute distance from each point to its source camera
@@ -1165,7 +1251,7 @@ gaussians.training_setup(Namespace(
     position_lr_delay_mult=0.01,
     position_lr_max_steps=30000,
     feature_lr=0.0025,
-    opacity_lr=0.05,
+    opacity_lr=GAUSSIAN_OPACITY_LR,
     scaling_lr=0.005,
     rotation_lr=0.001,
     percent_dense=0.01,
@@ -1176,6 +1262,13 @@ gaussians.training_setup(Namespace(
     densify_until_iter=15000,
     densify_grad_threshold=0.0002,
 ))
+apply_opacity_policy(
+    gaussians,
+    fixed_opacity=SONAR_FIXED_OPACITY,
+    fixed_target=FIXED_OPACITY_TARGET,
+    learnable_opacity_lr=GAUSSIAN_OPACITY_LR,
+)
+print(f"[Stage 0] Opacity mode: {'FIXED (target=0.999)' if SONAR_FIXED_OPACITY else 'LEARNABLE'}")
 
 # Scale factor module
 # Known scale factor from calibration cube in COLMAP (true value ~0.66)
@@ -1423,6 +1516,12 @@ if STAGE2_ITERATIONS > 0:
             if FOV_PRUNE_INTERVAL > 0 and iteration % FOV_PRUNE_INTERVAL == 0:
                 num_pruned = prune_outside_fov(gaussians, training_frames, sonar_config, sonar_scale_factor)
                 if num_pruned > 0:
+                    apply_opacity_policy(
+                        gaussians,
+                        fixed_opacity=SONAR_FIXED_OPACITY,
+                        fixed_target=FIXED_OPACITY_TARGET,
+                        learnable_opacity_lr=GAUSSIAN_OPACITY_LR,
+                    )
                     print(f"  [FOV prune] Removed {num_pruned} surfels outside FOV, {len(gaussians.get_xyz)} remaining")
 
         scale_value = sonar_scale_factor.get_scale_value()
@@ -1522,6 +1621,12 @@ if STAGE3_ITERATIONS > 0:
             if FOV_PRUNE_INTERVAL > 0 and iteration % FOV_PRUNE_INTERVAL == 0:
                 num_pruned = prune_outside_fov(gaussians, training_frames, sonar_config, sonar_scale_factor)
                 if num_pruned > 0:
+                    apply_opacity_policy(
+                        gaussians,
+                        fixed_opacity=SONAR_FIXED_OPACITY,
+                        fixed_target=FIXED_OPACITY_TARGET,
+                        learnable_opacity_lr=GAUSSIAN_OPACITY_LR,
+                    )
                     print(f"  [FOV prune] Removed {num_pruned} surfels outside FOV, {len(gaussians.get_xyz)} remaining")
 
         scale_value = sonar_scale_factor.get_scale_value()
@@ -1563,6 +1668,12 @@ if STAGE3_ITERATIONS > 0:
     # Force final prune
     num_pruned = prune_outside_fov(gaussians, training_frames, sonar_config, sonar_scale_factor)
     if num_pruned > 0:
+        apply_opacity_policy(
+            gaussians,
+            fixed_opacity=SONAR_FIXED_OPACITY,
+            fixed_target=FIXED_OPACITY_TARGET,
+            learnable_opacity_lr=GAUSSIAN_OPACITY_LR,
+        )
         print(f"  [Final prune] Removed {num_pruned} surfels, {len(gaussians.get_xyz)} remaining")
 
     # Save final surfel positions as point cloud (for verification)

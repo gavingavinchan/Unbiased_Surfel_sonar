@@ -81,6 +81,9 @@ OUTPUT_DIR_BASE = "./output/debug_sonar_init"
 TARGET_FRAME = "sonar_1765233595134"
 PYRAMID_DEPTH = 0.5
 USE_SONAR_INIT = True  # Use sonar backward projection for init (vs COLMAP)
+ELEV_INIT_MODE = os.environ.get("ELEV_INIT_MODE", "zero").strip().lower()
+if ELEV_INIT_MODE not in {"zero", "random"}:
+    raise ValueError(f"Invalid ELEV_INIT_MODE='{ELEV_INIT_MODE}'. Expected one of: random, zero")
 
 # Create unique output folder (increment version number)
 def get_next_output_dir(base_path):
@@ -100,6 +103,7 @@ print("DEBUG: Single Frame - SONAR-INITIALIZED Gaussians")
 print(f"Seed: {SEED}")
 print(f"Target frame: {TARGET_FRAME}")
 print(f"Init mode: {'SONAR backward projection' if USE_SONAR_INIT else 'COLMAP points'}")
+print(f"Elevation init mode: {ELEV_INIT_MODE}")
 print(f"Output: {OUTPUT_DIR}")
 print("=" * 60)
 
@@ -210,11 +214,14 @@ print("=" * 60)
 if USE_SONAR_INIT:
     # Generate points from SINGLE frame
     # Use low threshold since sonar images are often dim
-    points, colors = sonar_frame_to_points(
+    frame_result = sonar_frame_to_points(
         viewpoint, sonar_config,
         intensity_threshold=0.01,  # Lowered from 0.05
-        mask_top_rows=10
+        mask_top_rows=10,
+        elevation_mode=ELEV_INIT_MODE,
+        return_debug=False,
     )
+    points, colors = frame_result[0], frame_result[1]
     
     print(f"Generated {len(points)} points from sonar frame")
     
