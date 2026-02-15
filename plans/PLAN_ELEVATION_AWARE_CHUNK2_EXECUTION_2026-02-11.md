@@ -363,3 +363,407 @@ No additional contract text is needed here; 3b/3c are now the source for fixed-o
 - 4c resolved: `Test 2b` promoted into the main test catalog.
 - 4d resolved: visual tests are now explicitly manual-review-required acceptance evidence.
 - 4e resolved: deterministic random-init sampling rule documented in implementation method.
+
+---
+
+## Point 5: Chunk 2 Execution Log + Handoff (gpt-5.3-codex, 2026-02-11)
+
+### 5a. Implemented code changes (completed)
+
+- `utils/sonar_utils.py`
+  - `sonar_frame_to_points()` now supports `elevation_mode` (`random`/`zero`), deterministic `rng`, and `return_debug` diagnostics.
+  - Helper default migrated to `elevation_mode="random"`.
+  - Added fail-fast validation for invalid mode values.
+  - `sonar_frames_to_point_cloud()` now passes through elevation mode/rng.
+- `debug_multiframe.py`
+  - Added centralized env parsing and defaults:
+    - `ELEV_INIT_MODE` default `random` (validated)
+    - `SONAR_FIXED_OPACITY` default `1`
+    - `SONAR_LOAD_CHECKPOINT`, `SONAR_SAVE_CHECKPOINT`
+    - `SONAR_OPACITY_WARMUP_ITERS`
+    - `SONAR_STAGE3_ITERS`
+  - Stage 0 init now explicitly passes `ELEV_INIT_MODE`, uses deterministic RNG seeded from `SEED`, and logs required diagnostics (`N`, `Y mean/std/min/max`, elevation min/max).
+  - Added zero-mode contract guard (`std/mean` near zero for sonar-frame Y).
+  - Implemented fixed-opacity policy (`inverse_sigmoid(0.999)`, `requires_grad=False`, opacity group LR=0, group kept intact).
+  - Added policy re-application hooks after prune/rebind events.
+  - Added checkpoint save/load helpers and resume wiring (`gaussians.capture/restore`, scale module + optimizer states).
+  - Added learnable-opacity warm-start behavior:
+    - if `SONAR_FIXED_OPACITY=0`, opacity can remain fixed for first `SONAR_OPACITY_WARMUP_ITERS`, then auto-switch to learnable.
+  - Added auto attenuation default for learnable-opacity mode when user does not explicitly set `SONAR_RANGE_ATTEN_AUTO_GAIN`.
+  - Raw comparison export now disables auto-gain to keep raw output faithful and avoid inflated brightness artifacts.
+  - Moved `after_stage3` comparison exports to pre-final-prune state so image quality review is not biased by cleanup prune.
+  - Added warning when selected frame count exceeds total training iterations (`Stage2+Stage3 < NumFrames`).
+- `gaussian_renderer/__init__.py`
+  - Sonar render visibility switched to center-based validity (`projection.valid`) to avoid boundary over-suppression in rendered images.
+- `debug_before_after_mesh.py`
+  - Added explicit `ELEV_INIT_MODE` parse/pass-through and validation for intentional behavior under new helper default.
+
+### 5b. Automated validation status (executed)
+
+- Compile gate passed for touched files (`py_compile`).
+- Init contracts passed:
+  - random mode has non-zero spread,
+  - zero mode remains near-zero spread,
+  - helper default path uses random,
+  - deterministic under same seed / changes with different seed.
+- Fail-fast contracts passed:
+  - invalid `ELEV_INIT_MODE` exits non-zero with actionable message,
+  - invalid helper mode raises `ValueError`.
+- Fixed-opacity contracts passed via micro-tests and runtime:
+  - no drift under fixed mode,
+  - opacity group retained,
+  - learnable mode remains trainable when enabled.
+- Checkpoint/resume smoke passed for required config pairs:
+  - `random+fixed` save/load/continue,
+  - `zero+fixed` save/load/continue.
+
+### 5c. Manual visual review record (reviewer verdicts)
+
+Tag-to-artifact map used in review:
+
+- `1A`: `output/chunk2_smoke_random_fixed/sonar_init_points.ply`
+- `1B`: `output/chunk2_smoke_zero_fixed/sonar_init_points.ply`
+- `1C`: `output/chunk2_smoke_random_fixed/comparison_after_stage3_frame0.png`
+- `1D`: `output/chunk2_smoke_zero_fixed/comparison_after_stage3_frame0.png`
+- `1E`: `output/chunk2_smoke_random_learnable/comparison_after_stage3_frame0.png`
+- `3A`: `output/chunk2_smoke_random_fixed_v3/comparison_after_stage3_frame0.png`
+- `3B`: `output/chunk2_smoke_zero_fixed_v3/comparison_after_stage3_frame0.png`
+- `3C`: `output/chunk2_smoke_random_learnable_v3/comparison_after_stage3_raw_frame0.png`
+- `3D`: `output/chunk2_smoke_random_learnable_v3/comparison_after_stage3_frame0.png`
+- `6A`: `output/chunk2_multiframe_random_learnable_warmup2_auto_v2/comparison_after_stage3_raw_frame0.png`
+- `6B`: `output/chunk2_multiframe_random_learnable_warmup2_auto_v2/comparison_after_stage3_frame0.png`
+- `6C`: `output/chunk2_multiframe_random_fixed_regression/comparison_after_stage3_frame0.png`
+
+- `T11`: PASS
+  - `1A`/`1B` reviewer note: zero-mode is random-mode geometry projected to elevation zero (expected).
+- `T12` required views:
+  - initial run: FAIL/marginal due to bottom-row dropout and sparsity,
+  - after renderer/export fixes:
+    - `3A`: PASS (conditional; sparse spots only at very bottom row),
+    - `3B`: PASS (conditional; similar to `3A`).
+- Optional ablation view (`random + learnable`, raw):
+  - `3C`: FAIL,
+  - `3D`: improved.
+- Additional reviewer notes (later pass):
+  - `6A`: too bright,
+  - `6B`: acceptable (expected brightened),
+  - `6C`: matches original brightness baseline,
+  - non-frame0 views in both folders remain poor; reviewer did not yet review `.ply` manually.
+
+### 5d. Multi-frame evaluation correction (important)
+
+- Early visual checks used short/1-frame-like smoke settings and were not sufficient for multi-frame behavior claims.
+- Additional true multi-frame runs were executed (`SONAR_NUM_FRAMES=8`) with longer Stage2/Stage3 windows.
+- Observed behavior: frame 0 is often best; other frames remain weak in both fixed and learnable variants under current setup.
+
+### 5e. Clarified evaluation objective (agreed)
+
+- Distinguish two targets:
+  1. per-frame fidelity (single-frame match can be very good),
+  2. cross-view consistency (true multi-frame goal; often harder and may reduce single-frame fit quality).
+- End-goal requires overlap for 3D consistency, but good single-frame reprojection does not imply good multi-frame consistency.
+
+### 5f. Recommended target-2 (cross-view consistency) tracking for next session
+
+- Add holdout-view evaluation (train subset A, report loss/SSIM on unseen subset B).
+- Add surfel multi-view support metrics (`support>=2`, `support>=3`, median support).
+- Add per-frame final loss table + variance to detect frame dominance.
+- Add optional surfel dominance metric (single-frame ownership concentration).
+
+### 5g. Artifacts and run folders to hand off
+
+- Chunk 2 smoke / visual artifacts:
+  - `output/chunk2_smoke_random_fixed/`
+  - `output/chunk2_smoke_zero_fixed/`
+  - `output/chunk2_smoke_random_learnable/`
+  - `output/chunk2_smoke_random_fixed_v3/`
+  - `output/chunk2_smoke_zero_fixed_v3/`
+  - `output/chunk2_smoke_random_learnable_v3/`
+- Checkpoint/resume artifacts:
+  - `output/chunk2_resume/random_fixed_ckpt.pth`
+  - `output/chunk2_resume/zero_fixed_ckpt.pth`
+  - logs under `output/chunk2_resume/*/run.log`
+- Multi-frame follow-up runs:
+  - `output/chunk2_multiframe_random_learnable_warmup4_auto_v3/`
+  - `output/chunk2_multiframe_random_fixed_v3/`
+
+### 5h. Current gate-readiness summary
+
+- Chunk 2 core implementation and automated gates: substantially complete.
+- Manual visuals: required checks accepted with conditions; optional learnable ablation still problematic.
+- Remaining risk for next session: robust cross-view consistency quality across non-frame0 views.
+
+### 5h.1 Outstanding manual review items (not yet completed)
+
+- `.ply` manual quality verdict is still pending (reviewer explicitly noted it was not checked yet).
+- Pending `.ply` review targets (minimum):
+  - `output/chunk2_multiframe_random_learnable_warmup4_auto_v3/sonar_init_points.ply`
+  - `output/chunk2_multiframe_random_learnable_warmup4_auto_v3/mesh_poisson_after_stage3.ply`
+  - `output/chunk2_multiframe_random_fixed_v3/sonar_init_points.ply`
+  - `output/chunk2_multiframe_random_fixed_v3/mesh_poisson_after_stage3.ply`
+
+### 5i. Session state snapshot for takeover
+
+- Branch: `debug-multiframe-r2`
+- Last committed checkpoint in this session:
+  - `63deba1` `WIP chunk2 stage-0 elevation init and fixed-opacity policy (gpt-5.3-codex)`
+- Current uncommitted files at handoff:
+  - `debug_multiframe.py`
+  - `gaussian_renderer/__init__.py`
+  - `plans/PLAN_ELEVATION_AWARE_CHUNK2_EXECUTION_2026-02-11.md`
+- Repro commands used for later-stage multi-frame checks:
+  - learnable+warmup+auto (8 frames):
+    - `SONAR_OUTPUT_DIR=./output/chunk2_multiframe_random_learnable_warmup4_auto_v3 SONAR_NUM_FRAMES=8 SONAR_STAGE2_ITERS=24 SONAR_STAGE3_ITERS=8 ELEV_INIT_MODE=random SONAR_FIXED_OPACITY=0 SONAR_OPACITY_WARMUP_ITERS=4 python debug_multiframe.py`
+  - fixed baseline (8 frames):
+    - `SONAR_OUTPUT_DIR=./output/chunk2_multiframe_random_fixed_v3 SONAR_NUM_FRAMES=8 SONAR_STAGE2_ITERS=24 SONAR_STAGE3_ITERS=8 ELEV_INIT_MODE=random SONAR_FIXED_OPACITY=1 python debug_multiframe.py`
+- Known recurring runtime note:
+  - occasional `Exception ignored in sys.unraisablehook` at process teardown; non-blocking in completed runs, but worth cleanup if reproducibility tooling is tightened.
+
+---
+
+## Point 6: Continuation Worklog + Newly Raised Issues (gpt-5.3-codex, 2026-02-11)
+
+### 6a. Continuation implementation (in progress)
+
+- `debug_multiframe.py`
+  - Added cross-view tracking instrumentation from Point 5f recommendations:
+    - optional holdout split via `SONAR_HOLDOUT_FRAMES`,
+    - final per-frame evaluation CSVs (`final_eval_train_frames.csv`, `final_eval_holdout_frames.csv`),
+    - frame coverage/visit accounting (`frame_training_visits.csv`),
+    - surfel multi-view support diagnostics (`support_metrics_train.csv`, `support_metrics_train_plus_holdout.csv`).
+  - Added final run summary logging for:
+    - train vs holdout loss/SSIM gap,
+    - support fractions (`support>=2`, `support>=3`),
+    - simple dominance proxies (`single_view_top_share`, `nearest_owner_top_share`).
+  - Fixed checkpoint continuation accounting bug:
+    - final checkpoint save now stores `iteration=training_iter_offset + total_iters` instead of `total_iters` only.
+
+### 6b. Issues raised during continuation
+
+1. **Generalization risk remains likely unresolved**
+   - Existing notes already show non-frame0 weakness; new holdout diagnostics are now instrumented but not yet fully re-baselined across representative multi-frame runs.
+
+2. **Resume semantics are still coarse-grained**
+   - Checkpoint restore now preserves Gaussian + scale states and iteration offset, but does not restore stage-local scheduler context beyond the scalar offset.
+   - For strict stage-resume fidelity, explicit stage cursor/state restoration may still be needed in a future chunk.
+
+3. **`sys.unraisablehook` teardown warning remains open**
+   - Still seen intermittently at process shutdown; no root-cause fix has been implemented yet.
+
+### 6c. Holdout re-baseline runs executed (8 train + 2 holdout)
+
+Run A (fixed opacity baseline):
+
+- Command:
+  - `SONAR_OUTPUT_DIR=./output/chunk2_multiframe_random_fixed_holdout_v1 SONAR_DATASET=r2 SONAR_NUM_FRAMES=8 SONAR_HOLDOUT_FRAMES=2 SONAR_STAGE2_ITERS=24 SONAR_STAGE3_ITERS=8 ELEV_INIT_MODE=random SONAR_FIXED_OPACITY=1 python debug_multiframe.py`
+- Key results:
+  - train: `loss_mean=0.034048`, `ssim_mean=0.8679`
+  - holdout: `loss_mean=0.048536`, `ssim_mean=0.8603`
+  - gap: `loss_gap=+0.014487` (holdout-train), `ssim_gap=+0.0076` (train-holdout)
+  - support(train): `support>=2=0.4614`, `support>=3=0.0449`, `median=1.0`
+  - dominance proxy: `single_view_top_share=0.5588` (train), `0.7249` (train+holdout)
+
+Run B (learnable opacity + warmup):
+
+- Command:
+  - `SONAR_OUTPUT_DIR=./output/chunk2_multiframe_random_learnable_holdout_v1 SONAR_DATASET=r2 SONAR_NUM_FRAMES=8 SONAR_HOLDOUT_FRAMES=2 SONAR_STAGE2_ITERS=24 SONAR_STAGE3_ITERS=8 ELEV_INIT_MODE=random SONAR_FIXED_OPACITY=0 SONAR_OPACITY_WARMUP_ITERS=4 python debug_multiframe.py`
+- Key results:
+  - train: `loss_mean=0.045582`, `ssim_mean=0.8332`
+  - holdout: `loss_mean=0.059386`, `ssim_mean=0.8454`
+  - gap: `loss_gap=+0.013804` (holdout-train), `ssim_gap=-0.0122` (train-holdout)
+  - support(train): `support>=2=0.4625`, `support>=3=0.0444`, `median=1.0`
+  - dominance proxy: `single_view_top_share=0.5607` (train), `0.7257` (train+holdout)
+
+Artifacts:
+
+- `output/chunk2_multiframe_random_fixed_holdout_v1/`
+- `output/chunk2_multiframe_random_learnable_holdout_v1/`
+
+### 6d. Additional issues raised from holdout re-baseline
+
+1. **Cross-view support remains shallow**
+   - In both modes, only ~4.4-4.5% of surfels have `support>=3` and median support is 1, indicating weak multi-view reinforcement.
+
+2. **Frame ownership concentration remains high**
+   - `single_view_top_share` is ~0.56 on train frames and ~0.73 when including holdout frames, suggesting persistent frame dominance.
+
+3. **Learnable-opacity ablation underperforms fixed baseline at this budget**
+   - Higher train loss and lower train SSIM than fixed mode at identical iteration budget.
+
+4. **TSDF mesh extraction path still returns empty meshes (`V=0`) in this setup**
+   - Open3D warns during writes for `mesh_before_training.ply`, `mesh_after_stage2.ply`, and `mesh_after_stage3.ply`; Poisson meshes are still produced.
+   - Scope note: this is tracked as a non-blocking issue for Chunk 2 gate decisions because Chunk 2 acceptance is Stage-0/training-behavior focused.
+
+### 6e. Higher-budget holdout follow-up (next-step execution)
+
+Executed a higher-budget rerun to test whether the 8+2 holdout gaps/support improve with more optimization:
+
+- Budget:
+  - `SONAR_STAGE2_ITERS=96`, `SONAR_STAGE3_ITERS=32` (vs prior 24/8)
+
+Run C (fixed opacity, higher budget):
+
+- Command:
+  - `SONAR_OUTPUT_DIR=./output/chunk2_multiframe_random_fixed_holdout_hb1 SONAR_DATASET=r2 SONAR_NUM_FRAMES=8 SONAR_HOLDOUT_FRAMES=2 SONAR_STAGE2_ITERS=96 SONAR_STAGE3_ITERS=32 ELEV_INIT_MODE=random SONAR_FIXED_OPACITY=1 python debug_multiframe.py`
+- Key results:
+  - train: `loss_mean=0.032021`, `ssim_mean=0.8775`
+  - holdout: `loss_mean=0.048669`, `ssim_mean=0.8601`
+  - gap: `loss_gap=+0.016648` (`~1.52x` holdout/train), `ssim_gap=+0.0175`
+  - support(train): `support>=2=0.4615`, `support>=3=0.0446`, `median=1.0`
+
+Run D (learnable opacity + warmup, higher budget):
+
+- Command:
+  - `SONAR_OUTPUT_DIR=./output/chunk2_multiframe_random_learnable_holdout_hb1 SONAR_DATASET=r2 SONAR_NUM_FRAMES=8 SONAR_HOLDOUT_FRAMES=2 SONAR_STAGE2_ITERS=96 SONAR_STAGE3_ITERS=32 ELEV_INIT_MODE=random SONAR_FIXED_OPACITY=0 SONAR_OPACITY_WARMUP_ITERS=16 python debug_multiframe.py`
+- Key results:
+  - train: `loss_mean=0.039490`, `ssim_mean=0.8455`
+  - holdout: `loss_mean=0.060202`, `ssim_mean=0.8448`
+  - gap: `loss_gap=+0.020712` (`~1.52x` holdout/train), `ssim_gap=+0.0006`
+  - support(train): `support>=2=0.4630`, `support>=3=0.0439`, `median=1.0`
+
+Artifacts:
+
+- `output/chunk2_multiframe_random_fixed_holdout_hb1/`
+- `output/chunk2_multiframe_random_learnable_holdout_hb1/`
+
+### 6f. Issue update after higher-budget run
+
+- Increasing iteration budget improved in-set train metrics modestly, but **did not improve cross-view support depth** (`support>=3` still ~4.4%) and **did not reduce holdout ratio risk** (still ~1.5x).
+- Learnable-opacity mode remains weaker than fixed-opacity mode under both short and higher budgets.
+
+### 6g. Manual review tag map (surfel/training focused)
+
+For concise reviewer references (no mesh-gate dependency for Chunk 2):
+
+- `HBF-I`: `output/chunk2_multiframe_random_fixed_holdout_hb1/sonar_init_points.ply`
+- `HBF-S`: `output/chunk2_multiframe_random_fixed_holdout_hb1/surfels_after_training.ply`
+- `HBF-F2`: `output/chunk2_multiframe_random_fixed_holdout_hb1/comparison_after_stage3_frame2.png`
+- `HBF-F3`: `output/chunk2_multiframe_random_fixed_holdout_hb1/comparison_after_stage3_frame3.png`
+- `HBF-R2`: `output/chunk2_multiframe_random_fixed_holdout_hb1/comparison_after_stage3_raw_frame2.png`
+- `HBF-R3`: `output/chunk2_multiframe_random_fixed_holdout_hb1/comparison_after_stage3_raw_frame3.png`
+
+- `HBL-I`: `output/chunk2_multiframe_random_learnable_holdout_hb1/sonar_init_points.ply`
+- `HBL-S`: `output/chunk2_multiframe_random_learnable_holdout_hb1/surfels_after_training.ply`
+- `HBL-F2`: `output/chunk2_multiframe_random_learnable_holdout_hb1/comparison_after_stage3_frame2.png`
+- `HBL-F3`: `output/chunk2_multiframe_random_learnable_holdout_hb1/comparison_after_stage3_frame3.png`
+- `HBL-R2`: `output/chunk2_multiframe_random_learnable_holdout_hb1/comparison_after_stage3_raw_frame2.png`
+- `HBL-R3`: `output/chunk2_multiframe_random_learnable_holdout_hb1/comparison_after_stage3_raw_frame3.png`
+
+- `HBF-TCSV`: `output/chunk2_multiframe_random_fixed_holdout_hb1/final_eval_train_frames.csv`
+- `HBF-HCSV`: `output/chunk2_multiframe_random_fixed_holdout_hb1/final_eval_holdout_frames.csv`
+- `HBF-SUP`: `output/chunk2_multiframe_random_fixed_holdout_hb1/support_metrics_train.csv`
+- `HBF-VIS`: `output/chunk2_multiframe_random_fixed_holdout_hb1/frame_training_visits.csv`
+
+- `HBL-TCSV`: `output/chunk2_multiframe_random_learnable_holdout_hb1/final_eval_train_frames.csv`
+- `HBL-HCSV`: `output/chunk2_multiframe_random_learnable_holdout_hb1/final_eval_holdout_frames.csv`
+- `HBL-SUP`: `output/chunk2_multiframe_random_learnable_holdout_hb1/support_metrics_train.csv`
+- `HBL-VIS`: `output/chunk2_multiframe_random_learnable_holdout_hb1/frame_training_visits.csv`
+
+### 6h. Expanded review checklist tags (everything to check)
+
+Use this full tag set for reviewer notes.
+
+Geometry (required):
+
+- `HBF-I`: `output/chunk2_multiframe_random_fixed_holdout_hb1/sonar_init_points.ply`
+- `HBF-S`: `output/chunk2_multiframe_random_fixed_holdout_hb1/surfels_after_training.ply`
+- `HBL-I`: `output/chunk2_multiframe_random_learnable_holdout_hb1/sonar_init_points.ply`
+- `HBL-S`: `output/chunk2_multiframe_random_learnable_holdout_hb1/surfels_after_training.ply`
+
+Rendered comparisons (all training frames, stage3):
+
+- `HBF-F0`..`HBF-F7`: `output/chunk2_multiframe_random_fixed_holdout_hb1/comparison_after_stage3_frame{0..7}.png`
+- `HBL-F0`..`HBL-F7`: `output/chunk2_multiframe_random_learnable_holdout_hb1/comparison_after_stage3_frame{0..7}.png`
+
+Raw-vs-render comparisons (all training frames, stage3 raw):
+
+- `HBF-R0`..`HBF-R7`: `output/chunk2_multiframe_random_fixed_holdout_hb1/comparison_after_stage3_raw_frame{0..7}.png`
+- `HBL-R0`..`HBL-R7`: `output/chunk2_multiframe_random_learnable_holdout_hb1/comparison_after_stage3_raw_frame{0..7}.png`
+
+CSV diagnostics (required):
+
+- `HBF-TCSV`: `output/chunk2_multiframe_random_fixed_holdout_hb1/final_eval_train_frames.csv`
+- `HBF-HCSV`: `output/chunk2_multiframe_random_fixed_holdout_hb1/final_eval_holdout_frames.csv`
+- `HBF-SUP`: `output/chunk2_multiframe_random_fixed_holdout_hb1/support_metrics_train.csv`
+- `HBF-VIS`: `output/chunk2_multiframe_random_fixed_holdout_hb1/frame_training_visits.csv`
+
+- `HBL-TCSV`: `output/chunk2_multiframe_random_learnable_holdout_hb1/final_eval_train_frames.csv`
+- `HBL-HCSV`: `output/chunk2_multiframe_random_learnable_holdout_hb1/final_eval_holdout_frames.csv`
+- `HBL-SUP`: `output/chunk2_multiframe_random_learnable_holdout_hb1/support_metrics_train.csv`
+- `HBL-VIS`: `output/chunk2_multiframe_random_learnable_holdout_hb1/frame_training_visits.csv`
+
+Suggested reviewer verdict line format:
+
+- `HBF-I=PASS, HBF-S=PASS, HBF-F2=FAIL(<reason>), HBF-R2=PASS, HBF-TCSV=PASS, ...`
+
+### 6i. Human manual review notes (user review)
+
+Reviewer notes captured from tagged artifact review:
+
+- `HBF-I/HBF-S`: after-training surfel cloud appears tighter than init cloud; reviewer notes too few frames for confident 3D-structure judgment.
+- `HBF-F*` and `HBF-R*`: reviewer sees little to no visible change from prior behavior; frame-0 best-case may be due to weak overlap with other frames (hypothesis).
+- `HBL-*` vs `HBF-*`: reviewer sees very similar behavior overall.
+- `HBL-F2/HBL-F3`: frames containing the calibration cube (object of interest) still do not reproject cube quality well; persistent weakness remains.
+
+Interpretation for Chunk-2 follow-up (training-focused):
+
+- Manual review is consistent with metric findings (limited cross-view support depth and persistent frame-dominance signals).
+- Remaining priority is not Stage-0 init correctness (already stabilized), but cross-view training effectiveness on overlap-critical frames (notably frame2/frame3 in this run setup).
+
+### 6j. Quantitative cross-check against reviewer hypotheses
+
+- Frame-0 overlap hypothesis is strongly supported by support CSVs:
+  - fixed (`HBF-SUP`): frame0 `visible_surfel_count=479`, `single_view_owner_count=479`, `nearest_owner_count=479`.
+  - learnable (`HBL-SUP`): frame0 `visible_surfel_count=465`, `single_view_owner_count=465`, `nearest_owner_count=465`.
+  - Interpretation: in this run, frame0-visible surfels are effectively single-view-owned by frame0.
+
+- Frames 2 and 3 remain the worst-loss frames in both modes (`HBF-TCSV`, `HBL-TCSV`):
+  - fixed: frame2 `total_loss=0.079433`, frame3 `0.072710`.
+  - learnable: frame2 `total_loss=0.082253`, frame3 `0.071277`.
+  - Interpretation: reviewer-observed cube reprojection weakness in frame2/frame3 matches scalar diagnostics.
+
+### 6k. Strategic decision: stop optimizing overlap quality inside Chunk 2
+
+Decision (agreed):
+
+- Do not spend more effort trying to "perfect" overlap/cross-view quality within Chunk 2.
+- Treat Chunk 2 as Stage-0 stabilization work (init + opacity behavior), then move to later chunks for overlap-quality fixes.
+
+Rationale from source plans:
+
+- Execution plan defines Chunk 2 scope narrowly as Stage-0 behavior (`random/zero` init + fixed opacity), while overlap table/sampler belongs to Chunk 3 and coupling/support belongs to Chunk 4.
+- Detailed plan defines Stage 0 as `init_only` and puts multi-view overlap likelihood in Stage 1.
+- High-level plan states the multi-view support/diversity retention policy and mandatory belief-to-geometry coupling as the mechanisms intended to solve weak overlap/frame-dominance behavior.
+
+Practical implication:
+
+- Chunk 2 acceptance should remain based on its own gate contracts.
+- Cross-view failure modes observed here (frame dominance, weak frame2/3 cube reprojection, low `support>=3`) are tracked as expected unresolved items to be addressed primarily in Chunk 3/4 implementation.
+
+Chunk 2 baseline numbers for Chunk 3/4 to beat (from 6c/6e higher-budget runs):
+
+| Metric | Fixed (Run C, primary baseline) | Learnable (Run D, secondary ablation) |
+|--------|----------------------------------|----------------------------------------|
+| `support>=2` | 0.4615 | 0.4630 |
+| `support>=3` | 0.0446 | 0.0439 |
+| `median_support` | 1.0 | 1.0 |
+| `single_view_top_share` (train) | 0.5606 | 0.5643 |
+| `single_view_top_share` (train+holdout) | 0.7249 | 0.7252 |
+| `holdout_loss / train_loss` | 1.52x | 1.52x |
+| `train_loss_mean` | 0.032021 | 0.039490 |
+| `holdout_loss_mean` | 0.048669 | 0.060202 |
+| `train_ssim_mean` | 0.8775 | 0.8455 |
+| `holdout_ssim_mean` | 0.8601 | 0.8448 |
+
+Chunk-specific expectations (to avoid overloading Chunk 3):
+
+- Chunk 3 target emphasis (overlap/sampler/likelihood): reduce frame dominance (`single_view_top_share`), improve holdout generalization trend, and keep losses finite/stable under overlap-aware sampling.
+- Chunk 4 target emphasis (coupling/support): increase multi-view retention depth (`support>=3`), raise `median_support` above 1.0, and improve overlap-critical frame quality (notably frame2/frame3 in this setup).
+
+Evaluation policy notes:
+
+- Use fixed-opacity (Run C) as the primary comparator because Chunk 2 default behavior is fixed opacity.
+- Keep learnable-opacity (Run D) as a secondary ablation; improvements there are informative but not the primary gate signal.
+- Holdout has only 2 frames in this protocol; treat holdout ratio as directional evidence and always pair it with per-frame holdout CSV rows and tagged visual checks.
+
+These are the cross-view quality baselines for Chunk 3/4 progression. (opus4.6 review, refined by gpt-5.3-codex, 2026-02-11)

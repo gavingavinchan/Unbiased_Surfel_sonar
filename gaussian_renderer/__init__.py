@@ -419,18 +419,9 @@ def render_sonar(
     range_vals = projection.range_vals
     horiz_dist = torch.sqrt(right**2 + forward**2)
     elevation = torch.atan2(down, horiz_dist.clamp_min(1e-8))
-    center_in_fov = projection.in_fov & projection.in_front
-
-    # Size-aware FOV check: surfel must be FULLY inside FOV (center + size extent)
-    # Get surfel radius (max of scaling dimensions)
-    scaling = pc.get_scaling  # [N, 2]
-    surfel_radius = scaling.max(dim=1).values  # [N]
-
-    # Compute margin to nearest FOV boundary
-    margin = compute_fov_margin(range_vals, azimuth, elevation, sonar_config)
-
-    # Surfel is fully inside if center in FOV AND margin > surfel radius
-    in_fov = center_in_fov & (margin > surfel_radius)
+    # Rendering uses center-based visibility. Size-aware full-extent FOV constraints
+    # are handled by debug-side pruning to avoid suppressing boundary bins in images.
+    in_fov = projection.valid
     
     # Convert polar to pixel coordinates for valid surfels
     # Column: maps azimuth to [0, width] with flipped direction

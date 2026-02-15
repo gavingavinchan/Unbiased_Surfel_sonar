@@ -338,3 +338,16 @@ flowchart TB
 - Added `SONAR_NUM_FRAMES` env override in `debug_multiframe.py` to control training frame count.
 - Fixed Poisson filtering alignment bug when applying opacity + scale filters sequentially.
 - Recorded mesh extraction notes and sonar-native TSDF plan in snapshots for future implementation.
+
+## Recent Updates (2026-02-11 to 2026-02-15)
+- Chunk 2 implementation was extended with deterministic Stage-0 controls and observability in `debug_multiframe.py`:
+  - optional holdout split (`SONAR_HOLDOUT_FRAMES`),
+  - per-frame final evaluation CSVs (`final_eval_train_frames.csv`, `final_eval_holdout_frames.csv`),
+  - frame-visit coverage (`frame_training_visits.csv`),
+  - multi-view support diagnostics (`support_metrics_train*.csv`).
+- Two 8-train + 2-holdout baselines were recorded for Chunk-3/4 comparison:
+  - fixed opacity (primary): holdout/train loss ratio `1.52x`, `support>=3 = 0.0446`, `median_support = 1.0`,
+  - learnable opacity (secondary ablation): holdout/train loss ratio `1.52x`, `support>=3 = 0.0439`, `median_support = 1.0`.
+- Manual tagged review confirmed weak overlap-critical behavior persists (notably frame2/frame3), while frame0 tends to dominate due to weak overlap.
+- Strategic pivot formalized in the Chunk 2 plan: stop trying to optimize overlap quality inside Chunk 2; carry overlap/coupling fixes into Chunk 3 (overlap/sampler/likelihood) and Chunk 4 (coupling/support pruning).
+- Non-blocking but tracked issues: intermittent `sys.unraisablehook` teardown warning and TSDF path frequently writing empty meshes in these sonar runs.

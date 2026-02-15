@@ -291,3 +291,50 @@ Here $\mathcal{M}_{\mathrm{out}}$ are mesh elements with $|\theta| > 60^\circ$ o
 - Bright-pixel loss (percentile 95, weight 0.5, min pixels 32).
 - Multi-frame debug tooling and mesh tuning workflows.
 - Poisson mesh tuning with depth 9 and filtering quantiles (0.02, 0.2, 0.9).
+
+## 13. Chunk 2 Cross-View Baseline (for Chunk 3/4 Targets)
+
+To avoid overfitting decisions to qualitative inspection, we recorded a fixed-seed 8-train + 2-holdout baseline protocol and treat its metrics as the floor that Chunk 3/4 must beat.
+
+### 13.1 Baseline runs (higher-budget protocol)
+
+- Fixed opacity (primary comparator):
+  - train loss mean: $0.032021$
+  - holdout loss mean: $0.048669$
+  - train SSIM mean: $0.8775$
+  - holdout SSIM mean: $0.8601$
+  - support fractions: $\mathrm{support}\ge2 = 0.4615$, $\mathrm{support}\ge3 = 0.0446$
+  - median support: $1.0$
+  - single-view dominance (train): $0.5606$
+- Learnable opacity (secondary ablation):
+  - train loss mean: $0.039490$
+  - holdout loss mean: $0.060202$
+  - train SSIM mean: $0.8455$
+  - holdout SSIM mean: $0.8448$
+  - support fractions: $\mathrm{support}\ge2 = 0.4630$, $\mathrm{support}\ge3 = 0.0439$
+  - median support: $1.0$
+  - single-view dominance (train): $0.5643$
+
+### 13.2 Derived indicators
+
+Generalization ratio:
+$$
+R_{\mathrm{gen}} = \frac{\mathcal{L}_{\mathrm{holdout}}}{\mathcal{L}_{\mathrm{train}}}
+$$
+
+For both higher-budget baselines, $R_{\mathrm{gen}} \approx 1.52$, indicating persistent holdout degradation.
+
+Support depth indicators:
+$$
+S_{\ge k} = \frac{1}{N}\sum_{i=1}^{N}\mathbb{1}[\mathrm{support}_i \ge k]
+$$
+
+With $k=3$, $S_{\ge3}\approx 0.044$, showing shallow multi-view reinforcement.
+
+### 13.3 Strategic implication
+
+- Stage-0 work (Chunk 2) is considered functionally stabilized.
+- Remaining overlap-quality issues are expected to be addressed mainly by:
+  - Chunk 3: overlap-aware frame sampling + bin-likelihood evidence,
+  - Chunk 4: belief-to-geometry coupling and ID-keyed support retention/pruning.
+- Therefore, Chunk 2 metrics above are treated as baseline comparators, not final quality targets.

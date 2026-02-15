@@ -26,6 +26,7 @@ Outputs:
 import os
 import sys
 import atexit
+import csv
 import torch
 import random
 import numpy as np
@@ -408,6 +409,59 @@ def apply_opacity_policy(gaussians, fixed_opacity, fixed_target=FIXED_OPACITY_TA
         opacity_group["lr"] = learnable_opacity_lr
 
 
+def save_training_checkpoint(checkpoint_path, gaussians, sonar_scale_factor, scale_optimizer,
+                             iteration, stage_name, metadata=None):
+    checkpoint_dir = os.path.dirname(checkpoint_path)
+    if checkpoint_dir:
+        os.makedirs(checkpoint_dir, exist_ok=True)
+
+    payload = {
+        "gaussians_capture": gaussians.capture(),
+        "iteration": int(iteration),
+        "stage_name": str(stage_name),
+        "sonar_scale_state_dict": sonar_scale_factor.state_dict(),
+        "scale_optimizer_state_dict": scale_optimizer.state_dict(),
+        "metadata": metadata or {},
+    }
+    torch.save(payload, checkpoint_path)
+    print(f"[Checkpoint] Saved: {checkpoint_path} (iter={iteration}, stage={stage_name})")
+
+
+def load_training_checkpoint(checkpoint_path, gaussians, gaussian_training_args,
+                             sonar_scale_factor, scale_optimizer):
+    try:
+        payload = torch.load(checkpoint_path, map_location="cuda", weights_only=False)
+    except TypeError:
+        payload = torch.load(checkpoint_path, map_location="cuda")
+
+    if isinstance(payload, tuple) and len(payload) == 2:
+        # Compatibility with legacy tuple checkpoints: (gaussians.capture(), iteration)
+        model_args, iteration = payload
+        gaussians.restore(model_args, gaussian_training_args)
+        return int(iteration), {"format": "legacy_tuple"}
+
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"Unsupported checkpoint format in {checkpoint_path}")
+
+    model_args = payload.get("gaussians_capture")
+    if model_args is None:
+        raise RuntimeError(f"Missing 'gaussians_capture' in checkpoint: {checkpoint_path}")
+
+    gaussians.restore(model_args, gaussian_training_args)
+
+    scale_state = payload.get("sonar_scale_state_dict")
+    if scale_state is not None:
+        sonar_scale_factor.load_state_dict(scale_state)
+
+    scale_optim_state = payload.get("scale_optimizer_state_dict")
+    if scale_optim_state is not None:
+        scale_optimizer.load_state_dict(scale_optim_state)
+
+    iteration = int(payload.get("iteration", 0))
+    metadata = payload.get("metadata", {})
+    return iteration, metadata
+
+
 class Tee:
     def __init__(self, *streams):
         self.streams = streams
@@ -642,6 +696,11 @@ def save_raw_comparison_images(training_frames, gaussians, background, sonar_con
                                scale_factor, output_dir, stage_name, dataset_path, sonar_dir):
     """Save raw sonar vs rendered comparison images (no brighten, no masking)."""
     print(f"\n  Saving raw-frame comparisons for {stage_name}...")
+    raw_render_kwargs = dict(SONAR_RENDER_KWARGS)
+    if raw_render_kwargs.get("range_atten_auto_gain", False):
+        # Keep raw comparison faithful; avoid per-frame auto-gain amplification.
+        raw_render_kwargs["range_atten_auto_gain"] = False
+        raw_render_kwargs["range_atten_gain"] = SONAR_RANGE_ATTEN_GAIN
     for i, cam in enumerate(training_frames):
         raw_path = resolve_raw_sonar_path(cam, dataset_path, sonar_dir)
         if raw_path is None:
@@ -657,7 +716,7 @@ def save_raw_comparison_images(training_frames, gaussians, background, sonar_con
                 sonar_config=sonar_config,
                 scale_factor=scale_factor,
                 sonar_extrinsic=None,
-                **SONAR_RENDER_KWARGS,
+                **raw_render_kwargs,
             )
             rendered = render_pkg["render"]
 
@@ -670,6 +729,240 @@ def save_raw_comparison_images(training_frames, gaussians, background, sonar_con
         Image.fromarray(comparison_raw, mode="L").save(os.path.join(output_dir, filename))
 
     print(f"  Saved raw-frame comparisons for {stage_name}")
+
+
+def write_csv_rows(csv_path, fieldnames, rows):
+    with open(csv_path, "w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def evaluate_frame_set(frame_set_name, frames, gaussians, background, sonar_config,
+                       scale_factor, output_dir):
+    if not frames:
+        return None
+
+    rows = []
+    with torch.no_grad():
+        for i, cam in enumerate(frames):
+            gt_image = preprocess_gt_image(cam.original_image)
+            render_pkg = render_sonar(
+                cam, gaussians, background,
+                sonar_config=sonar_config,
+                scale_factor=scale_factor,
+                sonar_extrinsic=None,
+                **SONAR_RENDER_KWARGS,
+            )
+            rendered = render_pkg["render"]
+
+            l1_val = l1_loss(rendered, gt_image)
+            ssim_val = ssim(rendered, gt_image)
+            base_loss = 0.8 * l1_val + 0.2 * (1 - ssim_val)
+            bright_loss = compute_bright_loss(rendered, gt_image)
+            total_loss = (1 - BRIGHT_WEIGHT) * base_loss + BRIGHT_WEIGHT * bright_loss
+
+            rows.append({
+                "frame_idx": i,
+                "image_name": cam.image_name,
+                "l1": float(l1_val.item()),
+                "ssim": float(ssim_val.item()),
+                "base_loss": float(base_loss.item()),
+                "bright_loss": float(bright_loss.item()),
+                "total_loss": float(total_loss.item()),
+            })
+
+    csv_path = os.path.join(output_dir, f"final_eval_{frame_set_name}_frames.csv")
+    fieldnames = ["frame_idx", "image_name", "l1", "ssim", "base_loss", "bright_loss", "total_loss"]
+    write_csv_rows(csv_path, fieldnames, rows)
+
+    loss_vals = np.array([row["total_loss"] for row in rows], dtype=np.float64)
+    ssim_vals = np.array([row["ssim"] for row in rows], dtype=np.float64)
+    print(
+        f"[Final Eval:{frame_set_name}] frames={len(rows)} "
+        f"loss_mean={loss_vals.mean():.6f}, loss_std={loss_vals.std():.6f}, "
+        f"loss_min={loss_vals.min():.6f}, loss_max={loss_vals.max():.6f}, "
+        f"ssim_mean={ssim_vals.mean():.4f}, ssim_std={ssim_vals.std():.4f}"
+    )
+
+    worst_rows = sorted(rows, key=lambda row: row["total_loss"], reverse=True)[: min(5, len(rows))]
+    print(f"  [Final Eval:{frame_set_name}] Worst frames by total loss:")
+    for row in worst_rows:
+        print(
+            f"    frame={row['frame_idx']:3d} ({row['image_name']}): "
+            f"loss={row['total_loss']:.6f}, ssim={row['ssim']:.4f}"
+        )
+    print(f"  [Final Eval:{frame_set_name}] Saved CSV: {csv_path}")
+
+    return {
+        "rows": rows,
+        "csv_path": csv_path,
+        "loss_mean": float(loss_vals.mean()),
+        "loss_std": float(loss_vals.std()),
+        "ssim_mean": float(ssim_vals.mean()),
+        "ssim_std": float(ssim_vals.std()),
+    }
+
+
+def summarize_training_frame_visits(training_frames, frame_visit_counts, frame_loss_sums,
+                                    frame_loss_counts, output_dir):
+    if len(training_frames) == 0:
+        return
+
+    rows = []
+    for i, cam in enumerate(training_frames):
+        visit_count = int(frame_visit_counts[i])
+        loss_count = int(frame_loss_counts[i])
+        avg_loss = float(frame_loss_sums[i] / loss_count) if loss_count > 0 else float("nan")
+        rows.append({
+            "frame_idx": i,
+            "image_name": cam.image_name,
+            "visit_count": visit_count,
+            "avg_training_loss": avg_loss,
+        })
+
+    csv_path = os.path.join(output_dir, "frame_training_visits.csv")
+    write_csv_rows(csv_path, ["frame_idx", "image_name", "visit_count", "avg_training_loss"], rows)
+
+    total_visits = int(frame_visit_counts.sum())
+    max_visits = int(frame_visit_counts.max()) if total_visits > 0 else 0
+    min_visits = int(frame_visit_counts.min()) if total_visits > 0 else 0
+    zero_visit = int((frame_visit_counts == 0).sum())
+    concentration = (max_visits / total_visits) if total_visits > 0 else 0.0
+    print(
+        f"[Frame Coverage] total_visits={total_visits}, min={min_visits}, max={max_visits}, "
+        f"zero_visit_frames={zero_visit}, max_share={concentration:.4f}"
+    )
+    if zero_visit > 0:
+        print(
+            f"[Issue] {zero_visit} training frames received zero optimization visits; "
+            "cross-view consistency estimates may be biased."
+        )
+    print(f"  [Frame Coverage] Saved CSV: {csv_path}")
+
+
+def compute_multiview_support_metrics(gaussians, frames, sonar_config, scale_factor):
+    if not frames:
+        return None
+
+    xyz = gaussians.get_xyz
+    num_surfels = int(xyz.shape[0])
+    if num_surfels == 0:
+        return {
+            "num_surfels": 0,
+            "num_frames": len(frames),
+            "support_ge_1_frac": 0.0,
+            "support_ge_2_frac": 0.0,
+            "support_ge_3_frac": 0.0,
+            "support_mean": 0.0,
+            "support_median": 0.0,
+            "single_view_count": 0,
+            "single_view_top_share": 0.0,
+            "nearest_owner_top_share": 0.0,
+            "visible_counts_per_frame": [0 for _ in frames],
+            "single_view_owner_counts": [0 for _ in frames],
+            "nearest_owner_counts": [0 for _ in frames],
+        }
+
+    with torch.no_grad():
+        visibility_masks = []
+        visible_ranges = []
+        for cam in frames:
+            details = is_in_sonar_fov(xyz, cam, sonar_config, scale_factor, return_details=True)
+            in_fov = details["in_fov"]
+            visibility_masks.append(in_fov)
+            visible_ranges.append(
+                torch.where(in_fov, details["range_vals"], torch.full_like(details["range_vals"], float("inf")))
+            )
+
+        visibility = torch.stack(visibility_masks, dim=0)
+        support_counts = visibility.sum(dim=0)
+        visible_counts_per_frame = visibility.sum(dim=1)
+
+        support_ge_1 = (support_counts >= 1).float().mean().item()
+        support_ge_2 = (support_counts >= 2).float().mean().item()
+        support_ge_3 = (support_counts >= 3).float().mean().item()
+        support_mean = support_counts.float().mean().item()
+        support_median = support_counts.float().median().item()
+
+        single_view_mask = support_counts == 1
+        single_view_count = int(single_view_mask.sum().item())
+        if single_view_count > 0:
+            single_owners = visibility[:, single_view_mask].float().argmax(dim=0)
+            single_view_owner_counts = torch.bincount(single_owners, minlength=len(frames)).cpu().numpy()
+            single_view_top_share = float(single_view_owner_counts.max() / single_view_owner_counts.sum())
+        else:
+            single_view_owner_counts = np.zeros(len(frames), dtype=np.int64)
+            single_view_top_share = 0.0
+
+        range_stack = torch.stack(visible_ranges, dim=0)
+        any_visible = visibility.any(dim=0)
+        nearest_owner = range_stack.argmin(dim=0)
+        nearest_visible = nearest_owner[any_visible]
+        if nearest_visible.numel() > 0:
+            nearest_owner_counts = torch.bincount(nearest_visible, minlength=len(frames)).cpu().numpy()
+            nearest_owner_top_share = float(nearest_owner_counts.max() / nearest_owner_counts.sum())
+        else:
+            nearest_owner_counts = np.zeros(len(frames), dtype=np.int64)
+            nearest_owner_top_share = 0.0
+
+    return {
+        "num_surfels": num_surfels,
+        "num_frames": len(frames),
+        "support_ge_1_frac": float(support_ge_1),
+        "support_ge_2_frac": float(support_ge_2),
+        "support_ge_3_frac": float(support_ge_3),
+        "support_mean": float(support_mean),
+        "support_median": float(support_median),
+        "single_view_count": single_view_count,
+        "single_view_top_share": single_view_top_share,
+        "nearest_owner_top_share": nearest_owner_top_share,
+        "visible_counts_per_frame": visible_counts_per_frame.cpu().numpy().tolist(),
+        "single_view_owner_counts": single_view_owner_counts.tolist(),
+        "nearest_owner_counts": nearest_owner_counts.tolist(),
+    }
+
+
+def report_support_metrics(label, metrics, frames, output_dir):
+    if metrics is None:
+        print(f"[Support:{label}] skipped (no frames)")
+        return
+
+    print(
+        f"[Support:{label}] surfels={metrics['num_surfels']}, frames={metrics['num_frames']}, "
+        f"support>=1={metrics['support_ge_1_frac']:.4f}, "
+        f"support>=2={metrics['support_ge_2_frac']:.4f}, "
+        f"support>=3={metrics['support_ge_3_frac']:.4f}, "
+        f"mean={metrics['support_mean']:.3f}, median={metrics['support_median']:.3f}"
+    )
+    print(
+        f"  [Support:{label}] single_view_count={metrics['single_view_count']}, "
+        f"single_view_top_share={metrics['single_view_top_share']:.4f}, "
+        f"nearest_owner_top_share={metrics['nearest_owner_top_share']:.4f}"
+    )
+
+    rows = []
+    for i, cam in enumerate(frames):
+        rows.append({
+            "frame_idx": i,
+            "image_name": cam.image_name,
+            "visible_surfel_count": int(metrics["visible_counts_per_frame"][i]),
+            "single_view_owner_count": int(metrics["single_view_owner_counts"][i]),
+            "nearest_owner_count": int(metrics["nearest_owner_counts"][i]),
+        })
+    csv_path = os.path.join(output_dir, f"support_metrics_{label}.csv")
+    write_csv_rows(
+        csv_path,
+        [
+            "frame_idx",
+            "image_name",
+            "visible_surfel_count",
+            "single_view_owner_count",
+            "nearest_owner_count",
+        ],
+        rows,
+    )
+    print(f"  [Support:{label}] Saved CSV: {csv_path}")
 
 
 metric_step = 0
@@ -819,7 +1112,9 @@ POISSON_OPACITY_PERCENTILE = env_float("POISSON_OPACITY_PERCENTILE", POISSON_OPA
 POISSON_SCALE_PERCENTILE = env_float("POISSON_SCALE_PERCENTILE", POISSON_SCALE_PERCENTILE)
 
 STAGE2_ITERATIONS = env_int("SONAR_STAGE2_ITERS", STAGE2_ITERATIONS)
+STAGE3_ITERATIONS = env_int("SONAR_STAGE3_ITERS", STAGE3_ITERATIONS)
 NUM_TRAINING_FRAMES = env_int("SONAR_NUM_FRAMES", NUM_TRAINING_FRAMES_DEFAULT)
+SONAR_HOLDOUT_FRAMES = max(0, env_int("SONAR_HOLDOUT_FRAMES", 0))
 
 SONAR_CONVENTION_ASSERTS = env_bool("SONAR_CONVENTION_ASSERTS", True)
 SONAR_USE_RANGE_ATTEN = env_bool("SONAR_USE_RANGE_ATTEN", True)
@@ -827,9 +1122,21 @@ SONAR_RANGE_ATTEN_EXP = env_float("SONAR_RANGE_ATTEN_EXP", 2.0)
 SONAR_RANGE_ATTEN_GAIN = env_float("SONAR_RANGE_ATTEN_GAIN", 1.0)
 SONAR_RANGE_ATTEN_R0 = env_float("SONAR_RANGE_ATTEN_R0", 0.35)
 SONAR_RANGE_ATTEN_EPS = env_float("SONAR_RANGE_ATTEN_EPS", 1e-6)
+SONAR_RANGE_ATTEN_AUTO_GAIN_ENV = os.environ.get("SONAR_RANGE_ATTEN_AUTO_GAIN")
 SONAR_RANGE_ATTEN_AUTO_GAIN = env_bool("SONAR_RANGE_ATTEN_AUTO_GAIN", False)
 ELEV_INIT_MODE = env_choice("ELEV_INIT_MODE", "random", {"random", "zero"})
 SONAR_FIXED_OPACITY = env_bool("SONAR_FIXED_OPACITY", True)
+SONAR_OPACITY_WARMUP_ITERS = max(0, env_int("SONAR_OPACITY_WARMUP_ITERS", 200))
+SONAR_LOAD_CHECKPOINT = os.environ.get("SONAR_LOAD_CHECKPOINT", "").strip()
+SONAR_SAVE_CHECKPOINT = os.environ.get("SONAR_SAVE_CHECKPOINT", "").strip()
+
+# In learnable-opacity mode, default to auto attenuation gain unless explicitly overridden.
+if (
+    (not SONAR_FIXED_OPACITY)
+    and SONAR_USE_RANGE_ATTEN
+    and SONAR_RANGE_ATTEN_AUTO_GAIN_ENV in (None, "")
+):
+    SONAR_RANGE_ATTEN_AUTO_GAIN = True
 
 if not SONAR_USE_RANGE_ATTEN:
     SONAR_ATTENUATION_MODE = "off"
@@ -876,14 +1183,27 @@ print(f"Seed: {SEED}")
 print(f"Dataset: {DATASET_KEY} ({DATASET_PATH})")
 print(f"Init scale: {INIT_SCALE_FACTOR}")
 print(f"Num training frames: {NUM_TRAINING_FRAMES}")
+print(f"Holdout frames: {SONAR_HOLDOUT_FRAMES}")
 print(f"Curriculum: Stage1={STAGE1_ITERATIONS} (scale), Stage2={STAGE2_ITERATIONS} (surfels), Stage3={STAGE3_ITERATIONS} (joint)")
+if NUM_TRAINING_FRAMES > 1 and (STAGE2_ITERATIONS + STAGE3_ITERATIONS) < NUM_TRAINING_FRAMES:
+    print(
+        "[Warning] Stage2+Stage3 iterations are fewer than selected training frames; "
+        "many frames may receive zero gradient updates in this run."
+    )
 print(f"FOV pruning interval: {FOV_PRUNE_INTERVAL} iterations")
 print(f"Convention asserts: {SONAR_CONVENTION_ASSERTS}")
 print(f"Camera/view convention: {SONAR_CAMERA_FRAME_CONVENTION}")
 print(f"Sonar image convention: {SONAR_IMAGE_CONVENTION}")
 print(f"Mount extrinsic (camera frame): translation={SONAR_MOUNT_TRANSLATION_CAM}, pitch_deg={SONAR_MOUNT_PITCH_DEG}")
 print(f"[Stage 0] ELEV_INIT_MODE={ELEV_INIT_MODE}, SONAR_FIXED_OPACITY={int(SONAR_FIXED_OPACITY)}")
-print(f"[Stage 0] Opacity mode: {'FIXED (target=0.999)' if SONAR_FIXED_OPACITY else 'LEARNABLE'}")
+if SONAR_FIXED_OPACITY:
+    print("[Stage 0] Opacity mode: FIXED (target=0.999)")
+else:
+    print(f"[Stage 0] Opacity mode: LEARNABLE (warmup fixed for first {SONAR_OPACITY_WARMUP_ITERS} iters)")
+if SONAR_LOAD_CHECKPOINT:
+    print(f"[Checkpoint] Resume from: {SONAR_LOAD_CHECKPOINT}")
+if SONAR_SAVE_CHECKPOINT:
+    print(f"[Checkpoint] Save at end: {SONAR_SAVE_CHECKPOINT}")
 if SONAR_ATTENUATION_MODE == "off":
     print("Range attenuation: OFF (all attenuation parameters ignored)")
 elif SONAR_ATTENUATION_MODE == "auto":
@@ -956,9 +1276,36 @@ print(f"Total cameras available: {len(train_cameras)}")
 frame_indices = select_diverse_frames(train_cameras, NUM_TRAINING_FRAMES, seed=SEED)
 training_frames = [train_cameras[i] for i in frame_indices]
 
+holdout_frames = []
+if SONAR_HOLDOUT_FRAMES > 0:
+    selected_index_set = set(frame_indices)
+    remaining_indices = [idx for idx in range(len(train_cameras)) if idx not in selected_index_set]
+    if len(remaining_indices) == 0:
+        print("[Holdout] Requested holdout frames but no remaining cameras are available")
+    else:
+        if SONAR_HOLDOUT_FRAMES > len(remaining_indices):
+            print(
+                f"[Holdout] Requested {SONAR_HOLDOUT_FRAMES} frames but only "
+                f"{len(remaining_indices)} are available; clipping"
+            )
+        holdout_count = min(SONAR_HOLDOUT_FRAMES, len(remaining_indices))
+        holdout_pool = [train_cameras[idx] for idx in remaining_indices]
+        holdout_rel_indices = select_diverse_frames(holdout_pool, holdout_count, seed=SEED + 1000)
+        holdout_indices = [remaining_indices[idx] for idx in holdout_rel_indices]
+        holdout_frames = [train_cameras[idx] for idx in holdout_indices]
+
 print(f"Selected {len(training_frames)} training frames:")
 for i, cam in enumerate(training_frames):
     print(f"  [{i}] {cam.image_name}")
+
+if holdout_frames:
+    print(f"Selected {len(holdout_frames)} holdout frames:")
+    for i, cam in enumerate(holdout_frames):
+        print(f"  [H{i}] {cam.image_name}")
+
+frame_visit_counts = np.zeros(len(training_frames), dtype=np.int64)
+frame_loss_sums = np.zeros(len(training_frames), dtype=np.float64)
+frame_loss_counts = np.zeros(len(training_frames), dtype=np.int64)
 
 # Update sonar config with actual image size
 sample_cam = training_frames[0]
@@ -1245,7 +1592,7 @@ print("TRAINING SETUP")
 print("=" * 60)
 
 # Setup Gaussian optimizer
-gaussians.training_setup(Namespace(
+gaussian_training_args = Namespace(
     position_lr_init=0.00016,
     position_lr_final=0.0000016,
     position_lr_delay_mult=0.01,
@@ -1261,14 +1608,8 @@ gaussians.training_setup(Namespace(
     densify_from_iter=500,
     densify_until_iter=15000,
     densify_grad_threshold=0.0002,
-))
-apply_opacity_policy(
-    gaussians,
-    fixed_opacity=SONAR_FIXED_OPACITY,
-    fixed_target=FIXED_OPACITY_TARGET,
-    learnable_opacity_lr=GAUSSIAN_OPACITY_LR,
 )
-print(f"[Stage 0] Opacity mode: {'FIXED (target=0.999)' if SONAR_FIXED_OPACITY else 'LEARNABLE'}")
+gaussians.training_setup(gaussian_training_args)
 
 # Scale factor module
 # Known scale factor from calibration cube in COLMAP (true value ~0.66)
@@ -1279,6 +1620,59 @@ sonar_scale_factor = SonarScaleFactor(init_value=INIT_SCALE_FACTOR).cuda()
 scale_optimizer = torch.optim.Adam([
     {'params': [sonar_scale_factor._log_scale], 'lr': 0.01, 'name': 'sonar_scale'}
 ])
+
+training_iter_offset = 0
+
+if SONAR_LOAD_CHECKPOINT:
+    resumed_iter, resume_meta = load_training_checkpoint(
+        SONAR_LOAD_CHECKPOINT,
+        gaussians,
+        gaussian_training_args,
+        sonar_scale_factor,
+        scale_optimizer,
+    )
+    training_iter_offset = resumed_iter
+    print(f"[Checkpoint] Loaded: {SONAR_LOAD_CHECKPOINT} (iter={resumed_iter})")
+    if resume_meta:
+        print(f"[Checkpoint] Metadata: {resume_meta}")
+
+opacity_policy_state = {"initialized": False, "fixed": False}
+
+
+def effective_fixed_opacity(global_iter):
+    if SONAR_FIXED_OPACITY:
+        return True
+    if SONAR_OPACITY_WARMUP_ITERS <= 0:
+        return False
+    return global_iter <= SONAR_OPACITY_WARMUP_ITERS
+
+
+def sync_opacity_policy(global_iter, context, force=False):
+    fixed_now = effective_fixed_opacity(global_iter)
+    mode_changed = (not opacity_policy_state["initialized"]) or opacity_policy_state["fixed"] != fixed_now
+    if force or mode_changed:
+        apply_opacity_policy(
+            gaussians,
+            fixed_opacity=fixed_now,
+            fixed_target=FIXED_OPACITY_TARGET,
+            learnable_opacity_lr=GAUSSIAN_OPACITY_LR,
+        )
+        if mode_changed and fixed_now and not SONAR_FIXED_OPACITY:
+            print(
+                f"[Opacity] Warmup FIXED at iter {global_iter} ({context}); "
+                f"will switch to LEARNABLE after iter {SONAR_OPACITY_WARMUP_ITERS}"
+            )
+        elif mode_changed and (not fixed_now) and (not SONAR_FIXED_OPACITY):
+            print(f"[Opacity] Switched to LEARNABLE at iter {global_iter} ({context})")
+        elif force and (not mode_changed):
+            mode_name = "FIXED" if fixed_now else "LEARNABLE"
+            print(f"[Opacity] Re-applied {mode_name} policy at iter {global_iter} ({context})")
+        opacity_policy_state["initialized"] = True
+        opacity_policy_state["fixed"] = fixed_now
+    return fixed_now
+
+
+sync_opacity_policy(max(training_iter_offset + 1, 1), "setup")
 
 print(f"Initial scale factor: {sonar_scale_factor.get_scale_value():.6f}")
 
@@ -1346,6 +1740,7 @@ if STAGE1_ITERATIONS > 0:
 
         frame_idx = epoch_indices[(iteration - 1) % len(training_frames)]
         viewpoint_cam = training_frames[frame_idx]
+        frame_visit_counts[frame_idx] += 1
 
 
         # Get ground truth (with intensity thresholding)
@@ -1375,6 +1770,8 @@ if STAGE1_ITERATIONS > 0:
         base_loss = 0.8 * Ll1 + 0.2 * (1 - ssim_val)
         bright_loss = compute_bright_loss(rendered, gt_image)
         loss = (1 - BRIGHT_WEIGHT) * base_loss + BRIGHT_WEIGHT * bright_loss
+        frame_loss_sums[frame_idx] += float(loss.item())
+        frame_loss_counts[frame_idx] += 1
 
         if iteration == 1:
             print(f"    loss.requires_grad: {loss.requires_grad}")
@@ -1474,6 +1871,7 @@ if STAGE2_ITERATIONS > 0:
     print(f"Scale factor frozen at: {frozen_scale:.6f}")
 
     epoch_indices = get_epoch_indices(len(training_frames), SEED)
+    stage2_global_offset = training_iter_offset + STAGE1_ITERATIONS
     for iteration in range(1, STAGE2_ITERATIONS + 1):
         # Shuffle frames per epoch
         if (iteration - 1) % len(training_frames) == 0:
@@ -1482,6 +1880,9 @@ if STAGE2_ITERATIONS > 0:
 
         frame_idx = epoch_indices[(iteration - 1) % len(training_frames)]
         viewpoint_cam = training_frames[frame_idx]
+        global_iter = stage2_global_offset + iteration
+        sync_opacity_policy(global_iter, f"stage2/iter{iteration}")
+        frame_visit_counts[frame_idx] += 1
 
         # Get ground truth (with intensity thresholding)
         gt_image = preprocess_gt_image(viewpoint_cam.original_image)
@@ -1502,6 +1903,8 @@ if STAGE2_ITERATIONS > 0:
         base_loss = 0.8 * Ll1 + 0.2 * (1 - ssim_val)
         bright_loss = compute_bright_loss(rendered, gt_image)
         loss = (1 - BRIGHT_WEIGHT) * base_loss + BRIGHT_WEIGHT * bright_loss
+        frame_loss_sums[frame_idx] += float(loss.item())
+        frame_loss_counts[frame_idx] += 1
 
         # Backward
         loss.backward()
@@ -1516,12 +1919,7 @@ if STAGE2_ITERATIONS > 0:
             if FOV_PRUNE_INTERVAL > 0 and iteration % FOV_PRUNE_INTERVAL == 0:
                 num_pruned = prune_outside_fov(gaussians, training_frames, sonar_config, sonar_scale_factor)
                 if num_pruned > 0:
-                    apply_opacity_policy(
-                        gaussians,
-                        fixed_opacity=SONAR_FIXED_OPACITY,
-                        fixed_target=FIXED_OPACITY_TARGET,
-                        learnable_opacity_lr=GAUSSIAN_OPACITY_LR,
-                    )
+                    sync_opacity_policy(global_iter, f"stage2/fov_prune@{iteration}", force=True)
                     print(f"  [FOV prune] Removed {num_pruned} surfels outside FOV, {len(gaussians.get_xyz)} remaining")
 
         scale_value = sonar_scale_factor.get_scale_value()
@@ -1582,6 +1980,7 @@ if STAGE3_ITERATIONS > 0:
     sonar_scale_factor._log_scale.requires_grad = False
 
     epoch_indices = get_epoch_indices(len(training_frames), SEED)
+    stage3_global_offset = training_iter_offset + STAGE1_ITERATIONS + STAGE2_ITERATIONS
     for iteration in range(1, STAGE3_ITERATIONS + 1):
         # Shuffle frames per epoch
         if (iteration - 1) % len(training_frames) == 0:
@@ -1590,6 +1989,9 @@ if STAGE3_ITERATIONS > 0:
 
         frame_idx = epoch_indices[(iteration - 1) % len(training_frames)]
         viewpoint_cam = training_frames[frame_idx]
+        global_iter = stage3_global_offset + iteration
+        sync_opacity_policy(global_iter, f"stage3/iter{iteration}")
+        frame_visit_counts[frame_idx] += 1
 
 
         gt_image = preprocess_gt_image(viewpoint_cam.original_image)
@@ -1608,6 +2010,8 @@ if STAGE3_ITERATIONS > 0:
         base_loss = 0.8 * Ll1 + 0.2 * (1 - ssim_val)
         bright_loss = compute_bright_loss(rendered, gt_image)
         loss = (1 - BRIGHT_WEIGHT) * base_loss + BRIGHT_WEIGHT * bright_loss
+        frame_loss_sums[frame_idx] += float(loss.item())
+        frame_loss_counts[frame_idx] += 1
 
         loss.backward()
 
@@ -1621,12 +2025,7 @@ if STAGE3_ITERATIONS > 0:
             if FOV_PRUNE_INTERVAL > 0 and iteration % FOV_PRUNE_INTERVAL == 0:
                 num_pruned = prune_outside_fov(gaussians, training_frames, sonar_config, sonar_scale_factor)
                 if num_pruned > 0:
-                    apply_opacity_policy(
-                        gaussians,
-                        fixed_opacity=SONAR_FIXED_OPACITY,
-                        fixed_target=FIXED_OPACITY_TARGET,
-                        learnable_opacity_lr=GAUSSIAN_OPACITY_LR,
-                    )
+                    sync_opacity_policy(global_iter, f"stage3/fov_prune@{iteration}", force=True)
                     print(f"  [FOV prune] Removed {num_pruned} surfels outside FOV, {len(gaussians.get_xyz)} remaining")
 
         scale_value = sonar_scale_factor.get_scale_value()
@@ -1648,6 +2047,14 @@ if STAGE3_ITERATIONS > 0:
 
     print(f"Stage 3 complete. Surfels: {len(gaussians.get_xyz)}")
 
+    # Save comparison images before final prune so render quality is evaluated
+    # on the actual post-training state (pruning is for mesh cleanup).
+    save_comparison_images(training_frames, gaussians, background, sonar_config,
+                           sonar_scale_factor, OUTPUT_DIR, "after_stage3")
+    save_raw_comparison_images(training_frames, gaussians, background, sonar_config,
+                               sonar_scale_factor, OUTPUT_DIR, "after_stage3",
+                               DATASET_PATH, dataset_args.sonar_images)
+
     # Final FOV diagnostic and forced prune before mesh extraction
     print("\n  Final FOV check before mesh extraction:")
     for i, cam in enumerate(training_frames):
@@ -1668,12 +2075,8 @@ if STAGE3_ITERATIONS > 0:
     # Force final prune
     num_pruned = prune_outside_fov(gaussians, training_frames, sonar_config, sonar_scale_factor)
     if num_pruned > 0:
-        apply_opacity_policy(
-            gaussians,
-            fixed_opacity=SONAR_FIXED_OPACITY,
-            fixed_target=FIXED_OPACITY_TARGET,
-            learnable_opacity_lr=GAUSSIAN_OPACITY_LR,
-        )
+        final_global_iter = training_iter_offset + STAGE1_ITERATIONS + STAGE2_ITERATIONS + STAGE3_ITERATIONS
+        sync_opacity_policy(final_global_iter, "final_prune", force=True)
         print(f"  [Final prune] Removed {num_pruned} surfels, {len(gaussians.get_xyz)} remaining")
 
     # Save final surfel positions as point cloud (for verification)
@@ -1706,12 +2109,70 @@ if STAGE3_ITERATIONS > 0:
         sonar_extrinsic=None
     )
 
-    # Save comparison images after Stage 3
-    save_comparison_images(training_frames, gaussians, background, sonar_config,
-                           sonar_scale_factor, OUTPUT_DIR, "after_stage3")
-    save_raw_comparison_images(training_frames, gaussians, background, sonar_config,
-                               sonar_scale_factor, OUTPUT_DIR, "after_stage3",
-                               DATASET_PATH, dataset_args.sonar_images)
+print("\n" + "=" * 60)
+print("FINAL EVALUATION")
+print("=" * 60)
+
+summarize_training_frame_visits(
+    training_frames,
+    frame_visit_counts,
+    frame_loss_sums,
+    frame_loss_counts,
+    OUTPUT_DIR,
+)
+
+train_eval = evaluate_frame_set(
+    "train",
+    training_frames,
+    gaussians,
+    background,
+    sonar_config,
+    sonar_scale_factor,
+    OUTPUT_DIR,
+)
+
+holdout_eval = None
+if holdout_frames:
+    holdout_eval = evaluate_frame_set(
+        "holdout",
+        holdout_frames,
+        gaussians,
+        background,
+        sonar_config,
+        sonar_scale_factor,
+        OUTPUT_DIR,
+    )
+
+if train_eval is not None and holdout_eval is not None:
+    loss_gap = holdout_eval["loss_mean"] - train_eval["loss_mean"]
+    ssim_gap = train_eval["ssim_mean"] - holdout_eval["ssim_mean"]
+    print(
+        f"[Holdout Gap] loss_gap={loss_gap:+.6f} (holdout-train), "
+        f"ssim_gap={ssim_gap:+.4f} (train-holdout)"
+    )
+    if holdout_eval["loss_mean"] > train_eval["loss_mean"] * 1.25:
+        print(
+            "[Issue] Holdout loss is >25% above train loss; "
+            "cross-view generalization remains weak under current settings."
+        )
+
+train_support = compute_multiview_support_metrics(
+    gaussians,
+    training_frames,
+    sonar_config,
+    sonar_scale_factor,
+)
+report_support_metrics("train", train_support, training_frames, OUTPUT_DIR)
+
+if holdout_frames:
+    combined_frames = training_frames + holdout_frames
+    combined_support = compute_multiview_support_metrics(
+        gaussians,
+        combined_frames,
+        sonar_config,
+        sonar_scale_factor,
+    )
+    report_support_metrics("train_plus_holdout", combined_support, combined_frames, OUTPUT_DIR)
 
 stage_boundaries = []
 completed_iters = 0
@@ -1733,6 +2194,26 @@ print(f"\nFinal scale factor: {sonar_scale_factor.get_scale_value():.6f}")
 # Summary
 # =============================================================================
 total_iters = STAGE1_ITERATIONS + STAGE2_ITERATIONS + STAGE3_ITERATIONS
+
+if SONAR_SAVE_CHECKPOINT:
+    save_training_checkpoint(
+        SONAR_SAVE_CHECKPOINT,
+        gaussians,
+        sonar_scale_factor,
+        scale_optimizer,
+        iteration=training_iter_offset + total_iters,
+        stage_name="final",
+        metadata={
+            "dataset_key": DATASET_KEY,
+            "seed": SEED,
+            "elev_init_mode": ELEV_INIT_MODE,
+            "sonar_fixed_opacity": int(SONAR_FIXED_OPACITY),
+            "stage1_iterations": STAGE1_ITERATIONS,
+            "stage2_iterations": STAGE2_ITERATIONS,
+            "stage3_iterations": STAGE3_ITERATIONS,
+        },
+    )
+
 print("\n" + "=" * 60)
 print("COMPLETE")
 print("=" * 60)
@@ -1752,3 +2233,10 @@ print(f"  - comparison_after_stage2_frameN.png    (After surfel learning)")
 print(f"  - comparison_after_stage3_frameN.png    (After joint fine-tuning)")
 print(f"  - comparison_after_stage3_raw_frameN.png (Raw sonar vs rendered)")
 print(f"  - scale_and_loss.png                    (Scale and loss curves)")
+print(f"  - frame_training_visits.csv             (Per-frame optimizer visit coverage)")
+print(f"  - final_eval_train_frames.csv           (Per-frame final train losses)")
+if holdout_frames:
+    print(f"  - final_eval_holdout_frames.csv         (Per-frame final holdout losses)")
+print(f"  - support_metrics_train.csv             (Surfel support diagnostics)")
+if holdout_frames:
+    print(f"  - support_metrics_train_plus_holdout.csv (Support with holdout views)")
