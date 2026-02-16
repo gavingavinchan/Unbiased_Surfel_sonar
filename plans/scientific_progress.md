@@ -373,3 +373,42 @@ to stress-test camera-to-sonar extrinsic handling when that path is explicitly u
 ### 14.3 Open geometric coverage limitation
 
 Current synthetic pose sampling is predominantly a single rough orbit, so observed views concentrate near an equatorial band. This can bias initialized surfel centers toward a cylindrical shell rather than uniformly covering spherical latitude. Planned mitigation is multi-orbit/random-shell viewpoint sampling with bounded radius and center-looking orientation constraints.
+
+## 15. Synthetic Dataset C (Cube Vacuum) Update (2026-02-16)
+
+We extended the synthetic benchmark from Dataset A (sphere) to Dataset C (cube) using the same acceptance-gate structure, with cube-surface metrics replacing sphere-radial metrics.
+
+### 15.1 Dataset-C acceptance gate
+
+The gate is:
+$$
+G_C = G_{\mathrm{consistency}} \wedge G_{\mathrm{run1}} \wedge G_{\mathrm{run2}} \wedge G_{\mathrm{drift}}
+$$
+where $G_{\mathrm{run}i}$ requires:
+$$
+\bar{d}_{\mathrm{surf}} \le 0.05\,\mathrm{m}, \quad d_{95} \le 0.10\,\mathrm{m}, \quad e_{\mathrm{center}} \le 0.03\,\mathrm{m}
+$$
+for run $i\in\{1,2\}$.
+
+Observed canonical gate result (`sonar_equivalent`, multi-band poses):
+- $G_{\mathrm{consistency}}=\text{true}$ with mean residual $0.098358\,\mathrm{m}$ and $p95=0.244904\,\mathrm{m}$.
+- $G_{\mathrm{run1}}=\text{false}$ with $(\bar{d}_{\mathrm{surf}}, d_{95}, e_{\mathrm{center}})=(0.090046, 0.233642, 0.010489)\,\mathrm{m}$.
+- $G_{\mathrm{run2}}=\text{false}$ with $(0.090045, 0.233642, 0.010489)\,\mathrm{m}$.
+- $G_{\mathrm{drift}}=\text{true}$ (near-zero inter-run deltas).
+
+Hence $G_C=\text{false}$ in the current implementation.
+
+### 15.2 Additional ablations
+
+Post-gate runs tested longer stage budgets and key toggles:
+- attenuation off + zero elevation init: $(\bar{d}_{\mathrm{surf}}, d_{95})\approx(0.0853, 0.2139)\,\mathrm{m}$,
+- learnable opacity ablation: $(0.0891, 0.2307)\,\mathrm{m}$.
+
+Both remain above acceptance thresholds.
+
+### 15.3 Current scientific interpretation
+
+- Dataset C pipeline reliability is strong (deterministic behavior, reproducible metrics).
+- The failure mode is geometric quality, not stochastic instability.
+- Under the current Chunk-2-era feature set, results suggest a quality ceiling for cube face/edge recovery.
+- The most probable next gain is from Chunk 3/4 components (overlap-aware likelihood evidence and belief-to-geometry coupling) rather than additional Stage-2-only budget increases.

@@ -1042,17 +1042,23 @@ torch.cuda.manual_seed_all(SEED)
 # =============================================================================
 # Configuration
 # =============================================================================
-SYNTHETIC_DATASET_KEYS = {"synthetic_a_clean"}
+SYNTHETIC_DATASET_KEYS = {"synthetic_a_clean", "synthetic_c_clean"}
 DEFAULT_SYNTHETIC_A_PATH = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
     "synthetic_datasets",
     "synthetic_sphere_A_clean",
+)
+DEFAULT_SYNTHETIC_C_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "synthetic_datasets",
+    "synthetic_cube_C_clean",
 )
 
 DATASET_PATHS = {
     "legacy": "/home/gavin/ros2_ws/outputs/session_2025-12-08_16-35-13_sonar_data_for_2dgs",
     "r2": "/home/gavin/ros2_ws/outputs/session_2025-12-08_16-35-13_sonar_data_for_2dgs_R2",
     "synthetic_a_clean": DEFAULT_SYNTHETIC_A_PATH,
+    "synthetic_c_clean": DEFAULT_SYNTHETIC_C_PATH,
 }
 
 DATASET_KEY = os.environ.get("SONAR_DATASET", "r2").strip().lower()
@@ -1074,6 +1080,7 @@ INIT_SCALE_FACTORS = {
     "legacy": 0.65,
     "r2": 0.6127,
     "synthetic_a_clean": 1.0,
+    "synthetic_c_clean": 1.0,
 }
 
 is_synthetic_key = DATASET_KEY in SYNTHETIC_DATASET_KEYS or DATASET_KEY.startswith("synthetic")

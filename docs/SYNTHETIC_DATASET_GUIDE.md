@@ -1,15 +1,26 @@
 # Synthetic Sonar Dataset Guide
 
-This guide documents the Dataset A (`A_clean`) workflow for synthetic sonar validation.
+This guide documents Dataset A (`A_clean`, sphere) and Dataset C (`C_clean`, cube)
+workflows for synthetic sonar validation.
+
+## Current Dataset Inventory
+
+Use this section as the source of truth for currently maintained synthetic datasets.
+
+- `synthetic_sphere_A_clean` (`A_clean`, sphere in vacuum)
+- `synthetic_cube_C_clean` (`C_clean`, cube in vacuum)
 
 ## Scope
 
-- Dataset: analytic sphere in vacuum (`synthetic_sphere_A_clean`)
+- Datasets:
+  - Dataset A: analytic sphere in vacuum (`synthetic_sphere_A_clean`)
+  - Dataset C: analytic cube in vacuum (`synthetic_cube_C_clean`)
 - Goal: validate end-to-end sonar training behavior with known geometry and deterministic data
 - Primary scripts:
   - `scripts/generate_synthetic_sonar_dataset.py`
   - `debug_multiframe.py`
   - `scripts/eval_synthetic_sphere.py`
+  - `scripts/eval_synthetic_cube.py`
 
 ## Environment
 
@@ -121,14 +132,78 @@ Summary artifacts:
 - `output/debug_multiframe_synth_gate_summary.json`
 - `output/debug_multiframe_synth_gate_summary.md`
 
+## 6) Dataset C (cube) quickstart
+
+Generate Dataset C with multi-band pose coverage:
+
+```bash
+source ~/anaconda3/etc/profile.d/conda.sh && conda activate unbiased_surfel_sonar && \
+python scripts/generate_synthetic_sonar_dataset.py \
+  --output-dir ./synthetic_datasets/synthetic_cube_C_clean \
+  --variant C_clean \
+  --pose-mode sonar_equivalent \
+  --pose-policy multi_band \
+  --num-frames 500 \
+  --seed 42 \
+  --elevation-samples 64 \
+  --overwrite
+```
+
+Train on Dataset C:
+
+```bash
+source ~/anaconda3/etc/profile.d/conda.sh && conda activate unbiased_surfel_sonar && \
+SONAR_DATASET=synthetic_c_clean \
+SONAR_DATASET_PATH=/home/gavin/Unbiased_Surfel_sonar/synthetic_datasets/synthetic_cube_C_clean \
+SONAR_OUTPUT_DIR=./output/debug_multiframe_synth_c_run1 \
+SONAR_NUM_FRAMES=500 \
+SONAR_STAGE2_ITERS=1000 \
+SONAR_STAGE3_ITERS=1 \
+SONAR_FREEZE_SCALE=1 \
+python debug_multiframe.py
+```
+
+Evaluate cube geometry:
+
+```bash
+source ~/anaconda3/etc/profile.d/conda.sh && conda activate unbiased_surfel_sonar && \
+python scripts/eval_synthetic_cube.py \
+  --reconstruction ./output/debug_multiframe_synth_c_run1/surfels_after_training.ply \
+  --dataset-root ./synthetic_datasets/synthetic_cube_C_clean \
+  --output-dir ./output/debug_multiframe_synth_c_run1/eval_surfel \
+  --fit-mode both
+```
+
+One-command Dataset C gate:
+
+```bash
+source ~/anaconda3/etc/profile.d/conda.sh && conda activate unbiased_surfel_sonar && \
+python scripts/run_synthetic_c_gate.py \
+  --dataset-root ./synthetic_datasets/synthetic_cube_C_clean \
+  --pose-mode sonar_equivalent \
+  --pose-policy multi_band \
+  --num-frames 500 \
+  --stage2-iters 1000 \
+  --stage3-iters 1 \
+  --overwrite-runs
+```
+
+Dataset C default pass thresholds:
+
+- mean surface error <= 0.05 m
+- p95 surface error <= 0.10 m
+- center error <= 0.03 m
+
 ## Implementation Notes
 
 - **Sonar image channel contract**: synthetic sonar PNGs are saved as 3-channel grayscale RGB. This avoids SSIM channel mismatch in the existing training path that expects 3 channels.
 - **Pose modes**: use `sonar_equivalent` for the canonical Dataset A acceptance gate. `camera_with_extrinsic` is optional diagnostic mode for transform-path checks.
-- **Evaluator fit mode**: `scripts/eval_synthetic_sphere.py` defaults to `--fit-mode gt_trimmed`. It uses GT-centered radial trimming before sphere fitting to reduce outlier bias in center estimation while still reporting full-cloud GT radial statistics.
+- **Pose policy**: Dataset C defaults to multi-band coverage (`--pose-policy auto` resolves to `multi_band`) to avoid equatorial-only coverage bias.
+- **Evaluator fit mode**: `scripts/eval_synthetic_sphere.py` and `scripts/eval_synthetic_cube.py` default to `--fit-mode gt_trimmed` for robust center estimation while still reporting full-cloud GT residual statistics.
 
 ## Commands Used in Practice
 
 - Generator: `scripts/generate_synthetic_sonar_dataset.py`
 - Training: `debug_multiframe.py` with `SONAR_DATASET_PATH` and `SONAR_FREEZE_SCALE=1`
 - Evaluator: `scripts/eval_synthetic_sphere.py`
+- Evaluator (cube): `scripts/eval_synthetic_cube.py`

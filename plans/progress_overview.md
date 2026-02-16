@@ -358,3 +358,10 @@ flowchart TB
 - Full-quality Dataset A gate now passes in canonical mode with stable repeatability across two runs (consistency gate pass + eval threshold pass + drift pass).
 - Chunk-1/2 validation refresh completed after gate integration: init-only smoke pass, `ELEV_INIT_MODE=random` spread confirmed, `ELEV_INIT_MODE=zero` parity contract pass, fixed-opacity behavior confirmed, and save/load resume continuation pass.
 - Recorded a follow-up risk for later work: single-orbit pose sampling concentrates FOV near an equatorial band and can bias surfel centers toward a cylindrical shell; multi-orbit/random-shell sampling was added to plan backlog.
+
+## Recent Updates (2026-02-16 Dataset C Track)
+- Implemented Dataset C (cube vacuum) end-to-end tooling: generator extensions in `scripts/generate_synthetic_sonar_dataset.py`, evaluator `scripts/eval_synthetic_cube.py`, and gate runner `scripts/run_synthetic_c_gate.py`.
+- Added Dataset C integration in `debug_multiframe.py` (`SONAR_DATASET=synthetic_c_clean`) and updated usage docs in `docs/SYNTHETIC_DATASET_GUIDE.md`.
+- Canonical Dataset C gate executed with multi-band poses; consistency and reproducibility gates pass, but both training runs fail cube reconstruction thresholds (`mean~0.090 m`, `p95~0.234 m`).
+- Follow-up tuning experiments (longer stage budgets, range-attenuation-off, zero-elevation init, learnable-opacity ablation) improved little and still fail thresholds (`exp1 mean/p95 ~0.085/0.214`, `exp2 ~0.089/0.231`).
+- Current handoff assessment: likely Chunk-2 quality ceiling; probable unblock is Chunk 3/4 overlap-likelihood + belief-to-geometry coupling work before expecting Dataset C acceptance.

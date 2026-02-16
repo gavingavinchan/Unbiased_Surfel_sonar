@@ -1,7 +1,7 @@
 # Plan: Synthetic Sonar Dataset Program (Detailed Execution)
 
 **Date:** 2026-02-15  
-**Status:** Implemented for Dataset A with validation artifacts and gate automation extensions (gpt-5.3-codex)  
+**Status:** Dataset A gate passed; Dataset C implementation completed and canonical gate executed, currently failing reconstruction thresholds (gpt-5.3-codex)  
 **Depends on:** `plans/PLAN_SYNTHETIC_DATASET_2026-02-15.md`
 
 ---
@@ -16,6 +16,8 @@ Implement Dataset A (sphere vacuum) end-to-end:
 - acceptance gate.
 
 Datasets B and D are out of scope for initial implementation. `A_noisy` is also deferred until `A_clean` passes.
+
+Scope extension (2026-02-16): Dataset C (cube in vacuum) was added with the same gate structure as Dataset A.
 
 ---
 
@@ -84,12 +86,79 @@ Datasets B and D are out of scope for initial implementation. `A_noisy` is also 
 3. Start Dataset B (sphere + plane) only after freezing extrinsic diagnostic policy for CI-style checks.
 4. Improve pose diversity for later runs: avoid single-orbit-only sampling that over-concentrates FOV near the sphere equator and can produce cylindrical surfel-center distributions; add multi-orbit and random-shell viewpoints (bounded radius, still roughly center-looking).
 
+## Execution Update (2026-02-16): Dataset C Gate + Handoff
+
+### Code Delivered for Dataset C
+
+- Updated: `scripts/generate_synthetic_sonar_dataset.py`
+  - Added Dataset C variants (`C_clean`, `C_noisy`), cube geometry, cube intersection, shape-aware consistency reporting, and Dataset C pose-policy defaults.
+- Added: `scripts/eval_synthetic_cube.py`
+  - Computes cube-surface residual metrics, center error, pass/fail checks, and histogram artifact.
+- Added: `scripts/run_synthetic_c_gate.py`
+  - Automates generate -> consistency gate -> train x2 -> eval x2 -> drift check.
+- Updated: `debug_multiframe.py`
+  - Added dataset key support for `synthetic_c_clean` and synthetic scale defaults for C.
+- Updated: `docs/SYNTHETIC_DATASET_GUIDE.md`
+  - Added Dataset C workflow/commands.
+
+### Canonical Dataset C Gate Result
+
+- Command path: `scripts/run_synthetic_c_gate.py` (canonical `--pose-mode sonar_equivalent`, `--pose-policy multi_band`, 500 frames).
+- Summary artifacts:
+  - `output/debug_multiframe_synth_c_gate_summary.json`
+  - `output/debug_multiframe_synth_c_gate_summary.md`
+- Outcome: `overall_pass=false`.
+- Breakdown:
+  1. Consistency gate: `pass=true` (`mean_surface_residual=0.098358 m`, `p95=0.244904 m`, median pixel error near zero).
+  2. Run1 eval: `fail` (`mean=0.090046 m`, `p95=0.233642 m`, `center=0.010489 m`).
+  3. Run2 eval: `fail` (`mean=0.090045 m`, `p95=0.233642 m`, `center=0.010489 m`).
+  4. Reproducibility drift: `pass=true` (near-zero deltas).
+
+### Post-Gate Experiments
+
+- `output/debug_multiframe_synth_c_exp1`: longer stage budget + attenuation off + zero elevation init.
+  - Eval: `mean=0.085301 m`, `p95=0.213949 m`, `overall_pass=false`.
+- `output/debug_multiframe_synth_c_exp2`: learnable opacity ablation + longer stage budget.
+  - Eval: `mean=0.089113 m`, `p95=0.230656 m`, `overall_pass=false`.
+- `output/debug_multiframe_synth_c_exp3`: much longer stage budget (`Stage2=10000`, `Stage3=1000`) with attenuation off + zero elevation init.
+  - Eval: `mean=0.085379 m`, `p95=0.208353 m`, `center=0.006545 m`, `overall_pass=false`.
+
+### Experiment Comparison (Gate vs Post-Gate)
+
+- Canonical gate baseline (`run1`): `mean=0.090046 m`, `p95=0.233642 m`, `center=0.010489 m`.
+- Best observed mean: `exp1` (`0.085301 m`, delta `-0.004744 m` vs gate baseline).
+- Best observed p95: `exp3` (`0.208353 m`, delta `-0.025288 m` vs gate baseline).
+- Despite improvements, best metrics remain above acceptance thresholds by large margins:
+  - mean gap: `+0.035301 m` over `0.05 m` limit,
+  - p95 gap: `+0.108353 m` over `0.10 m` limit.
+
+### Handoff Assessment
+
+- Dataset C tooling is complete and reproducible; failure is in geometric threshold quality, not pipeline reliability.
+- Current evidence (including exp3 evaluation) suggests a quality ceiling under present Chunk-2-era capabilities.
+- Most likely next unblock aligns with Chunk 3/4 work in `plans/PLAN_ELEVATION_AWARE_IMPLEMENTATION_EXECUTION_2026-02-10.md` (overlap/likelihood and belief-to-geometry coupling).
+
+### Blocker Statement (Recorded)
+
+- Dataset C acceptance is blocked under the currently implemented Chunk-2 scope.
+- Further tuning of existing Chunk-2 knobs improved metrics modestly but did not approach threshold pass conditions.
+- Expectation is that meaningful progress now depends on implementing Chunk 3/4 (likelihood core and belief-to-geometry coupling), then re-running the Dataset C gate.
+
+### Next Session Checklist
+
+1. Done: evaluate `output/debug_multiframe_synth_c_exp3/surfels_after_training.ply` with `scripts/eval_synthetic_cube.py`.
+2. Done: compare exp3 metrics against gate/run1/run2 and exp1/exp2 to confirm plateau vs improvement.
+3. Done: record formal blocker as requiring Chunk 3/4 implementation before expecting Dataset C acceptance.
+
 ---
 
 ## In-Scope Files
 
 - New: `scripts/generate_synthetic_sonar_dataset.py`
 - New: `scripts/eval_synthetic_sphere.py`
+- New: `scripts/eval_synthetic_cube.py`
+- New: `scripts/run_synthetic_a_gate.py`
+- New: `scripts/run_synthetic_c_gate.py`
 - Update: `debug_multiframe.py` (synthetic dataset path support)
 - Optional doc: `docs/SYNTHETIC_DATASET_GUIDE.md`
 

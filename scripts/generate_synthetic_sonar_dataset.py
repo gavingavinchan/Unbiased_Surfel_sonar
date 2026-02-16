@@ -2,7 +2,9 @@
 """
 Generate synthetic sonar datasets compatible with the existing COLMAP+sonar layout.
 
-Dataset A (sphere in vacuum) is the primary target for this script.
+Supported synthetic tracks:
+- Dataset A: sphere in vacuum
+- Dataset C: cube in vacuum
 """
 
 from __future__ import annotations
@@ -32,7 +34,11 @@ from scene.dataset_readers import readColmapSceneInfo
 from utils.sonar_utils import SonarConfig, get_camera_to_sonar_transform, sonar_frame_to_points
 
 
-SCRIPT_VERSION = "2026-02-15"
+SCRIPT_VERSION = "2026-02-16"
+
+SPHERE_VARIANTS = {"A_clean", "A_noisy"}
+CUBE_VARIANTS = {"C_clean", "C_noisy"}
+ALL_VARIANTS = tuple(sorted(SPHERE_VARIANTS | CUBE_VARIANTS))
 
 
 @dataclass
@@ -54,14 +60,14 @@ class PoseRecord:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Generate synthetic sonar sphere datasets")
+    parser = argparse.ArgumentParser(description="Generate synthetic sonar datasets (sphere/cube)")
     parser.add_argument(
         "--output-dir",
         type=Path,
         default=Path("./synthetic_datasets/synthetic_sphere_A_clean"),
         help="Dataset output directory",
     )
-    parser.add_argument("--variant", choices=["A_clean", "A_noisy"], default="A_clean")
+    parser.add_argument("--variant", choices=ALL_VARIANTS, default="A_clean")
     parser.add_argument("--num-frames", type=int, default=500)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--overwrite", action="store_true", help="Delete output dir if it exists")
@@ -77,9 +83,26 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--sphere-radius", type=float, default=0.8)
     parser.add_argument("--sphere-center", type=float, nargs=3, default=[0.0, 0.0, 0.0])
+    parser.add_argument("--cube-half-extent", type=float, default=0.8)
+    parser.add_argument("--cube-center", type=float, nargs=3, default=[0.0, 0.0, 0.0])
     parser.add_argument("--orbit-radius", type=float, default=2.0)
     parser.add_argument("--elevation-min-deg", type=float, default=-12.0)
     parser.add_argument("--elevation-max-deg", type=float, default=12.0)
+    parser.add_argument(
+        "--pose-policy",
+        choices=["auto", "orbit_sweep", "multi_band"],
+        default="auto",
+        help=(
+            "Pose coverage policy. 'auto' selects orbit_sweep for Dataset A and "
+            "multi_band for Dataset C."
+        ),
+    )
+    parser.add_argument(
+        "--pose-bands-deg",
+        type=str,
+        default="-12,-6,0,6,12",
+        help="Comma-separated elevation bands in degrees for multi_band policy",
+    )
     parser.add_argument("--translation-jitter-sigma", type=float, default=0.02)
     parser.add_argument("--rotation-jitter-sigma-deg", type=float, default=1.5)
 
@@ -110,6 +133,57 @@ def normalize(v: np.ndarray, eps: float = 1e-9) -> np.ndarray:
     if n < eps:
         return np.zeros_like(v)
     return v / n
+
+
+def variant_is_sphere(variant: str) -> bool:
+    return variant in SPHERE_VARIANTS
+
+
+def variant_is_cube(variant: str) -> bool:
+    return variant in CUBE_VARIANTS
+
+
+def variant_shape(variant: str) -> str:
+    if variant_is_sphere(variant):
+        return "sphere"
+    if variant_is_cube(variant):
+        return "cube"
+    raise ValueError(f"Unsupported variant: {variant}")
+
+
+def variant_is_noisy(variant: str) -> bool:
+    return variant.endswith("_noisy")
+
+
+def resolve_pose_policy(args: argparse.Namespace) -> str:
+    if args.pose_policy != "auto":
+        return args.pose_policy
+    return "multi_band" if variant_is_cube(args.variant) else "orbit_sweep"
+
+
+def parse_pose_bands_deg(raw: str) -> np.ndarray:
+    values = [v.strip() for v in raw.split(",") if v.strip()]
+    if not values:
+        raise ValueError("--pose-bands-deg must include at least one value")
+    bands = np.array([float(v) for v in values], dtype=np.float64)
+    return bands
+
+
+def geometry_vec3(geometry: Dict[str, object], key: str) -> np.ndarray:
+    value = geometry.get(key)
+    if not isinstance(value, (list, tuple, np.ndarray)):
+        raise ValueError(f"Geometry key '{key}' must be a 3-vector")
+    arr = np.asarray(value, dtype=np.float64)
+    if arr.shape != (3,):
+        raise ValueError(f"Geometry key '{key}' must have shape (3,), got {arr.shape}")
+    return arr
+
+
+def geometry_scalar(geometry: Dict[str, object], key: str) -> float:
+    value = geometry.get(key)
+    if not isinstance(value, (int, float, np.floating)):
+        raise ValueError(f"Geometry key '{key}' must be numeric")
+    return float(value)
 
 
 def rotation_matrix_from_rotvec(rotvec: np.ndarray) -> np.ndarray:
@@ -161,8 +235,56 @@ def look_at_rotation_w2c(center_world: np.ndarray, target_world: np.ndarray) -> 
     return R_w2c
 
 
+def generate_orbit_angles(
+    *,
+    num_frames: int,
+    elev_min_deg: float,
+    elev_max_deg: float,
+    policy: str,
+    pose_bands_deg: np.ndarray,
+    rng: np.random.Generator,
+) -> Tuple[np.ndarray, np.ndarray]:
+    azimuths = np.linspace(0.0, 2.0 * math.pi, num_frames, endpoint=False, dtype=np.float64)
+
+    if policy == "orbit_sweep":
+        elevations = np.linspace(
+            math.radians(elev_min_deg),
+            math.radians(elev_max_deg),
+            num_frames,
+            dtype=np.float64,
+        )
+        return azimuths, elevations
+
+    if policy != "multi_band":
+        raise ValueError(f"Unsupported pose policy: {policy}")
+
+    bands = np.deg2rad(np.asarray(pose_bands_deg, dtype=np.float64))
+    bands = bands[(bands >= math.radians(elev_min_deg)) & (bands <= math.radians(elev_max_deg))]
+    if bands.size == 0:
+        bands = np.linspace(math.radians(elev_min_deg), math.radians(elev_max_deg), 5, dtype=np.float64)
+
+    band_idx = np.arange(num_frames, dtype=np.int64) % bands.shape[0]
+    elevations = bands[band_idx]
+
+    if bands.shape[0] > 1:
+        sorted_bands = np.sort(np.unique(bands))
+        if sorted_bands.shape[0] > 1:
+            min_step = float(np.min(np.diff(sorted_bands)))
+            if min_step > 1e-9:
+                jitter = rng.uniform(low=-0.2 * min_step, high=0.2 * min_step, size=num_frames)
+                elevations = elevations + jitter
+
+    elevations = np.clip(elevations, math.radians(elev_min_deg), math.radians(elev_max_deg))
+    return azimuths, elevations
+
+
 def build_pose_records(args: argparse.Namespace, rng: np.random.Generator) -> List[PoseRecord]:
-    center = np.asarray(args.sphere_center, dtype=np.float64)
+    shape = variant_shape(args.variant)
+    if shape == "sphere":
+        center = np.asarray(args.sphere_center, dtype=np.float64)
+    else:
+        center = np.asarray(args.cube_center, dtype=np.float64)
+
     orbit_radius = float(args.orbit_radius)
     num_frames = int(args.num_frames)
     pose_mode = str(args.pose_mode)
@@ -175,12 +297,15 @@ def build_pose_records(args: argparse.Namespace, rng: np.random.Generator) -> Li
     else:
         T_s2c = np.eye(4, dtype=np.float64)
 
-    azimuths = np.linspace(0.0, 2.0 * math.pi, num_frames, endpoint=False, dtype=np.float64)
-    elevations = np.linspace(
-        math.radians(args.elevation_min_deg),
-        math.radians(args.elevation_max_deg),
-        num_frames,
-        dtype=np.float64,
+    pose_policy = resolve_pose_policy(args)
+    pose_bands_deg = parse_pose_bands_deg(args.pose_bands_deg)
+    azimuths, elevations = generate_orbit_angles(
+        num_frames=num_frames,
+        elev_min_deg=float(args.elevation_min_deg),
+        elev_max_deg=float(args.elevation_max_deg),
+        policy=pose_policy,
+        pose_bands_deg=pose_bands_deg,
+        rng=rng,
     )
 
     poses: List[PoseRecord] = []
@@ -285,13 +410,48 @@ def intersect_sphere_nearest_positive(
     return t
 
 
+def intersect_axis_aligned_cube_nearest_positive(
+    origin_world: np.ndarray,
+    dirs_world: np.ndarray,
+    cube_center: np.ndarray,
+    cube_half_extent: float,
+) -> np.ndarray:
+    box_min = cube_center - float(cube_half_extent)
+    box_max = cube_center + float(cube_half_extent)
+
+    t = np.full(dirs_world.shape[0], np.nan, dtype=np.float64)
+
+    parallel = np.abs(dirs_world) < 1e-12
+    outside_parallel = parallel & ((origin_world < box_min) | (origin_world > box_max))
+    impossible = np.any(outside_parallel, axis=1)
+
+    safe_dirs = np.where(parallel, 1.0, dirs_world)
+    inv_dir = 1.0 / safe_dirs
+
+    t1 = (box_min[None, :] - origin_world[None, :]) * inv_dir
+    t2 = (box_max[None, :] - origin_world[None, :]) * inv_dir
+
+    t_near = np.max(np.minimum(t1, t2), axis=1)
+    t_far = np.min(np.maximum(t1, t2), axis=1)
+
+    valid = (~impossible) & (t_far >= np.maximum(t_near, 1e-8))
+    if not np.any(valid):
+        return t
+
+    t_near_v = t_near[valid]
+    t_far_v = t_far[valid]
+    best = np.where(t_near_v > 1e-8, t_near_v, np.where(t_far_v > 1e-8, t_far_v, np.nan))
+    t[valid] = best
+    return t
+
+
 def render_sonar_frame(
     pose: PoseRecord,
     dirs_s_flat: np.ndarray,
     col_idx_flat: np.ndarray,
     sonar_cfg: SonarConfig,
-    sphere_center: np.ndarray,
-    sphere_radius: float,
+    shape: str,
+    geometry: Dict[str, object],
     elev_samples: int,
 ) -> np.ndarray:
     """
@@ -304,12 +464,22 @@ def render_sonar_frame(
     dirs_w_flat = dirs_s_flat @ R_s2w.T
     dirs_w_flat = dirs_w_flat / np.linalg.norm(dirs_w_flat, axis=1, keepdims=True).clip(min=1e-12)
 
-    hit_ranges = intersect_sphere_nearest_positive(
-        origin_world=pose.sonar_center_world,
-        dirs_world=dirs_w_flat,
-        sphere_center=sphere_center,
-        sphere_radius=float(sphere_radius),
-    )
+    if shape == "sphere":
+        hit_ranges = intersect_sphere_nearest_positive(
+            origin_world=pose.sonar_center_world,
+            dirs_world=dirs_w_flat,
+            sphere_center=geometry_vec3(geometry, "sphere_center_m"),
+            sphere_radius=geometry_scalar(geometry, "sphere_radius_m"),
+        )
+    elif shape == "cube":
+        hit_ranges = intersect_axis_aligned_cube_nearest_positive(
+            origin_world=pose.sonar_center_world,
+            dirs_world=dirs_w_flat,
+            cube_center=geometry_vec3(geometry, "cube_center_m"),
+            cube_half_extent=geometry_scalar(geometry, "cube_half_extent_m"),
+        )
+    else:
+        raise ValueError(f"Unsupported shape for rendering: {shape}")
 
     H = int(sonar_cfg.image_height)
     W = int(sonar_cfg.image_width)
@@ -340,7 +510,7 @@ def apply_noise_if_needed(
     speckle_sigma: float,
     dropout_prob: float,
 ) -> np.ndarray:
-    if variant != "A_noisy":
+    if not variant_is_noisy(variant):
         return img_float
 
     noisy = img_float.copy()
@@ -407,6 +577,48 @@ def sample_sphere_points(center: np.ndarray, radius: float, count: int, rng: np.
     return points.astype(np.float64)
 
 
+def sample_cube_surface_points(
+    center: np.ndarray,
+    half_extent: float,
+    count: int,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    half = float(half_extent)
+    face_idx = rng.integers(low=0, high=6, size=count)
+    uv = rng.uniform(low=-half, high=half, size=(count, 2))
+    pts = np.zeros((count, 3), dtype=np.float64)
+
+    # +X
+    mask = face_idx == 0
+    pts[mask, 0] = half
+    pts[mask, 1:] = uv[mask]
+    # -X
+    mask = face_idx == 1
+    pts[mask, 0] = -half
+    pts[mask, 1:] = uv[mask]
+    # +Y
+    mask = face_idx == 2
+    pts[mask, 1] = half
+    pts[mask, 0] = uv[mask, 0]
+    pts[mask, 2] = uv[mask, 1]
+    # -Y
+    mask = face_idx == 3
+    pts[mask, 1] = -half
+    pts[mask, 0] = uv[mask, 0]
+    pts[mask, 2] = uv[mask, 1]
+    # +Z
+    mask = face_idx == 4
+    pts[mask, 2] = half
+    pts[mask, :2] = uv[mask]
+    # -Z
+    mask = face_idx == 5
+    pts[mask, 2] = -half
+    pts[mask, :2] = uv[mask]
+
+    pts += center[None, :]
+    return pts
+
+
 def write_points3d_txt(path: Path, points: np.ndarray) -> None:
     with open(path, "w", encoding="utf-8") as f:
         f.write("# 3D point list with one line of data per point:\n")
@@ -440,45 +652,66 @@ def write_dataset_settings_md(path: Path, manifest: Dict) -> None:
         "",
         "## Geometry",
         "",
-        f"- Sphere center (m): `{geometry['sphere_center_m']}`",
-        f"- Sphere radius (m): `{geometry['sphere_radius_m']}`",
-        "",
-        "## Sonar Model",
-        "",
-        f"- Image size: `{sonar['image_width']}x{sonar['image_height']}`",
-        f"- Azimuth FOV (deg): `{sonar['azimuth_fov_deg']}`",
-        f"- Elevation FOV (deg): `{sonar['elevation_fov_deg']}`",
-        f"- Range limits (m): `[{sonar['range_min_m']}, {sonar['range_max_m']}]`",
-        "",
-        "## Pose Policy",
-        "",
-        f"- Frames: `{pose['num_frames']}`",
-        f"- Orbit radius (m): `{pose['orbit_radius_m']}`",
-        f"- Elevation sweep (deg): `{pose['elevation_sweep_deg']}`",
-        f"- Translation jitter sigma (m): `{pose['translation_jitter_sigma_m']}`",
-        f"- Rotation jitter sigma (deg): `{pose['rotation_jitter_sigma_deg']}`",
-        f"- Orientation policy: `{pose['orientation_policy']}`",
-        f"- Pose mode: `{pose['pose_mode']}`",
-        f"- Pose export contract: `{pose['pose_export_contract']}`",
-        "",
-        "## Simulation",
-        "",
-        f"- Elevation samples per azimuth: `{sim['elevation_samples']}`",
-        f"- Intersection policy: `{sim['intersection_policy']}`",
-        f"- Intensity model: `{sim['intensity_model']}`",
-        f"- Normalization: `{sim['normalization']}`",
-        "",
-        "## Seed Contract",
-        "",
-        f"- master: `{seeds['master']}`",
-        f"- pose: `{seeds['pose']}`",
-        f"- noise: `{seeds['noise']}`",
-        f"- points3d: `{seeds['points3d']}`",
-        "",
-        "## Extrinsic Policy",
-        "",
-        f"- `{manifest['extrinsic_policy']}`",
+        f"- Shape: `{geometry['shape']}`",
     ]
+
+    if geometry["shape"] == "sphere":
+        lines.extend(
+            [
+                f"- Sphere center (m): `{geometry['sphere_center_m']}`",
+                f"- Sphere radius (m): `{geometry['sphere_radius_m']}`",
+            ]
+        )
+    elif geometry["shape"] == "cube":
+        lines.extend(
+            [
+                f"- Cube center (m): `{geometry['cube_center_m']}`",
+                f"- Cube half extent (m): `{geometry['cube_half_extent_m']}`",
+            ]
+        )
+
+    lines.extend(
+        [
+            "",
+            "## Sonar Model",
+            "",
+            f"- Image size: `{sonar['image_width']}x{sonar['image_height']}`",
+            f"- Azimuth FOV (deg): `{sonar['azimuth_fov_deg']}`",
+            f"- Elevation FOV (deg): `{sonar['elevation_fov_deg']}`",
+            f"- Range limits (m): `[{sonar['range_min_m']}, {sonar['range_max_m']}]`",
+            "",
+            "## Pose Policy",
+            "",
+            f"- Frames: `{pose['num_frames']}`",
+            f"- Orbit radius (m): `{pose['orbit_radius_m']}`",
+            f"- Elevation sweep (deg): `{pose['elevation_sweep_deg']}`",
+            f"- Pose policy: `{pose['pose_policy']}`",
+            f"- Pose bands (deg): `{pose.get('pose_bands_deg', [])}`",
+            f"- Translation jitter sigma (m): `{pose['translation_jitter_sigma_m']}`",
+            f"- Rotation jitter sigma (deg): `{pose['rotation_jitter_sigma_deg']}`",
+            f"- Orientation policy: `{pose['orientation_policy']}`",
+            f"- Pose mode: `{pose['pose_mode']}`",
+            f"- Pose export contract: `{pose['pose_export_contract']}`",
+            "",
+            "## Simulation",
+            "",
+            f"- Elevation samples per azimuth: `{sim['elevation_samples']}`",
+            f"- Intersection policy: `{sim['intersection_policy']}`",
+            f"- Intensity model: `{sim['intensity_model']}`",
+            f"- Normalization: `{sim['normalization']}`",
+            "",
+            "## Seed Contract",
+            "",
+            f"- master: `{seeds['master']}`",
+            f"- pose: `{seeds['pose']}`",
+            f"- noise: `{seeds['noise']}`",
+            f"- points3d: `{seeds['points3d']}`",
+            "",
+            "## Extrinsic Policy",
+            "",
+            f"- `{manifest['extrinsic_policy']}`",
+        ]
+    )
 
     if gate:
         lines.extend(
@@ -554,18 +787,31 @@ def fit_sphere_least_squares(points: np.ndarray) -> Tuple[np.ndarray, float] | N
     return center, float(math.sqrt(radius_sq))
 
 
+def cube_signed_distance(points: np.ndarray, cube_center: np.ndarray, cube_half_extent: float) -> np.ndarray:
+    q = np.abs(points - cube_center[None, :]) - float(cube_half_extent)
+    outside = np.linalg.norm(np.maximum(q, 0.0), axis=1)
+    inside = np.minimum(np.max(q, axis=1), 0.0)
+    return outside + inside
+
+
+def fit_cube_center_median(points: np.ndarray) -> np.ndarray | None:
+    if points.shape[0] < 8:
+        return None
+    return np.median(points, axis=0)
+
+
 def run_backward_projection_gate(
     dataset_root: Path,
     poses: List[PoseRecord],
     images_uint8: List[np.ndarray],
     sonar_cfg: SonarConfig,
-    sphere_center: np.ndarray,
-    sphere_radius: float,
+    shape: str,
+    geometry: Dict[str, object],
     threshold: float,
     mask_top_rows: int,
 ) -> Dict:
     all_pixel_errors = []
-    all_radial_residuals = []
+    all_surface_residuals = []
     all_points = []
     has_nan_inf = False
 
@@ -606,59 +852,98 @@ def run_backward_projection_gate(
         proj_rows, proj_cols = project_points_to_source_pixels(points_world, camera_stub, sonar_cfg, scale_factor=1.0)
         pixel_err = np.sqrt((proj_rows - src_rows) ** 2 + (proj_cols - src_cols) ** 2)
 
-        radial = np.abs(np.linalg.norm(points_world - sphere_center[None, :], axis=1) - sphere_radius)
+        if shape == "sphere":
+            sphere_center = geometry_vec3(geometry, "sphere_center_m")
+            sphere_radius = geometry_scalar(geometry, "sphere_radius_m")
+            residual = np.abs(np.linalg.norm(points_world - sphere_center[None, :], axis=1) - sphere_radius)
+        elif shape == "cube":
+            cube_center = geometry_vec3(geometry, "cube_center_m")
+            cube_half_extent = geometry_scalar(geometry, "cube_half_extent_m")
+            residual = np.abs(cube_signed_distance(points_world, cube_center, cube_half_extent))
+        else:
+            raise ValueError(f"Unsupported shape in consistency gate: {shape}")
 
         all_pixel_errors.append(pixel_err)
-        all_radial_residuals.append(radial)
+        all_surface_residuals.append(residual)
         all_points.append(points_world)
 
-        if (not np.isfinite(points_world).all()) or (not np.isfinite(pixel_err).all()) or (not np.isfinite(radial).all()):
+        if (not np.isfinite(points_world).all()) or (not np.isfinite(pixel_err).all()) or (not np.isfinite(residual).all()):
             has_nan_inf = True
 
     if all_pixel_errors:
         pixel_errors = np.concatenate(all_pixel_errors, axis=0)
-        radial_residuals = np.concatenate(all_radial_residuals, axis=0)
+        surface_residuals = np.concatenate(all_surface_residuals, axis=0)
         recovered_points = np.concatenate(all_points, axis=0)
     else:
         pixel_errors = np.zeros((0,), dtype=np.float64)
-        radial_residuals = np.zeros((0,), dtype=np.float64)
+        surface_residuals = np.zeros((0,), dtype=np.float64)
         recovered_points = np.zeros((0, 3), dtype=np.float64)
 
-    fitted = fit_sphere_least_squares(recovered_points)
-    if fitted is None:
-        fitted_center = None
-        fitted_radius = None
-        fitted_center_error = float("inf")
-        fitted_radius_error = float("inf")
+    if shape == "sphere":
+        gt_center = geometry_vec3(geometry, "sphere_center_m")
+        gt_radius = geometry_scalar(geometry, "sphere_radius_m")
+        fitted = fit_sphere_least_squares(recovered_points)
+        if fitted is None:
+            fitted_center = None
+            fitted_size = None
+            fitted_center_error = float("inf")
+            fitted_size_error = float("inf")
+        else:
+            fitted_center, fitted_radius = fitted
+            fitted_size = float(fitted_radius)
+            fitted_center_error = float(np.linalg.norm(fitted_center - gt_center))
+            fitted_size_error = float(abs(fitted_radius - gt_radius))
+        residual_key = "radial"
     else:
-        fitted_center, fitted_radius = fitted
-        fitted_center_error = float(np.linalg.norm(fitted_center - sphere_center))
-        fitted_radius_error = float(abs(fitted_radius - sphere_radius))
+        gt_center = geometry_vec3(geometry, "cube_center_m")
+        gt_half_extent = geometry_scalar(geometry, "cube_half_extent_m")
+        fitted_center = fit_cube_center_median(recovered_points)
+        if fitted_center is None:
+            fitted_size = None
+            fitted_center_error = float("inf")
+            fitted_size_error = float("inf")
+        else:
+            centered = np.abs(recovered_points - fitted_center[None, :])
+            estimated_extent = float(np.percentile(np.max(centered, axis=1), 90.0))
+            fitted_size = estimated_extent
+            fitted_center_error = float(np.linalg.norm(fitted_center - gt_center))
+            fitted_size_error = float(abs(estimated_extent - gt_half_extent))
+        residual_key = "surface"
 
     gate = {
+        "shape": shape,
         "num_recovered_points": int(recovered_points.shape[0]),
         "nan_inf_found": bool(has_nan_inf),
         "median_pixel_error": float(np.median(pixel_errors)) if pixel_errors.size > 0 else float("inf"),
-        "mean_radial_residual_m": float(np.mean(radial_residuals)) if radial_residuals.size > 0 else float("inf"),
-        "p95_radial_residual_m": float(np.percentile(radial_residuals, 95.0)) if radial_residuals.size > 0 else float("inf"),
+        f"mean_{residual_key}_residual_m": float(np.mean(surface_residuals)) if surface_residuals.size > 0 else float("inf"),
+        f"p95_{residual_key}_residual_m": float(np.percentile(surface_residuals, 95.0)) if surface_residuals.size > 0 else float("inf"),
         "fitted_center_m": fitted_center.tolist() if fitted_center is not None else None,
-        "fitted_radius_m": float(fitted_radius) if fitted_radius is not None else None,
+        "fitted_size_m": fitted_size,
         "fitted_center_error_m": fitted_center_error,
-        "fitted_radius_error_m": fitted_radius_error,
+        "fitted_size_error_m": fitted_size_error,
         "criteria": {
             "median_pixel_error_le": 1.0,
-            "mean_radial_residual_m_le": 0.15,
-            "p95_radial_residual_m_le": 0.30,
+            f"mean_{residual_key}_residual_m_le": 0.15,
+            f"p95_{residual_key}_residual_m_le": 0.30,
             "fitted_center_error_m_le": 0.10,
         },
     }
 
+    if shape == "sphere":
+        gate["fitted_radius_m"] = fitted_size
+        gate["fitted_radius_error_m"] = fitted_size_error
+    else:
+        gate["fitted_half_extent_m"] = fitted_size
+        gate["fitted_half_extent_error_m"] = fitted_size_error
+
+    criteria = gate["criteria"]
+
     gate["pass"] = (
         (not gate["nan_inf_found"])
-        and gate["median_pixel_error"] <= gate["criteria"]["median_pixel_error_le"]
-        and gate["mean_radial_residual_m"] <= gate["criteria"]["mean_radial_residual_m_le"]
-        and gate["p95_radial_residual_m"] <= gate["criteria"]["p95_radial_residual_m_le"]
-        and gate["fitted_center_error_m"] <= gate["criteria"]["fitted_center_error_m_le"]
+        and gate["median_pixel_error"] <= criteria["median_pixel_error_le"]
+        and gate[f"mean_{residual_key}_residual_m"] <= criteria[f"mean_{residual_key}_residual_m_le"]
+        and gate[f"p95_{residual_key}_residual_m"] <= criteria[f"p95_{residual_key}_residual_m_le"]
+        and gate["fitted_center_error_m"] <= criteria["fitted_center_error_m_le"]
     )
 
     write_manifest(dataset_root / "consistency_gate.json", gate)
@@ -689,14 +974,40 @@ def write_dataset(
 
     write_images_txt(sparse_dir / "images.txt", poses)
 
+    shape = variant_shape(args.variant)
     points_rng = np.random.default_rng(seeds["points3d"])
-    sphere_points = sample_sphere_points(
-        center=np.asarray(args.sphere_center, dtype=np.float64),
-        radius=float(args.sphere_radius),
-        count=int(args.points3d_count),
-        rng=points_rng,
-    )
-    write_points3d_txt(sparse_dir / "points3D.txt", sphere_points)
+    if shape == "sphere":
+        geom_points = sample_sphere_points(
+            center=np.asarray(args.sphere_center, dtype=np.float64),
+            radius=float(args.sphere_radius),
+            count=int(args.points3d_count),
+            rng=points_rng,
+        )
+        geometry = {
+            "shape": "sphere",
+            "sphere_center_m": [float(x) for x in args.sphere_center],
+            "sphere_radius_m": float(args.sphere_radius),
+        }
+        dataset_id = "synthetic_sphere_A"
+        target_name = "sphere"
+        intersection_policy = "nearest positive sphere root only"
+    else:
+        geom_points = sample_cube_surface_points(
+            center=np.asarray(args.cube_center, dtype=np.float64),
+            half_extent=float(args.cube_half_extent),
+            count=int(args.points3d_count),
+            rng=points_rng,
+        )
+        geometry = {
+            "shape": "cube",
+            "cube_center_m": [float(x) for x in args.cube_center],
+            "cube_half_extent_m": float(args.cube_half_extent),
+        }
+        dataset_id = "synthetic_cube_C"
+        target_name = "cube"
+        intersection_policy = "nearest positive axis-aligned cube slab hit only"
+
+    write_points3d_txt(sparse_dir / "points3D.txt", geom_points)
 
     generated_utc = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
     T_c2s = get_camera_to_sonar_transform(device="cpu").detach().cpu().numpy().astype(np.float64)
@@ -714,16 +1025,16 @@ def write_dataset(
         )
         pose_export_contract = "images.txt stores sonar-equivalent poses (legacy compatibility mode)"
 
+    pose_policy = resolve_pose_policy(args)
+    pose_bands_deg = parse_pose_bands_deg(args.pose_bands_deg)
+
     manifest = {
-        "dataset_id": "synthetic_sphere_A",
+        "dataset_id": dataset_id,
         "variant": args.variant,
         "generator_version": SCRIPT_VERSION,
         "generated_utc": generated_utc,
         "layout_contract": "COLMAP text sparse/0 + sonar/*.png (R2-compatible)",
-        "geometry": {
-            "sphere_center_m": [float(x) for x in args.sphere_center],
-            "sphere_radius_m": float(args.sphere_radius),
-        },
+        "geometry": geometry,
         "sonar_model": {
             "image_width": int(args.image_width),
             "image_height": int(args.image_height),
@@ -737,20 +1048,22 @@ def write_dataset(
             "orbit_radius_m": float(args.orbit_radius),
             "azimuth_coverage_deg": 360.0,
             "elevation_sweep_deg": [float(args.elevation_min_deg), float(args.elevation_max_deg)],
+            "pose_policy": pose_policy,
+            "pose_bands_deg": [float(x) for x in pose_bands_deg.tolist()],
             "translation_jitter_sigma_m": float(args.translation_jitter_sigma),
             "rotation_jitter_sigma_deg": float(args.rotation_jitter_sigma_deg),
-            "orientation_policy": "look-at sphere center + rotation jitter",
+            "orientation_policy": f"look-at {target_name} center + rotation jitter",
             "pose_mode": args.pose_mode,
             "pose_export_contract": pose_export_contract,
         },
         "simulation": {
             "elevation_samples": int(args.elevation_samples),
-            "intersection_policy": "nearest positive sphere root only",
+            "intersection_policy": intersection_policy,
             "intensity_model": "binary hit accumulation per elevation sample",
             "normalization": "img_float = hit_count / elevation_samples",
         },
         "noise_model": {
-            "enabled": bool(args.variant == "A_noisy"),
+            "enabled": bool(variant_is_noisy(args.variant)),
             "speckle_sigma": float(args.noise_speckle_sigma),
             "dropout_prob": float(args.noise_dropout_prob),
         },
@@ -848,15 +1161,27 @@ def main() -> None:
 
     print("[3/6] Rendering sonar frames")
     images_uint8: List[np.ndarray] = []
-    sphere_center = np.asarray(args.sphere_center, dtype=np.float64)
+    shape = variant_shape(args.variant)
+    geometry: Dict[str, object]
+    if shape == "sphere":
+        geometry = {
+            "sphere_center_m": [float(x) for x in args.sphere_center],
+            "sphere_radius_m": float(args.sphere_radius),
+        }
+    else:
+        geometry = {
+            "cube_center_m": [float(x) for x in args.cube_center],
+            "cube_half_extent_m": float(args.cube_half_extent),
+        }
+
     for idx, pose in enumerate(poses):
         img_float = render_sonar_frame(
             pose=pose,
             dirs_s_flat=dirs_s_flat,
             col_idx_flat=col_idx_flat,
             sonar_cfg=sonar_cfg,
-            sphere_center=sphere_center,
-            sphere_radius=float(args.sphere_radius),
+            shape=shape,
+            geometry=geometry,
             elev_samples=int(args.elevation_samples),
         )
         img_float = apply_noise_if_needed(
@@ -891,17 +1216,18 @@ def main() -> None:
             poses=poses,
             images_uint8=images_uint8,
             sonar_cfg=sonar_cfg,
-            sphere_center=sphere_center,
-            sphere_radius=float(args.sphere_radius),
+            shape=shape,
+            geometry=geometry,
             threshold=float(args.gate_intensity_threshold),
             mask_top_rows=int(args.gate_mask_top_rows),
         )
+        residual_key = "radial" if shape == "sphere" else "surface"
         print(
             "  gate: "
             f"pass={gate_result['pass']}, "
             f"median_px={gate_result['median_pixel_error']:.4f}, "
-            f"mean_res={gate_result['mean_radial_residual_m']:.4f}m, "
-            f"p95_res={gate_result['p95_radial_residual_m']:.4f}m"
+            f"mean_res={gate_result[f'mean_{residual_key}_residual_m']:.4f}m, "
+            f"p95_res={gate_result[f'p95_{residual_key}_residual_m']:.4f}m"
         )
 
         manifest_path = args.output_dir / "manifest.json"
@@ -924,8 +1250,9 @@ def main() -> None:
     print("Done.")
     print(f"Dataset root: {args.output_dir}")
     print("Expected debug command:")
+    dataset_key = "synthetic_a_clean" if shape == "sphere" else "synthetic_c_clean"
     print(
-        "SONAR_DATASET=synthetic_a_clean "
+        f"SONAR_DATASET={dataset_key} "
         "SONAR_DATASET_PATH="
         f"{args.output_dir} "
         "SONAR_INIT_SCALE_FACTOR=1.0 "

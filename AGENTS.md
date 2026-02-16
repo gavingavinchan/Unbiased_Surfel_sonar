@@ -13,6 +13,12 @@ This is **Unbiased Surfel** extended with **sonar imaging support** for underwat
 
 **Current Focus**: Development is centered on `debug_multiframe.py` (multi-frame sonar training) and `scripts/poisson_tuner_gui.py` (mesh tuning GUI). Other modules are not a priority unless they affect these.
 
+## Synthetic Dataset Program
+
+- Synthetic dataset workflows are actively used for validation and regression gating.
+- Do not treat this file as the source of truth for exact synthetic dataset names; the dataset set changes over time.
+- For the current synthetic dataset inventory, generation/evaluation commands, and gate workflow/status, use `docs/SYNTHETIC_DATASET_GUIDE.md`.
+
 ## Development Commands
 
 ### Environment Setup
@@ -243,6 +249,7 @@ Used by `debug_multiframe.py` and the GUI. Defaults change often; check the scri
 - Plans guide: `plans/README.md` (plan format and naming)
 - Snapshots: `snapshots/` (SNAPSHOT_* files; current-state notes meant to reduce repeated forensics)
 - Snapshots guide: `snapshots/README.md` (snapshot format and naming)
+- Synthetic datasets: `docs/SYNTHETIC_DATASET_GUIDE.md` (current dataset inventory + workflows)
 - Reference docs: `docs/` (DATASET_PREPARATION.md, R2_DATASET_ISSUES.md, unbiased_surfel_installation_notes.md)
 - Archived docs: `docs/old/` (superseded by plans/)
 

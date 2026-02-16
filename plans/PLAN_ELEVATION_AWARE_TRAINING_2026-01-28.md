@@ -1280,3 +1280,38 @@ Status note: Option 3 content is partially adopted as optional Stage 2 densifica
 
 Implementation contract remains the detailed plan file:
 `plans/PLAN_ELEVATION_AWARE_TRAINING_detailed_2026-02-01.md`.
+
+---
+
+## Decision Update (2026-02-16): Synthetic Dataset C (Cube in Vacuum) Validation Track
+
+- Add a cube-in-vacuum synthetic benchmark track aligned with the synthetic dataset roadmap, using Dataset A-style acceptance gates.
+- Purpose: test elevation-aware training behavior on planar faces, edges, and corners without background clutter.
+
+### Policy
+
+- Keep Dataset C operational flow parallel to Dataset A:
+  - deterministic dataset generation,
+  - multi-band pose coverage (multiple elevation bands and/or random-shell viewpoints) to avoid single-orbit equatorial bias seen in Dataset A,
+  - backward-projection consistency gate,
+  - end-to-end `debug_multiframe.py` run(s),
+  - quantitative geometry evaluator,
+  - fixed-seed repeatability check.
+- Keep synthetic-clean defaults consistent with Dataset A unless explicitly ablated (same sonar defaults, pose policy family, and synthetic scale-freeze behavior).
+
+### Initial acceptance criteria (A-analog)
+
+- `debug_multiframe.py` runs end-to-end without special-case code edits.
+- Reconstruction is visually cube-like (flat faces and corners) with correct center.
+- Quantitative thresholds (cube-surface residual analog):
+  - mean surface distance <= `0.05 m`,
+  - p95 surface distance <= `0.10 m`,
+  - center error <= `0.03 m`.
+- Repeat run with the same seed yields near-identical metrics.
+
+### Role in elevation-aware development
+
+- Treat Dataset A + Dataset C as a paired synthetic sanity ladder:
+  - A validates baseline geometric consistency on smooth curved geometry,
+  - C validates non-spherical shape handling and edge/corner behavior.
+- If A passes but C fails, prioritize edge/corner and coupling diagnostics before expanding to background-mixed synthetic datasets.
