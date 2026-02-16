@@ -165,6 +165,11 @@ Dataset C is considered successful when all are true:
 - `debug_multiframe_synth_c_exp2`: learnable opacity ablation + longer budget; still fails (`mean=0.089113`, `p95=0.230656`).
 - `debug_multiframe_synth_c_exp3`: very long training run (`Stage2=10000`, `Stage3=1000`) evaluated at `output/debug_multiframe_synth_c_exp3/eval_surfel/cube_eval.json`; still fails (`mean=0.085379`, `p95=0.208353`, `center=0.006545`).
 - Combined readout across gate/experiments: best mean is exp1 (`0.085301`) and best p95 is exp3 (`0.208353`), both still far from acceptance thresholds (`<=0.05`, `<=0.10`).
+- Manual visual observation recorded for exp3 (`output/debug_multiframe_synth_c_exp3`):
+  - `input.ply` remains cube-like (matches expected initial geometry),
+  - `surfels_after_training.ply` shows many streak/line structures roughly parallel to the revolution axis,
+  - aggregate shape appears torus-like,
+  - streak lengths appear bounded by sonar-pose FOV support.
 
 ### Working Hypothesis for Next Session
 

@@ -123,6 +123,14 @@ Scope extension (2026-02-16): Dataset C (cube in vacuum) was added with the same
 - `output/debug_multiframe_synth_c_exp3`: much longer stage budget (`Stage2=10000`, `Stage3=1000`) with attenuation off + zero elevation init.
   - Eval: `mean=0.085379 m`, `p95=0.208353 m`, `center=0.006545 m`, `overall_pass=false`.
 
+### Manual Visual Observation (exp3 .ply artifacts)
+
+- Observation source: user review of `output/debug_multiframe_synth_c_exp3/input.ply` and `output/debug_multiframe_synth_c_exp3/surfels_after_training.ply`.
+- `input.ply` appears consistent with the original cube geometry.
+- `surfels_after_training.ply` exhibits many elongated streaks/lines approximately parallel to the axis of revolution; collectively these streaks look torus-like.
+- Streak extents appear bounded by sonar-pose FOV support, consistent with an in-FOV ambiguity manifold rather than true cube-face convergence.
+- This visual finding is consistent with quantitative failure (`mean/p95` still high) and is treated as a key qualitative blocker signal for Chunk-2-only behavior.
+
 ### Experiment Comparison (Gate vs Post-Gate)
 
 - Canonical gate baseline (`run1`): `mean=0.090046 m`, `p95=0.233642 m`, `center=0.010489 m`.

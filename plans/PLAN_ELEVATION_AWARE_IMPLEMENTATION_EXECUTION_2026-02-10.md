@@ -1,7 +1,7 @@
 # Plan: Elevation-Aware Training Implementation Execution
 
 **Date:** 2026-02-10  
-**Status:** Ready to implement  
+**Status:** Chunk 1/2 implemented; Chunk 3/4/5 pending with synthetic-gated validation updates  
 **Owner:** OpenCode (gpt-5.3-codex)
 
 ---
@@ -24,6 +24,14 @@ This execution plan answers:
 ## Implementation Strategy
 
 Do **not** implement everything in one pass. Implement in risk-ordered chunks with validation gates between chunks.
+
+### Current implementation state (2026-02-16)
+
+- Chunk 1 is implemented and validated.
+- Chunk 2 is implemented and validated.
+- Remaining scope is Chunk 3, Chunk 4, and Chunk 5.
+- Dataset-C synthetic results indicate a likely Chunk-2 quality ceiling for cube-like shape recovery, so future chunks must include explicit synthetic dataset validation in their gates.
+- Recorded qualitative baseline artifact (exp3): `output/debug_multiframe_synth_c_exp3/input.ply` is cube-like, while `output/debug_multiframe_synth_c_exp3/surfels_after_training.ply` shows FOV-bounded torus-like streaking aligned with the revolution axis.
 
 ### Why chunked delivery
 
@@ -71,6 +79,7 @@ Scope:
 Goal:
 
 - Get the belief layer stable first (without coupling added yet).
+- Prove the likelihood layer is numerically stable on both real and synthetic validation runs.
 
 ### Chunk 4: Belief-to-geometry enforcement
 
@@ -83,6 +92,7 @@ Scope:
 Goal:
 
 - Ensure improved elevation belief actually moves geometry and improves surfel retention quality.
+- Specifically target geometry-smearing failure modes seen in synthetic cube-style reconstructions.
 
 ### Chunk 5: Late-stage refinements
 
@@ -94,12 +104,23 @@ Scope:
 Goal:
 
 - Add late stability/quality improvements without destabilizing core training.
+- Preserve or improve synthetic-gate behavior while adding late refinements.
 
 ---
 
 ## Validation Gates Between Chunks (Mandatory)
 
 Each chunk must pass its gate before moving to the next chunk.
+
+### Synthetic validation policy for remaining chunks
+
+- For Chunk 3/4/5 gates, synthetic dataset validation is mandatory in addition to legacy real-data checks.
+- Do not hardcode synthetic dataset names in this plan; use the active inventory and commands documented in `docs/SYNTHETIC_DATASET_GUIDE.md`.
+- For every synthetic run used in a gate, record:
+  - command/config,
+  - output artifact paths,
+  - evaluator metrics,
+  - delta versus the most recent known baseline.
 
 ### Gate after Chunk 1
 
@@ -123,6 +144,8 @@ Each chunk must pass its gate before moving to the next chunk.
 - `loss_lik` / entropy terms are finite (no NaN/Inf).
 - Invalid projection handling is neutral (not over-penalizing).
 - Entropy trend is directionally decreasing over short horizon.
+- Synthetic gate smoke run(s) from `docs/SYNTHETIC_DATASET_GUIDE.md` complete end-to-end (generator/gate runner and/or training+evaluator path as appropriate).
+- Synthetic evaluator metrics are finite and do not regress materially versus Chunk-2 baselines (any regressions must be explained and approved before continuing).
 
 ### Gate after Chunk 4
 
@@ -130,12 +153,17 @@ Each chunk must pass its gate before moving to the next chunk.
 - Coupling match rate and residual metrics are sensible.
 - ID integrity checks pass across topology changes (no support-state drift).
 - Support/pruning behavior follows configured warmup and thresholds.
+- Synthetic validation includes shape-diversity checks from the active synthetic inventory (for example smooth-shape and edge/corner-shape representatives listed in `docs/SYNTHETIC_DATASET_GUIDE.md`).
+- Synthetic geometry artifacts associated with Chunk-2 limitations (streaking/toroidal smearing under in-FOV ambiguity) are explicitly reviewed and reported as improved/unchanged/regressed.
+- Quantitative synthetic metrics show directional improvement from Chunk-2 baselines for at least the known-problem shape class, or a documented blocker is recorded before proceeding.
 
 ### Gate after Chunk 5
 
 - Normals ramp activates on configured iterations.
 - Expected-elevation normals path does not destabilize training.
 - Optional Stage 2 hook can be toggled on/off safely (off by default).
+- Full synthetic gate rerun(s) from `docs/SYNTHETIC_DATASET_GUIDE.md` pass stability/reproducibility checks used for the synthetic program.
+- Synthetic metric deltas versus post-Chunk-4 baseline are recorded; late refinements must not reintroduce previously mitigated geometric artifacts.
 
 ### Resume gate after every chunk
 
@@ -143,6 +171,7 @@ Each chunk must pass its gate before moving to the next chunk.
 - Reload checkpoint.
 - Continue training for a short continuation window.
 - Confirm no state-contract breakage (`pixel_logits`, `optim_elev`, support buffers, surfel IDs).
+- Include at least one synthetic continuation check (resume on a synthetic-config run) for Chunk 3/4/5.
 
 ### Manual visual test policy
 
@@ -216,3 +245,4 @@ These tactics define engineering style and rollout behavior for this plan. They 
 - Prefer small, repeatable short runs for gates (fixed seed, reduced per-iter load).
 - Treat mesh quality as the primary success criterion; scalar losses are supporting diagnostics.
 - Before starting each chunk, create a short chunk-specific implementation plan and save it as a markdown file in `plans/` (one file per chunk) so intent and scope are explicit before coding.
+- For future subsidiary plans (Chunk 3+), include a dedicated synthetic test matrix section that references `docs/SYNTHETIC_DATASET_GUIDE.md` for active datasets and defines run commands, artifacts, baselines, and pass/fail criteria for that chunk.
