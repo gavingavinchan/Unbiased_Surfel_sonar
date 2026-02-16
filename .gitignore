@@ -165,6 +165,7 @@ checkpoints/
 # Datasets (common patterns)
 data/
 datasets/
+synthetic_datasets/
 *.tar
 *.tar.gz
 *.zip

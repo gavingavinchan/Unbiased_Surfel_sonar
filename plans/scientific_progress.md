@@ -338,3 +338,38 @@ With $k=3$, $S_{\ge3}\approx 0.044$, showing shallow multi-view reinforcement.
   - Chunk 3: overlap-aware frame sampling + bin-likelihood evidence,
   - Chunk 4: belief-to-geometry coupling and ID-keyed support retention/pruning.
 - Therefore, Chunk 2 metrics above are treated as baseline comparators, not final quality targets.
+
+## 14. Synthetic Dataset A Program Update (2026-02-15 to 2026-02-16)
+
+We added a controlled synthetic sonar benchmark path to isolate geometry/projection correctness from real-data noise.
+
+### 14.1 Dataset-A acceptance gate
+
+The automated gate is evaluated as:
+$$
+G_A = G_{\mathrm{consistency}} \wedge G_{\mathrm{run1}} \wedge G_{\mathrm{run2}} \wedge G_{\mathrm{drift}}
+$$
+where:
+- $G_{\mathrm{consistency}}$ checks backward-projection sanity (pixel round-trip and radial residual thresholds),
+- $G_{\mathrm{run1}}, G_{\mathrm{run2}}$ check sphere residual/center thresholds on two independent training runs,
+- $G_{\mathrm{drift}}$ checks repeatability deltas against fixed tolerances.
+
+In canonical mode (`sonar_equivalent`), the latest full-quality gate passes with low radial error and near-zero run-to-run drift.
+
+### 14.2 Pose-mode policy
+
+For acceptance, we use sonar-pose contract mode:
+$$
+\mathbf{T}_{w\rightarrow c}^{\mathrm{export}} = \mathbf{T}_{w\rightarrow s}
+$$
+This matches current debug training behavior and avoids introducing extrinsic-path mismatch into the baseline gate.
+
+An optional diagnostic mode is also implemented:
+$$
+\mathbf{T}_{w\rightarrow c}^{\mathrm{export}} = \mathbf{T}_{w\rightarrow s}\,\mathbf{T}_{s\rightarrow c}
+$$
+to stress-test camera-to-sonar extrinsic handling when that path is explicitly under test.
+
+### 14.3 Open geometric coverage limitation
+
+Current synthetic pose sampling is predominantly a single rough orbit, so observed views concentrate near an equatorial band. This can bias initialized surfel centers toward a cylindrical shell rather than uniformly covering spherical latitude. Planned mitigation is multi-orbit/random-shell viewpoint sampling with bounded radius and center-looking orientation constraints.

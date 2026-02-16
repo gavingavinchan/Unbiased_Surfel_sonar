@@ -1042,20 +1042,53 @@ torch.cuda.manual_seed_all(SEED)
 # =============================================================================
 # Configuration
 # =============================================================================
+SYNTHETIC_DATASET_KEYS = {"synthetic_a_clean"}
+DEFAULT_SYNTHETIC_A_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "synthetic_datasets",
+    "synthetic_sphere_A_clean",
+)
+
 DATASET_PATHS = {
     "legacy": "/home/gavin/ros2_ws/outputs/session_2025-12-08_16-35-13_sonar_data_for_2dgs",
     "r2": "/home/gavin/ros2_ws/outputs/session_2025-12-08_16-35-13_sonar_data_for_2dgs_R2",
+    "synthetic_a_clean": DEFAULT_SYNTHETIC_A_PATH,
 }
-DATASET_KEY = os.environ.get("SONAR_DATASET", "r2")
-if DATASET_KEY not in DATASET_PATHS:
-    raise ValueError(f"Unknown dataset key '{DATASET_KEY}'. Options: {list(DATASET_PATHS)}")
-DATASET_PATH = DATASET_PATHS[DATASET_KEY]
+
+DATASET_KEY = os.environ.get("SONAR_DATASET", "r2").strip().lower()
+DATASET_PATH_OVERRIDE = os.environ.get("SONAR_DATASET_PATH", "").strip()
+
+if DATASET_PATH_OVERRIDE:
+    DATASET_PATH = os.path.abspath(os.path.expanduser(DATASET_PATH_OVERRIDE))
+    if DATASET_KEY not in DATASET_PATHS:
+        print(
+            f"[Config] SONAR_DATASET_PATH override is set; allowing custom dataset key '{DATASET_KEY}' "
+            f"with path '{DATASET_PATH}'"
+        )
+else:
+    if DATASET_KEY not in DATASET_PATHS:
+        raise ValueError(f"Unknown dataset key '{DATASET_KEY}'. Options: {list(DATASET_PATHS)}")
+    DATASET_PATH = DATASET_PATHS[DATASET_KEY]
 
 INIT_SCALE_FACTORS = {
     "legacy": 0.65,
     "r2": 0.6127,
+    "synthetic_a_clean": 1.0,
 }
-INIT_SCALE_FACTOR = INIT_SCALE_FACTORS[DATASET_KEY]
+
+is_synthetic_key = DATASET_KEY in SYNTHETIC_DATASET_KEYS or DATASET_KEY.startswith("synthetic")
+is_synthetic_path = "synthetic" in os.path.basename(DATASET_PATH).lower()
+IS_SYNTHETIC_DATASET = is_synthetic_key or is_synthetic_path
+
+INIT_SCALE_FACTOR_DEFAULT = INIT_SCALE_FACTORS.get(
+    DATASET_KEY,
+    1.0 if IS_SYNTHETIC_DATASET else INIT_SCALE_FACTORS["r2"],
+)
+init_scale_override = os.environ.get("SONAR_INIT_SCALE_FACTOR", "").strip()
+if init_scale_override:
+    INIT_SCALE_FACTOR = float(init_scale_override)
+else:
+    INIT_SCALE_FACTOR = INIT_SCALE_FACTOR_DEFAULT
 
 OUTPUT_DIR_BASE = f"./output/debug_multiframe_{DATASET_KEY}"
 OUTPUT_DIR_OVERRIDE = os.environ.get("SONAR_OUTPUT_DIR")
@@ -1115,6 +1148,11 @@ STAGE2_ITERATIONS = env_int("SONAR_STAGE2_ITERS", STAGE2_ITERATIONS)
 STAGE3_ITERATIONS = env_int("SONAR_STAGE3_ITERS", STAGE3_ITERATIONS)
 NUM_TRAINING_FRAMES = env_int("SONAR_NUM_FRAMES", NUM_TRAINING_FRAMES_DEFAULT)
 SONAR_HOLDOUT_FRAMES = max(0, env_int("SONAR_HOLDOUT_FRAMES", 0))
+SONAR_FREEZE_SCALE = env_bool("SONAR_FREEZE_SCALE", IS_SYNTHETIC_DATASET)
+
+if SONAR_FREEZE_SCALE and STAGE1_ITERATIONS > 0:
+    print("[Config] SONAR_FREEZE_SCALE=1 -> forcing STAGE1_ITERATIONS=0")
+    STAGE1_ITERATIONS = 0
 
 SONAR_CONVENTION_ASSERTS = env_bool("SONAR_CONVENTION_ASSERTS", True)
 SONAR_USE_RANGE_ATTEN = env_bool("SONAR_USE_RANGE_ATTEN", True)
@@ -1181,7 +1219,11 @@ print("DEBUG: Multi-Frame Training with Curriculum Learning")
 print("=" * 60)
 print(f"Seed: {SEED}")
 print(f"Dataset: {DATASET_KEY} ({DATASET_PATH})")
+if DATASET_PATH_OVERRIDE:
+    print(f"Dataset path override: {DATASET_PATH_OVERRIDE}")
+print(f"Synthetic dataset mode: {IS_SYNTHETIC_DATASET}")
 print(f"Init scale: {INIT_SCALE_FACTOR}")
+print(f"Scale frozen: {SONAR_FREEZE_SCALE}")
 print(f"Num training frames: {NUM_TRAINING_FRAMES}")
 print(f"Holdout frames: {SONAR_HOLDOUT_FRAMES}")
 print(f"Curriculum: Stage1={STAGE1_ITERATIONS} (scale), Stage2={STAGE2_ITERATIONS} (surfels), Stage3={STAGE3_ITERATIONS} (joint)")
@@ -1635,6 +1677,14 @@ if SONAR_LOAD_CHECKPOINT:
     print(f"[Checkpoint] Loaded: {SONAR_LOAD_CHECKPOINT} (iter={resumed_iter})")
     if resume_meta:
         print(f"[Checkpoint] Metadata: {resume_meta}")
+
+if SONAR_FREEZE_SCALE:
+    with torch.no_grad():
+        sonar_scale_factor._log_scale.fill_(math.log(INIT_SCALE_FACTOR))
+    sonar_scale_factor._log_scale.requires_grad_(False)
+    for group in scale_optimizer.param_groups:
+        group["lr"] = 0.0
+    print(f"[Scale] Frozen at configured value: {sonar_scale_factor.get_scale_value():.6f}")
 
 opacity_policy_state = {"initialized": False, "fixed": False}
 
@@ -2205,9 +2255,11 @@ if SONAR_SAVE_CHECKPOINT:
         stage_name="final",
         metadata={
             "dataset_key": DATASET_KEY,
+            "dataset_path": DATASET_PATH,
             "seed": SEED,
             "elev_init_mode": ELEV_INIT_MODE,
             "sonar_fixed_opacity": int(SONAR_FIXED_OPACITY),
+            "sonar_freeze_scale": int(SONAR_FREEZE_SCALE),
             "stage1_iterations": STAGE1_ITERATIONS,
             "stage2_iterations": STAGE2_ITERATIONS,
             "stage3_iterations": STAGE3_ITERATIONS,

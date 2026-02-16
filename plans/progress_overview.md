@@ -351,3 +351,10 @@ flowchart TB
 - Manual tagged review confirmed weak overlap-critical behavior persists (notably frame2/frame3), while frame0 tends to dominate due to weak overlap.
 - Strategic pivot formalized in the Chunk 2 plan: stop trying to optimize overlap quality inside Chunk 2; carry overlap/coupling fixes into Chunk 3 (overlap/sampler/likelihood) and Chunk 4 (coupling/support pruning).
 - Non-blocking but tracked issues: intermittent `sys.unraisablehook` teardown warning and TSDF path frequently writing empty meshes in these sonar runs.
+
+## Recent Updates (2026-02-15 to 2026-02-16)
+- Implemented synthetic Dataset A tooling end-to-end: `scripts/generate_synthetic_sonar_dataset.py`, `scripts/eval_synthetic_sphere.py`, and one-command gate runner `scripts/run_synthetic_a_gate.py`.
+- Standardized canonical acceptance mode to sonar poses (`--pose-mode sonar_equivalent`), with camera-extrinsic mode retained as optional diagnostic only.
+- Full-quality Dataset A gate now passes in canonical mode with stable repeatability across two runs (consistency gate pass + eval threshold pass + drift pass).
+- Chunk-1/2 validation refresh completed after gate integration: init-only smoke pass, `ELEV_INIT_MODE=random` spread confirmed, `ELEV_INIT_MODE=zero` parity contract pass, fixed-opacity behavior confirmed, and save/load resume continuation pass.
+- Recorded a follow-up risk for later work: single-orbit pose sampling concentrates FOV near an equatorial band and can bias surfel centers toward a cylindrical shell; multi-orbit/random-shell sampling was added to plan backlog.

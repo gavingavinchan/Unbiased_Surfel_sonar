@@ -1,7 +1,7 @@
 # Plan: Synthetic Sonar Dataset Program (High-Level)
 
 **Date:** 2026-02-15  
-**Status:** Active planning (gpt-5.3-codex)
+**Status:** Dataset A implemented/validated; extrinsic-path and automation extensions added (gpt-5.3-codex)
 
 ---
 
@@ -68,6 +68,46 @@ Dataset A is considered successful when all are true:
 3. Integrate synthetic datasets into existing training entry points.
 4. Run A_clean and lock acceptance gate (defer A_noisy until clean passes).
 5. Expand to B, then D.
+6. Versioning policy: commit generators/manifests/eval scripts, but keep generated dataset binaries out of git.
+7. Dataset self-documentation policy: each generated dataset includes a human-readable settings file (markdown) plus machine-readable manifest.
+
+---
+
+## Current State (2026-02-15 Snapshot)
+
+### Implemented
+
+- Dataset A generator implemented: `scripts/generate_synthetic_sonar_dataset.py`
+  - Pose mode support added: `sonar_equivalent` and `camera_with_extrinsic`
+- Sphere evaluator implemented: `scripts/eval_synthetic_sphere.py`
+  - Fit mode support includes `both` (reports `least_squares` + `gt_trimmed`)
+- Synthetic integration in debug training implemented: `debug_multiframe.py`
+  - `SONAR_DATASET=synthetic_a_clean`
+  - `SONAR_DATASET_PATH` override
+  - synthetic default scale `1.0`
+  - synthetic default scale freeze enabled
+- One-command gate runner added: `scripts/run_synthetic_a_gate.py`
+- Guide added: `docs/SYNTHETIC_DATASET_GUIDE.md`
+- Dataset binaries excluded from git via `.gitignore` (`synthetic_datasets/`)
+
+### Validation Outcomes
+
+- Backward projection consistency gate passes on A_clean:
+  - median pixel error ~= 0
+  - mean radial residual ~= 0.0298 m
+  - p95 radial residual ~= 0.0689 m
+- `debug_multiframe.py` synthetic run completes end-to-end and keeps final scale fixed at `1.000000`.
+- Two repeated runs with same seed show near-identical metrics (tight drift).
+- Evaluator threshold pass achieved on final surfel cloud for both repeated runs.
+- `camera_with_extrinsic` pose mode smoke run passes consistency gate with low residuals and low fitted-center error.
+
+### Important Notes for Next Session
+
+- Synthetic images are intentionally written as 3-channel grayscale PNGs to match current SSIM/training channel expectations.
+- Evaluator default fit mode is `gt_trimmed` to make center estimation robust to sparse outlier surfels while still reporting full-cloud GT radial stats.
+- Canonical Dataset A acceptance gate uses sonar poses (`--pose-mode sonar_equivalent`).
+- Camera-to-sonar extrinsic path remains available as an optional diagnostic via `--pose-mode camera_with_extrinsic`.
+- Open follow-up: current training poses are mostly a single rough orbit, so FOV coverage concentrates in an equatorial band and can bias initialized surfel centers toward a cylindrical shell. Future pose sampling should add multi-orbit or random-shell viewpoints (within a bounded radius and still roughly looking at the object center).
 
 ---
 

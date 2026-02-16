@@ -1,7 +1,7 @@
 # Plan: Synthetic Sonar Dataset Program (Detailed Execution)
 
 **Date:** 2026-02-15  
-**Status:** Detailed implementation plan (gpt-5.3-codex)  
+**Status:** Implemented for Dataset A with validation artifacts and gate automation extensions (gpt-5.3-codex)  
 **Depends on:** `plans/PLAN_SYNTHETIC_DATASET_2026-02-15.md`
 
 ---
@@ -19,12 +19,85 @@ Datasets B and D are out of scope for initial implementation. `A_noisy` is also 
 
 ---
 
+## Implementation Snapshot (2026-02-15)
+
+### Code Delivered
+
+- Added: `scripts/generate_synthetic_sonar_dataset.py`
+- Added: `scripts/eval_synthetic_sphere.py`
+- Added: `scripts/run_synthetic_a_gate.py`
+- Updated: `debug_multiframe.py` (synthetic key/path + default frozen scale for synthetic)
+- Added: `docs/SYNTHETIC_DATASET_GUIDE.md`
+- Updated: `.gitignore` to ignore `synthetic_datasets/`
+- Updated: generator/evaluator contracts for extrinsic pose mode + dual-fit reporting
+
+### Step Status
+
+1. Step 1 (generator skeleton): **Done**
+2. Step 2 (pose synthesis + COLMAP export): **Done**
+3. Step 3 (elevation-integrated forward simulation): **Done**
+4. Step 3b (backward-projection consistency gate): **Done**
+5. Step 4 (debug training integration): **Done**
+6. Step 5 (quantitative evaluator): **Done**
+7. Step 6 (acceptance/repeatability runs): **Done for A_clean**
+8. Follow-up: extrinsic-aware generator mode + automated gate runner: **Done (smoke validated)**
+
+### Validation Artifacts and Metrics
+
+- Dataset root used:
+  - `synthetic_datasets/synthetic_sphere_A_clean`
+- Consistency gate artifact:
+  - `synthetic_datasets/synthetic_sphere_A_clean/consistency_gate.json`
+  - Result: `pass=true`, mean residual `0.0298 m`, p95 residual `0.0689 m`
+- Training run outputs:
+  - `output/debug_multiframe_synth_run1`
+  - `output/debug_multiframe_synth_run2`
+  - Both completed and report final scale `1.000000`
+- Evaluation outputs:
+  - `output/debug_multiframe_synth_run1/eval_surfel/sphere_eval.json`
+  - `output/debug_multiframe_synth_run2/eval_surfel/sphere_eval.json`
+  - Both pass thresholds (mean/p95/center)
+- Reproducibility checks:
+  - Repeated training metrics show negligible drift (loss/SSIM/radial/center)
+  - Re-generated dataset (same seed) produced identical COLMAP files, identical sonar image hashes, and identical gate outputs (except generation timestamp field)
+
+### Implementation Decisions Recorded
+
+1. Sonar image channel contract
+   - Generator writes sonar PNGs as 3-channel grayscale RGB.
+   - Reason: existing SSIM/loss path in training expects 3 channels.
+
+2. Sphere fit policy in evaluator
+   - Evaluator default fit mode is `gt_trimmed`.
+   - Reason: robust center estimate in presence of sparse outlier surfels; full-cloud GT radial metrics are still reported separately.
+
+3. Extrinsic-path coverage status
+   - Generator now supports both:
+     - `sonar_equivalent` (canonical Dataset A gate behavior; sonar-pose contract),
+     - `camera_with_extrinsic` (camera poses exported so runtime camera->sonar extrinsic path is exercised).
+   - `camera_with_extrinsic` smoke run passes consistency gate with low residuals and low fitted-center error.
+
+### Recommended Next Work
+
+1. Run full two-training-run acceptance gate using `scripts/run_synthetic_a_gate.py` in `sonar_equivalent` mode and archive summary artifacts.
+2. Keep `camera_with_extrinsic` as optional diagnostic only (not canonical acceptance gate).
+3. Start Dataset B (sphere + plane) only after freezing extrinsic diagnostic policy for CI-style checks.
+4. Improve pose diversity for later runs: avoid single-orbit-only sampling that over-concentrates FOV near the sphere equator and can produce cylindrical surfel-center distributions; add multi-orbit and random-shell viewpoints (bounded radius, still roughly center-looking).
+
+---
+
 ## In-Scope Files
 
 - New: `scripts/generate_synthetic_sonar_dataset.py`
 - New: `scripts/eval_synthetic_sphere.py`
 - Update: `debug_multiframe.py` (synthetic dataset path support)
 - Optional doc: `docs/SYNTHETIC_DATASET_GUIDE.md`
+
+### Version Control Policy
+
+- Commit generator/evaluation code, manifests, and plan/docs.
+- Do not commit generated sonar image datasets or other large binary dataset artifacts.
+- Reproducibility contract is code + manifest + seed, not binary snapshots in git.
 
 ---
 
@@ -58,6 +131,7 @@ Dataset root example:
 - `synthetic_sphere_A_clean/sparse/0/points3D.txt`
 - `synthetic_sphere_A_clean/sonar/sonar_000000.png`
 - `synthetic_sphere_A_clean/manifest.json`
+- `synthetic_sphere_A_clean/DATASET_SETTINGS.md`
 
 (`A_noisy` variant deferred until `A_clean` acceptance gate passes.)
 
@@ -77,6 +151,8 @@ Layout contract:
 - generation timestamp,
 - optional noise model settings.
 
+`DATASET_SETTINGS.md` must include a human-readable summary of the same generation settings (geometry, sonar params, pose policy, noise policy, seed, script version, and generation timestamp).
+
 ---
 
 ## Work Plan
@@ -88,10 +164,11 @@ Implement CLI in `scripts/generate_synthetic_sonar_dataset.py`:
 - inputs: output dir, frame count, seed, clean/noisy toggle,
 - deterministic RNG handling,
 - manifest writing,
+- dataset settings markdown (`DATASET_SETTINGS.md`) writing,
 - folder creation and COLMAP text writer stubs.
 
 Completion check:
-- script runs and writes valid folder tree + manifest.
+- script runs and writes valid folder tree + manifest + `DATASET_SETTINGS.md`.
 
 ### Step 2: Implement pose synthesis + COLMAP export
 
@@ -202,12 +279,13 @@ Gate criteria:
 ## Validation Checklist
 
 1. Generator reproducibility (same seed => same frames/manifests).
-2. Loader compatibility (`readColmapSceneInfo` in sonar mode).
-3. Backward projection consistency (Step 3b): round-trip pixel and residual sanity thresholds pass.
-4. Training smoke success on `A_clean`.
-5. Scale factor is frozen at 1.0 for synthetic runs in this phase.
-6. Evaluation artifact generation.
-7. Threshold gate pass.
+2. Generated dataset includes `DATASET_SETTINGS.md` and it matches `manifest.json` values.
+3. Loader compatibility (`readColmapSceneInfo` in sonar mode).
+4. Backward projection consistency (Step 3b): round-trip pixel and residual sanity thresholds pass.
+5. Training smoke success on `A_clean`.
+6. Scale factor is frozen at 1.0 for synthetic runs in this phase.
+7. Evaluation artifact generation.
+8. Threshold gate pass.
 
 ---
 
@@ -252,6 +330,7 @@ Sphere radius 1.0m at orbit radius 2.0m places the far surface at exactly 3.0m â
 
 - Synthetic Dataset A clean folder (noisy deferred).
 - Generator script with elevation-integrated forward model.
+- Per-dataset settings markdown (`DATASET_SETTINGS.md`) generated alongside `manifest.json`.
 - Sphere evaluation script.
 - `debug_multiframe.py` synthetic path integration.
 - Backward projection consistency gate artifacts (Step 3b).
