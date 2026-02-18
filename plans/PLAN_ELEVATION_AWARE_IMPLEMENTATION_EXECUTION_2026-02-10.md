@@ -19,6 +19,12 @@ This execution plan answers:
 2. Should tests be run between chunks? (**Yes, mandatory**)
 3. When should commits happen? (**At validated chunk boundaries**)
 
+Terminology/intent lock across subsidiary plans:
+
+- Wording drift is acceptable only when implementation intent is unchanged.
+- In particular, frame identity references (`frame index` vs `frame_key`) are non-material only when they preserve the same contract: stable per-frame identity, deterministic checkpoint keying, and deterministic resume mapping.
+- If wording drift changes behavior or makes intent ambiguous, stop and reconcile in this execution plan and the detailed plan before implementation.
+
 ---
 
 ## Implementation Strategy
@@ -39,6 +45,20 @@ Do **not** implement everything in one pass. Implement in risk-ordered chunks wi
 - Keeps each step runnable and debuggable.
 - Reduces risk of hidden regressions in a large refactor.
 - Allows mesh-quality checkpoints after each meaningful capability addition.
+
+### General execution note (user direction)
+
+- Implementation details are flexible as long as verification is strong, explicit, and reproducible.
+- For each chunk, publish the exact tests to be run (commands, expected checks, artifact paths) before gate review.
+- Synthetic datasets are the primary validation path for automated checks; manual visual review is supplementary and used only where automated metrics are insufficient.
+- Continue execution when plan reviews align across active reviewers (OpenCode + opus track); if a contract-level disagreement appears, record it and resolve before code changes proceed.
+
+### Development methodology (TDD requirement)
+
+- Use test-driven development for Chunk 3/4/5 work: define or update executable tests first, then implement code to satisfy those tests.
+- Each implementation task must map to at least one pre-declared verification item (unit/contract test, smoke test, synthetic gate check, or resume check).
+- Do not mark a chunk item complete until its mapped tests pass and artifacts are recorded.
+- When behavior changes, update tests and acceptance criteria in the same chunk plan before merging.
 
 ---
 
@@ -121,6 +141,9 @@ Each chunk must pass its gate before moving to the next chunk.
   - output artifact paths,
   - evaluator metrics,
   - delta versus the most recent known baseline.
+- Default material-regression rule for Chunk 3/4/5 synthetic gates:
+  - any relative degradation greater than `10%` versus the active baseline in key evaluator error metrics (`mean_*_error_m`, `p95_*_error_m`, `center_error_m`) is treated as material.
+  - material regression blocks progression unless an explicit written waiver (with rationale) is approved for the chunk.
 
 ### Gate after Chunk 1
 
@@ -145,7 +168,7 @@ Each chunk must pass its gate before moving to the next chunk.
 - Invalid projection handling is neutral (not over-penalizing).
 - Entropy trend is directionally decreasing over short horizon.
 - Synthetic gate smoke run(s) from `docs/SYNTHETIC_DATASET_GUIDE.md` complete end-to-end (generator/gate runner and/or training+evaluator path as appropriate).
-- Synthetic evaluator metrics are finite and do not regress materially versus Chunk-2 baselines (any regressions must be explained and approved before continuing).
+- Synthetic evaluator metrics are finite and satisfy the default material-regression rule versus Chunk-2 baselines (or a documented waiver is approved before continuing).
 
 ### Gate after Chunk 4
 
@@ -225,6 +248,7 @@ Before each commit, update:
 
 These tactics define engineering style and rollout behavior for this plan. They do not change the detailed plan scope; they reduce integration risk.
 
+- Use a TDD flow for each chunked feature: write or update failing tests/contracts first, implement the minimal code to pass, then refactor while keeping tests green.
 - Use a shadow-mode rollout first: compute Stage-1 likelihood/coupling paths and log diagnostics before adding them to `loss`; enable weights only after sanity checks pass.
 - Centralize config parsing in one typed runtime config object in `debug_multiframe.py`; avoid scattered `os.getenv` calls in deep helpers.
 - Keep all new behavior behind explicit gates (`ELEVATION_AWARE`, stage gates, feature flags) so baseline behavior is still reproducible.
