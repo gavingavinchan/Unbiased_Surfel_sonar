@@ -1,4 +1,6 @@
 import math
+import importlib.util
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -6,15 +8,27 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from utils.sonar_utils import (
-    SonarConfig,
-    back_project_bins,
-    run_sonar_convention_asserts,
-    sonar_frame_to_points,
-)
+REPO_ROOT = Path(__file__).resolve().parents[1]
+SONAR_UTILS_PATH = REPO_ROOT / "utils" / "sonar_utils.py"
 
 
-def _make_camera(*, image: torch.Tensor, translation=(0.0, 0.0, 0.0)):
+def _load_sonar_utils_module():
+    spec = importlib.util.spec_from_file_location("sonar_utils", SONAR_UTILS_PATH)
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+sonar_utils = _load_sonar_utils_module()
+SonarConfig = sonar_utils.SonarConfig
+back_project_bins = sonar_utils.back_project_bins
+run_sonar_convention_asserts = sonar_utils.run_sonar_convention_asserts
+sonar_frame_to_points = sonar_utils.sonar_frame_to_points
+
+
+def _make_camera(*, image, translation=(0.0, 0.0, 0.0)):
     w2v = torch.eye(4, dtype=torch.float32)
     w2v[3, :3] = torch.tensor(translation, dtype=torch.float32)
     return SimpleNamespace(
