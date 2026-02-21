@@ -30,7 +30,7 @@ print("extensions import OK")
 PY`
 6) If training fails with missing Python modules, do NOT install one-by-one.
    - Install the full pip set at once:
-     - `python -m pip install --upgrade open3d==0.18.0 mediapy==1.1.1 lpips==0.1.4 scikit-image==0.21.0 tqdm==4.66.2 trimesh==4.3.2 plyfile==1.0.3 opencv-python==4.10.0.84 matplotlib`
+     - `python -m pip install --upgrade open3d==0.18.0 mediapy==1.1.1 lpips==0.1.4 scikit-image==0.21.0 tqdm==4.66.2 trimesh==4.3.2 plyfile==1.0.3 opencv-python==4.10.0.84 pytest matplotlib`
 
 ### 1) Update the existing conda env
 - The `unbiased_surfel` env already existed, so it was updated with:
@@ -91,6 +91,8 @@ PY`
 - If `nvcc` already exists in the env and points to it, you can skip re-installing:
   - `which nvcc`
   - `nvcc --version`
+- For test tooling in this case, install via pip inside the env:
+  - `python -m pip install pytest`
 
 ## Current status
 - `diff_surfel_rasterization` and `simple_knn` are installed successfully.

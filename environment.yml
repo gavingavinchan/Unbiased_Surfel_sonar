@@ -24,5 +24,6 @@ dependencies:
     - trimesh==4.3.2
     - plyfile==1.0.3
     - opencv-python==4.10.0.84
+    - pytest==8.3.5
     - submodules/diff-surfel-rasterization
     - submodules/simple-knn
