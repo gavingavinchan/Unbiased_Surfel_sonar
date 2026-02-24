@@ -1,7 +1,7 @@
 # Plan: Elevation-Aware Chunk 3 Execution
 
 **Date:** 2026-02-16  
-**Status:** Approved for implementation (gpt-5.3-codex)  
+**Status:** Partially implemented; gate not closed (gpt-5.3-codex)  
 **Scope:** Chunk 3 only (Elevation Stage 1 likelihood core)
 
 ## Consensus Marker (Implementation Unlock)
@@ -10,6 +10,18 @@
 - Last reviewed date: `2026-02-18`
 - Approver(s): `user + OpenCode` (opus review incorporated via `scratchpad.md`)
 - Implementation unlocked: `yes`
+
+---
+
+## Implementation Snapshot (2026-02-23, code-verified)
+
+- Implemented in code (`debug_multiframe.py` + `utils/elevation_stage1_helpers.py`): `ELEV_STAGE1_MODE`, frame-key identity/uniqueness checks, active-frame fingerprint + schema resume checks, frame-keyed pixel-bank/logit registry, `optim_elev` ownership, refresh/remap controls, cache handoff tensors (`cached_loglik`, `cached_support_mask`, `p_post`), and Stage-1 checkpoint payload wiring.
+- Fast contract suite passes in conda env:
+  - `python -m py_compile debug_multiframe.py utils/elevation_stage1_helpers.py`
+  - `pytest tests/test_elevation_stage1_core_contracts.py tests/test_elevation_stage1_checkpoint_contracts.py tests/test_elevation_stage1_smoke_modes.py -q`
+  - current result: `37 passed`.
+- Remaining Chunk-3 parity gap (intent unchanged): Stage-1 likelihood in the training loop still uses an interim per-frame surrogate path and does not yet consume overlap-neighbor multi-view evidence via `back_project_bins` + projection-validity gating exactly as specified in the detailed plan.
+- Gate-close implication: Chunk 3 remains open until this parity gap is closed or explicitly waived with recorded rationale.
 
 ---
 
@@ -676,19 +688,19 @@ python scripts/eval_synthetic_cube.py \
 
 | Gate item | Required artifact path(s) | Status |
 |---|---|---|
-| Fast contract tests pass | `tests/test_elevation_stage1_core_contracts.py` output log; `tests/test_elevation_stage1_checkpoint_contracts.py` output log | pending |
-| Overlap-score formula fixture pass | `tests/test_elevation_stage1_core_contracts.py` (overlap score case output) | pending |
-| Smoke mode tests pass (`off|shadow|active`) | `tests/test_elevation_stage1_smoke_modes.py` output log | pending |
-| Shared vs decoupled post-temperature schedule pass | `tests/test_elevation_stage1_core_contracts.py` (temperature schedule case output) | pending |
-| Stage-1 numerics finite (`loss_lik`, `loss_ent`) | `output/.../loss_log.csv`; `output/.../run.log` | pending |
-| Posterior/cache interface present and finite | `output/.../run.log` (shape prints) or dedicated artifact notes | pending |
-| Chunk-2 diagnostics continuity preserved | `output/.../final_eval_train_frames.csv`; `output/.../support_metrics_train.csv`; `output/.../frame_training_visits.csv` | pending |
-| Synthetic S1/S2/S3/S4 completed | `output/.../*gate_summary.json`; `output/.../*gate_summary.md`; continuation run logs | pending |
-| Material-regression check passed (`<=10%` default) | baseline-delta note in chunk report; evaluator JSON deltas | pending |
-| Resume gate passed (real + synthetic continuation) | checkpoint file path(s); continuation `run.log`; short resume summary note | pending |
-| Schema/frame-set compatibility validated | checkpoint metadata dump or test log proving `checkpoint_schema_version` and `active_frame_fingerprint` handling | pending |
-| Refresh/remap contract validated | test log for refresh-enabled fixture (`nearest`/`reset`, remap distance reset, optimizer rebuild) | pending |
-| Docs updated for commit boundary | `plans/progress_overview.md`; `plans/scientific_progress.md` | pending |
+| Fast contract tests pass | `tests/test_elevation_stage1_core_contracts.py` output log; `tests/test_elevation_stage1_checkpoint_contracts.py` output log | done (`37 passed` total with smoke suite) |
+| Overlap-score formula fixture pass | `tests/test_elevation_stage1_core_contracts.py` (overlap score case output) | done |
+| Smoke mode tests pass (`off|shadow|active`) | `tests/test_elevation_stage1_smoke_modes.py` output log | done |
+| Shared vs decoupled post-temperature schedule pass | `tests/test_elevation_stage1_core_contracts.py` (temperature schedule case output) | done |
+| Stage-1 numerics finite (`loss_lik`, `loss_ent`) | `output/.../loss_log.csv`; `output/.../run.log` | done (see S1/S2/S3/S4 run logs and summaries) |
+| Posterior/cache interface present and finite | `output/.../run.log` (shape prints) or dedicated artifact notes | done |
+| Chunk-2 diagnostics continuity preserved | `output/.../final_eval_train_frames.csv`; `output/.../support_metrics_train.csv`; `output/.../frame_training_visits.csv` | done |
+| Synthetic S1/S2/S3/S4 completed | `output/.../*gate_summary.json`; `output/.../*gate_summary.md`; continuation run logs | done (S2/S4 threshold failures explicitly recorded) |
+| Material-regression check passed (`<=10%` default) | baseline-delta note in chunk report; evaluator JSON deltas | open (Dataset-C center metric regression; waiver/risk note active) |
+| Resume gate passed (real + synthetic continuation) | checkpoint file path(s); continuation `run.log`; short resume summary note | done |
+| Schema/frame-set compatibility validated | checkpoint metadata dump or test log proving `checkpoint_schema_version` and `active_frame_fingerprint` handling | done |
+| Refresh/remap contract validated | test log for refresh-enabled fixture (`nearest`/`reset`, remap distance reset, optimizer rebuild) | done |
+| Docs updated for commit boundary | `plans/progress_overview.md`; `plans/scientific_progress.md` | done (status updates recorded 2026-02-23) |
 
 ---
 

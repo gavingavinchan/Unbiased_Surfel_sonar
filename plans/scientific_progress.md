@@ -527,3 +527,23 @@ For apples-to-apples comparison with prior Chunk-2/Chunk-3 gate numbers, evaluat
 - `output/chunk3_seed_sweep_full/seed404_shadow/eval_surfel_surfels/cube_eval.json`
 
 This correction restores metric comparability for Chunk-3-to-Chunk-4 handoff tracking.
+
+### 16.7 Contract-parity status note (2026-02-23)
+
+Chunk-3 implementation status can be summarized as:
+
+$$
+\text{status}_{\text{Chunk3}} = \text{infrastructure complete} \land \text{core-likelihood parity pending}.
+$$
+
+Implemented and verified components include Stage-1 mode gating, frame-key/fingerprint/schema resume contracts, frame-keyed pixel-logit registry with optimizer ownership, refresh/remap controls, and checkpoint payload wiring.
+
+The remaining parity item is the Stage-1 likelihood core in the hot training loop: the current path is still an interim per-frame surrogate and has not yet been fully aligned to the overlap-neighbor, `back_project_bins`-driven multi-view evidence contract specified in the detailed plan.
+
+This note is status-only and does not change mathematical intent or acceptance criteria.
+
+Fast test evidence on current codebase:
+
+- `python -m py_compile debug_multiframe.py utils/elevation_stage1_helpers.py`
+- `pytest tests/test_elevation_stage1_core_contracts.py tests/test_elevation_stage1_checkpoint_contracts.py tests/test_elevation_stage1_smoke_modes.py -q`
+- Result: `37 passed`.

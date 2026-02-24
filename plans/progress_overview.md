@@ -371,6 +371,8 @@ flowchart TB
 - Added refresh/remap runtime wiring in Stage 2/3 (`ELEV_BANK_REFRESH_INTERVAL`, `ELEV_BANK_REMAP_MODE`, `ELEV_BANK_REMAP_MAX_DIST`) with deterministic `optim_elev` rebuild on shape changes.
 - Unified effective-mode logic to use helper contract (`resolve_effective_stage1_mode`) in config parsing.
 - Fast contract/smoke tests are green in conda env: core contracts (17), checkpoint contracts (10), smoke modes (10).
+- Status correction for Chunk 3: runtime infrastructure is implemented, but full detailed-plan Stage-1 parity is still open; current training-loop likelihood remains an interim per-frame surrogate and does not yet consume overlap-neighbor multi-view `back_project_bins` evidence end-to-end.
+- Re-verified on current codebase: `python -m py_compile debug_multiframe.py utils/elevation_stage1_helpers.py` and `pytest tests/test_elevation_stage1_core_contracts.py tests/test_elevation_stage1_checkpoint_contracts.py tests/test_elevation_stage1_smoke_modes.py -q` -> `37 passed`.
 - Synthetic matrix execution refresh:
   - S1 (`output/debug_multiframe_synth_gate_summary.json`): pass.
   - S2 (`output/debug_multiframe_synth_c_gate_summary.json`): consistency+repro pass, run thresholds still fail (overall false), with current run metrics around mean/p95 `0.08797/0.22886`.

@@ -2,7 +2,7 @@
 
 **Date/Time:** 2026-01-28 (updated 2026-02-10)
 **Git Commit:** 88b210c
-**Status:** Design exploration with decision addenda (not yet implemented)
+**Status:** Design exploration with decision addenda (implementation in progress via chunk plans; not fully complete)
 
 ---
 
@@ -14,6 +14,17 @@ To keep future sessions consistent and avoid decision/implementation drift:
 2. Resolve each issue by updating the detailed plan first with executable contracts.
 3. Add only a short decision summary in this base plan and link to the detailed plan for formulas/interfaces/defaults.
 4. Keep this base plan focused on decisions and status; keep implementation mechanics in the detailed plan.
+
+---
+
+## Implementation Status Note (2026-02-23)
+
+- Execution is active under chunked delivery plans:
+  - Chunk 1: implemented and validated.
+  - Chunk 2: implemented and validated.
+  - Chunk 3: partially implemented (runtime infrastructure landed; full Stage-1 likelihood contract parity still open).
+  - Chunk 4/5: pending.
+- This base plan remains a decision ledger; implementation contracts and gate details continue to live in the detailed plan and chunk execution plans.
 
 ---
 

@@ -1,8 +1,8 @@
 # Plan: Elevation-Aware Training with Back Projection (Detailed)
 
 **Date/Time:** 2026-02-01 (updated 2026-02-10)
-**Git Commit:** (not yet implemented)
-**Status:** Detailed implementation plan aligned to latest base-plan decisions
+**Git Commit:** multiple chunk commits in progress (see chunk execution plans)
+**Status:** Detailed implementation plan aligned to latest base-plan decisions (authoritative contract; implementation partially complete)
 
 ---
 
@@ -14,6 +14,15 @@ To keep future sessions consistent and avoid plan drift:
 2. When resolving an issue, update this detailed plan first with executable contracts (formulas, interfaces, defaults).
 3. Add only a short corresponding decision note in the base plan and point back to this file for full implementation details.
 4. Preserve this split for all new issues: base plan = decision summary, detailed plan = implementation contract.
+
+---
+
+## Implementation Conformance Note (2026-02-23)
+
+- This document remains the contract-level source of truth for Stage 0/1/2 behavior and acceptance criteria.
+- Current codebase status: Chunk 1 and Chunk 2 work is implemented; Chunk 3 runtime infrastructure and tests are implemented.
+- Known parity gap: the current Stage-1 training-loop likelihood path is still an interim per-frame surrogate and does not yet fully match this document's overlap-neighbor `back_project_bins` multi-view evidence contract.
+- This is a status-only note; intended algorithmic scope and validation intent are unchanged.
 
 ---
 

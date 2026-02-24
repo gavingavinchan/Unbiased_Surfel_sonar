@@ -1,7 +1,7 @@
 # Plan: Elevation-Aware Training Implementation Execution
 
 **Date:** 2026-02-10  
-**Status:** Chunk 1/2 implemented; Chunk 3/4/5 pending with synthetic-gated validation updates  
+**Status:** Chunk 1/2 implemented; Chunk 3 partially implemented (infrastructure complete, core likelihood contract parity pending); Chunk 4/5 pending with synthetic-gated validation updates  
 **Owner:** OpenCode (gpt-5.3-codex)
 
 ---
@@ -31,11 +31,13 @@ Terminology/intent lock across subsidiary plans:
 
 Do **not** implement everything in one pass. Implement in risk-ordered chunks with validation gates between chunks.
 
-### Current implementation state (2026-02-16)
+### Current implementation state (2026-02-23)
 
 - Chunk 1 is implemented and validated.
 - Chunk 2 is implemented and validated.
-- Remaining scope is Chunk 3, Chunk 4, and Chunk 5.
+- Chunk 3 is partially implemented: Stage-1 infrastructure (mode gating, frame-keyed pixel-logit state, checkpoint schema/fingerprint handling, refresh/remap plumbing, helper tests) is in code.
+- Chunk 3 core contract parity remains open: overlap-neighbor multi-view likelihood assembly via `back_project_bins` + projection-validity evidence in the training loop is not fully integrated yet.
+- Chunk 4 and Chunk 5 remain pending.
 - Dataset-C synthetic results indicate a likely Chunk-2 quality ceiling for cube-like shape recovery, so future chunks must include explicit synthetic dataset validation in their gates.
 - Recorded qualitative baseline artifact (exp3): `output/debug_multiframe_synth_c_exp3/input.ply` is cube-like, while `output/debug_multiframe_synth_c_exp3/surfels_after_training.ply` shows FOV-bounded torus-like streaking aligned with the revolution axis.
 
