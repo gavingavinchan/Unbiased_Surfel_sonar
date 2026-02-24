@@ -40,7 +40,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from argparse import Namespace
 from scene import Scene, GaussianModel
 from scene.dataset_readers import readColmapCameras, readColmapSceneInfo, getNerfppNorm
-from gaussian_renderer import render_sonar, render, quaternion_to_normal
+from gaussian_renderer import render_sonar, render, quaternion_to_normal, sonar_project_points
 from utils.sonar_utils import (SonarConfig, SonarScaleFactor, SonarExtrinsic,
                                 sonar_frame_to_points, sonar_frames_to_point_cloud,
                                 back_project_bins,
@@ -69,6 +69,13 @@ from utils.elevation_stage1_helpers import (
     should_refresh_pixel_bank,
     remap_or_reset_pixel_logits,
     optimizer_rebuild_required,
+)
+from utils.elevation_chunk4_helpers import (
+    resolve_effective_chunk4_modes,
+    mode_enables_weighted_coupling,
+    mode_enables_hard_prune,
+    associate_expected_points_to_surfels,
+    reduce_coupling_loss,
 )
 import open3d as o3d
 from PIL import Image
@@ -821,6 +828,158 @@ def maybe_refresh_pixel_bank_and_logits(
     return pixel_bank, pixel_logits_registry, optim_elev, True
 
 
+def resolve_chunk4_coupling_weight(iteration, cfg):
+    warmup = max(0, int(cfg.couple_warmup))
+    if warmup <= 0:
+        return float(cfg.couple_weight_end)
+    t = max(0.0, min(float(iteration) / float(warmup), 1.0))
+    return float(cfg.couple_weight_start) + t * (float(cfg.couple_weight_end) - float(cfg.couple_weight_start))
+
+
+def compute_chunk4_coupling_for_frame(
+    *,
+    frame_idx,
+    frame_key,
+    training_frames,
+    render_pkg,
+    gaussians,
+    sonar_config,
+    sonar_scale_factor,
+    pixel_bank,
+    p_post_frame,
+    elev_angle_bins,
+    chunk4_cfg,
+):
+    zero = gaussians.get_xyz.new_tensor(0.0)
+    out = {
+        "loss": zero,
+        "match_rate": 0.0,
+        "match_count": 0,
+        "expected_count": 0,
+        "residual_mean": 0.0,
+        "residual_p95": 0.0,
+        "assoc_w_mean": 0.0,
+    }
+
+    if frame_key not in pixel_bank:
+        return out
+    if p_post_frame is None or p_post_frame.ndim != 2:
+        return out
+
+    bank_entry = pixel_bank[frame_key]
+    rows = bank_entry["rows"]
+    cols = bank_entry["cols"]
+    if rows.numel() == 0 or cols.numel() == 0:
+        return out
+
+    p = min(int(rows.shape[0]), int(cols.shape[0]), int(p_post_frame.shape[0]))
+    b = min(int(p_post_frame.shape[1]), int(elev_angle_bins.shape[0]))
+    if p <= 0 or b <= 0:
+        return out
+
+    rows = rows[:p]
+    cols = cols[:p]
+    p_post = p_post_frame[:p, :b].detach().to(dtype=torch.float32)
+    p_post = p_post / p_post.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+    elev_bins = elev_angle_bins[:b].to(device=rows.device, dtype=torch.float32)
+
+    pts_bins = back_project_bins(
+        frame_idx=frame_idx,
+        rows=rows,
+        cols=cols,
+        elev_bins=elev_bins,
+        cameras=training_frames,
+        sonar_config=sonar_config,
+        scale_factor=sonar_scale_factor,
+    )
+    pts_expected = torch.sum(p_post.unsqueeze(-1) * pts_bins, dim=1)
+
+    exp_proj = sonar_project_points(
+        pts_expected,
+        training_frames[frame_idx],
+        sonar_config,
+        scale_factor=sonar_scale_factor,
+    )
+
+    visible_mask = render_pkg["visibility_filter"].to(dtype=torch.bool)
+    candidate_rows = torch.where(visible_mask)[0]
+    max_candidates = int(chunk4_cfg.couple_max_candidates)
+    if max_candidates > 0 and candidate_rows.numel() > max_candidates:
+        pick = torch.linspace(
+            0,
+            candidate_rows.numel() - 1,
+            steps=max_candidates,
+            device=candidate_rows.device,
+        ).round().to(dtype=torch.long)
+        candidate_rows = candidate_rows[pick]
+    if candidate_rows.numel() == 0:
+        out["expected_count"] = int(p)
+        return out
+
+    surfel_xyz = gaussians.get_xyz[candidate_rows]
+    surf_proj = sonar_project_points(
+        surfel_xyz,
+        training_frames[frame_idx],
+        sonar_config,
+        scale_factor=sonar_scale_factor,
+    )
+
+    surf_idx, assoc_w, match_valid = associate_expected_points_to_surfels(
+        exp_row=exp_proj.row,
+        exp_col=exp_proj.col,
+        exp_depth=exp_proj.range_vals,
+        exp_valid=exp_proj.valid,
+        surf_row=surf_proj.row,
+        surf_col=surf_proj.col,
+        surf_depth=surf_proj.range_vals,
+        surf_valid=surf_proj.valid,
+        max_pix_err=chunk4_cfg.couple_max_pix_err,
+        max_depth_err=chunk4_cfg.couple_max_depth_err,
+        sigma_pix=chunk4_cfg.couple_sigma_pix,
+        sigma_depth=chunk4_cfg.couple_sigma_depth,
+        min_w=chunk4_cfg.couple_min_w,
+    )
+
+    loss_couple = reduce_coupling_loss(
+        pts_expected=pts_expected,
+        surfel_xyz=surfel_xyz,
+        surf_idx=surf_idx,
+        assoc_w=assoc_w,
+        match_valid=match_valid,
+        huber_delta=chunk4_cfg.couple_huber_delta,
+    )
+    if not bool(torch.isfinite(loss_couple).item()):
+        loss_couple = zero
+
+    match_count = int(match_valid.sum().item())
+    expected_count = int(match_valid.shape[0])
+    match_rate = float(match_count / max(1, expected_count))
+
+    residual_mean = 0.0
+    residual_p95 = 0.0
+    assoc_w_mean = 0.0
+    if match_count > 0:
+        matched_idx = surf_idx[match_valid]
+        residual = torch.norm(surfel_xyz[matched_idx] - pts_expected[match_valid], dim=-1)
+        residual_detached = residual.detach()
+        residual_mean = float(residual_detached.mean().item())
+        residual_p95 = float(torch.quantile(residual_detached, 0.95).item())
+        assoc_w_mean = float(assoc_w[match_valid].detach().mean().item())
+
+    out.update(
+        {
+            "loss": loss_couple,
+            "match_rate": match_rate,
+            "match_count": match_count,
+            "expected_count": expected_count,
+            "residual_mean": residual_mean,
+            "residual_p95": residual_p95,
+            "assoc_w_mean": assoc_w_mean,
+        }
+    )
+    return out
+
+
 def apply_opacity_policy(gaussians, fixed_opacity, fixed_target=FIXED_OPACITY_TARGET,
                          learnable_opacity_lr=GAUSSIAN_OPACITY_LR):
     """Apply and re-apply opacity policy while keeping optimizer group structure intact."""
@@ -906,25 +1065,33 @@ class Tee:
 
     def write(self, data):
         for stream in self.streams:
-            stream.write(data)
+            try:
+                stream.write(data)
+            except Exception:
+                continue
         self.flush()
 
     def flush(self):
         for stream in self.streams:
-            stream.flush()
+            try:
+                stream.flush()
+            except Exception:
+                continue
 
 
 LOG_FILE = None
 LOSS_LOG_HANDLE = None
 LOSS_LOG_PATH = None
+ORIGINAL_STDOUT = sys.stdout
+ORIGINAL_STDERR = sys.stderr
 
 
 def setup_logging(output_dir):
     global LOG_FILE
     log_path = os.path.join(output_dir, "run.log")
     LOG_FILE = open(log_path, "w")
-    sys.stdout = Tee(sys.stdout, LOG_FILE)
-    sys.stderr = Tee(sys.stderr, LOG_FILE)
+    sys.stdout = Tee(ORIGINAL_STDOUT, LOG_FILE)
+    sys.stderr = Tee(ORIGINAL_STDERR, LOG_FILE)
     print(f"Logging to: {log_path}")
     return log_path
 
@@ -952,12 +1119,23 @@ def log_loss(iteration, stage_name, l1_value, ssim_value, base_loss, bright_loss
 
 
 def close_logs():
+    global LOG_FILE, LOSS_LOG_HANDLE
+
+    sys.stdout = ORIGINAL_STDOUT
+    sys.stderr = ORIGINAL_STDERR
+
     if LOSS_LOG_HANDLE is not None:
-        LOSS_LOG_HANDLE.flush()
-        LOSS_LOG_HANDLE.close()
+        try:
+            LOSS_LOG_HANDLE.flush()
+            LOSS_LOG_HANDLE.close()
+        finally:
+            LOSS_LOG_HANDLE = None
     if LOG_FILE is not None:
-        LOG_FILE.flush()
-        LOG_FILE.close()
+        try:
+            LOG_FILE.flush()
+            LOG_FILE.close()
+        finally:
+            LOG_FILE = None
 
 
 def print_sonar_diagnostics(diag, prefix=""):
@@ -1767,6 +1945,76 @@ def parse_elevation_stage1_config(stage2_iters):
     )
 
 
+@dataclass(frozen=True)
+class ElevationChunk4Config:
+    couple_mode: str
+    support_mode: str
+    effective_couple_mode: str
+    effective_support_mode: str
+    couple_weight_start: float
+    couple_weight_end: float
+    couple_warmup: int
+    couple_max_pix_err: float
+    couple_max_depth_err: float
+    couple_huber_delta: float
+    couple_sigma_mode: str
+    couple_sigma_pix: float
+    couple_sigma_depth: float
+    couple_min_w: float
+    couple_max_candidates: int
+
+
+def parse_elevation_chunk4_config(elevation_aware):
+    couple_mode = env_choice("ELEV_COUPLE_MODE", "shadow", {"off", "shadow", "active"})
+    support_mode = env_choice("ELEV_SUPPORT_MODE", "shadow", {"off", "shadow", "active"})
+    effective_couple_mode, effective_support_mode = resolve_effective_chunk4_modes(
+        elevation_aware=elevation_aware,
+        requested_couple_mode=couple_mode,
+        requested_support_mode=support_mode,
+    )
+
+    couple_weight_start = env_float("ELEV_COUPLE_WEIGHT_START", 0.10)
+    couple_weight_end = env_float("ELEV_COUPLE_WEIGHT_END", 0.50)
+    couple_warmup = env_int("ELEV_COUPLE_WARMUP", 2000)
+    couple_max_pix_err = env_float("ELEV_COUPLE_MAX_PIX_ERR", 3.0)
+    couple_max_depth_err = env_float("ELEV_COUPLE_MAX_DEPTH_ERR", 0.08)
+    couple_huber_delta = env_float("ELEV_COUPLE_HUBER_DELTA", 0.03)
+    couple_sigma_mode = env_choice("ELEV_COUPLE_SIGMA_MODE", "fixed", {"fixed"})
+    couple_sigma_pix = env_float("ELEV_COUPLE_SIGMA_PIX", 2.0)
+    couple_sigma_depth = env_float("ELEV_COUPLE_SIGMA_DEPTH", 0.05)
+    couple_min_w = env_float("ELEV_COUPLE_MIN_W", 0.10)
+    couple_max_candidates = env_int("ELEV_COUPLE_MAX_CANDIDATES", 2048)
+
+    _require_config("ELEV_COUPLE_WEIGHT_START", couple_weight_start >= 0.0, "must be >= 0")
+    _require_config("ELEV_COUPLE_WEIGHT_END", couple_weight_end >= 0.0, "must be >= 0")
+    _require_config("ELEV_COUPLE_WARMUP", couple_warmup >= 0, "must be >= 0")
+    _require_config("ELEV_COUPLE_MAX_PIX_ERR", couple_max_pix_err > 0.0, "must be > 0")
+    _require_config("ELEV_COUPLE_MAX_DEPTH_ERR", couple_max_depth_err > 0.0, "must be > 0")
+    _require_config("ELEV_COUPLE_HUBER_DELTA", couple_huber_delta > 0.0, "must be > 0")
+    _require_config("ELEV_COUPLE_SIGMA_PIX", couple_sigma_pix > 0.0, "must be > 0")
+    _require_config("ELEV_COUPLE_SIGMA_DEPTH", couple_sigma_depth > 0.0, "must be > 0")
+    _require_config("ELEV_COUPLE_MIN_W", 0.0 <= couple_min_w <= 1.0, "must be in [0, 1]")
+    _require_config("ELEV_COUPLE_MAX_CANDIDATES", couple_max_candidates >= 0, "must be >= 0")
+
+    return ElevationChunk4Config(
+        couple_mode=couple_mode,
+        support_mode=support_mode,
+        effective_couple_mode=effective_couple_mode,
+        effective_support_mode=effective_support_mode,
+        couple_weight_start=couple_weight_start,
+        couple_weight_end=couple_weight_end,
+        couple_warmup=couple_warmup,
+        couple_max_pix_err=couple_max_pix_err,
+        couple_max_depth_err=couple_max_depth_err,
+        couple_huber_delta=couple_huber_delta,
+        couple_sigma_mode=couple_sigma_mode,
+        couple_sigma_pix=couple_sigma_pix,
+        couple_sigma_depth=couple_sigma_depth,
+        couple_min_w=couple_min_w,
+        couple_max_candidates=couple_max_candidates,
+    )
+
+
 # Curriculum learning parameters
 STAGE1_ITERATIONS = 0   # Learn scale only (surfels frozen) - DISABLED, using known scale
 STAGE2_ITERATIONS = 1000  # Learn surfels only (scale frozen)
@@ -1794,6 +2042,7 @@ NUM_TRAINING_FRAMES = env_int("SONAR_NUM_FRAMES", NUM_TRAINING_FRAMES_DEFAULT)
 SONAR_HOLDOUT_FRAMES = max(0, env_int("SONAR_HOLDOUT_FRAMES", 0))
 SONAR_FREEZE_SCALE = env_bool("SONAR_FREEZE_SCALE", IS_SYNTHETIC_DATASET)
 ELEV_STAGE1_CFG = parse_elevation_stage1_config(STAGE2_ITERATIONS)
+ELEV_CHUNK4_CFG = parse_elevation_chunk4_config(ELEV_STAGE1_CFG.elevation_aware)
 
 if SONAR_FREEZE_SCALE and STAGE1_ITERATIONS > 0:
     STAGE1_ITERATIONS = 0
@@ -1893,6 +2142,13 @@ def main():
             "[Elevation Stage 1] ELEVATION_AWARE=0 forces effective mode to off "
             f"(requested={ELEV_STAGE1_CFG.stage1_mode})"
         )
+    if (not ELEV_STAGE1_CFG.elevation_aware) and (
+        ELEV_CHUNK4_CFG.couple_mode != "off" or ELEV_CHUNK4_CFG.support_mode != "off"
+    ):
+        print(
+            "[Elevation Chunk 4] ELEVATION_AWARE=0 forces coupling/support modes to off "
+            f"(requested couple={ELEV_CHUNK4_CFG.couple_mode}, support={ELEV_CHUNK4_CFG.support_mode})"
+        )
     anneal_source = "ELEV_ANNEAL_ITERS" if ELEV_STAGE1_CFG.anneal_iters_is_explicit else "SONAR_STAGE2_ITERS"
     print(
         "[Elevation Stage 1] "
@@ -1921,6 +2177,32 @@ def main():
         f"refresh_interval={ELEV_STAGE1_CFG.bank_refresh_interval}, "
         f"remap_mode={ELEV_STAGE1_CFG.bank_remap_mode}"
     )
+    print(
+        "[Elevation Chunk 4] "
+        f"couple_mode={ELEV_CHUNK4_CFG.couple_mode}, "
+        f"support_mode={ELEV_CHUNK4_CFG.support_mode}, "
+        f"effective_couple={ELEV_CHUNK4_CFG.effective_couple_mode}, "
+        f"effective_support={ELEV_CHUNK4_CFG.effective_support_mode}"
+    )
+    print(
+        "[Elevation Chunk 4] "
+        f"couple_weight={ELEV_CHUNK4_CFG.couple_weight_start:.3f}->{ELEV_CHUNK4_CFG.couple_weight_end:.3f}, "
+        f"warmup={ELEV_CHUNK4_CFG.couple_warmup}, "
+        f"gates=(pix<={ELEV_CHUNK4_CFG.couple_max_pix_err:.2f}, depth<={ELEV_CHUNK4_CFG.couple_max_depth_err:.3f}), "
+        f"sigma=({ELEV_CHUNK4_CFG.couple_sigma_pix:.2f}, {ELEV_CHUNK4_CFG.couple_sigma_depth:.3f}), "
+        f"huber_delta={ELEV_CHUNK4_CFG.couple_huber_delta:.3f}, min_w={ELEV_CHUNK4_CFG.couple_min_w:.2f}, "
+        f"max_candidates={ELEV_CHUNK4_CFG.couple_max_candidates}"
+    )
+    if ELEV_STAGE1_CFG.effective_stage1_mode == "off" and ELEV_CHUNK4_CFG.effective_couple_mode != "off":
+        print(
+            "[Elevation Chunk 4] coupling diagnostics are requested but Stage-1 is off; "
+            "coupling will remain inactive because no posterior cache is produced"
+        )
+    if mode_enables_hard_prune(ELEV_CHUNK4_CFG.effective_support_mode):
+        print(
+            "[Elevation Chunk 4] support hard-prune mode is requested, "
+            "but support-driven prune wiring is not enabled yet in this script"
+        )
     if ELEV_STAGE1_CFG.effective_stage1_mode == "off":
         print("[Elevation Stage 1] effective_mode=off -> sampler fallback=legacy single-frame shuffled path")
     if SONAR_FIXED_OPACITY:
@@ -2784,9 +3066,16 @@ def main():
         save_comparison_images(training_frames, gaussians, background, sonar_config,
                                sonar_scale_factor, OUTPUT_DIR, "after_stage1")
 
-    elev_bin_centers = torch.linspace(
+    elev_lik_bin_centers = torch.linspace(
         0.0,
         1.0,
+        steps=ELEV_STAGE1_CFG.bins,
+        device=gaussians.get_xyz.device,
+        dtype=torch.float32,
+    )
+    elev_angle_bins = torch.linspace(
+        -sonar_config.half_elevation_rad,
+        sonar_config.half_elevation_rad,
         steps=ELEV_STAGE1_CFG.bins,
         device=gaussians.get_xyz.device,
         dtype=torch.float32,
@@ -2856,6 +3145,15 @@ def main():
                 temp_post_end=ELEV_STAGE1_CFG.temp_post_end,
                 horizon=ELEV_STAGE1_CFG.anneal_iters,
             )
+            couple_compute_enabled = (
+                stage2_use_round_robin
+                and ELEV_CHUNK4_CFG.effective_couple_mode in {"shadow", "active"}
+            )
+            couple_weight_iter = (
+                resolve_chunk4_coupling_weight(global_iter, ELEV_CHUNK4_CFG)
+                if mode_enables_weighted_coupling(ELEV_CHUNK4_CFG.effective_couple_mode)
+                else 0.0
+            )
 
             batch_l1 = []
             batch_ssim = []
@@ -2865,6 +3163,10 @@ def main():
             batch_loss_lik = []
             batch_loss_ent = []
             batch_stage1 = []
+            batch_loss_couple = []
+            batch_match_rate = []
+            batch_residual_p95 = []
+            batch_assoc_w = []
             iter_cached_loglik = {}
             iter_cached_support_mask = {}
             iter_p_post = {}
@@ -2913,7 +3215,7 @@ def main():
                     else:
                         reliability = 1.0
 
-                    dist = torch.abs(norm_vals.unsqueeze(-1) - elev_bin_centers.unsqueeze(0))
+                    dist = torch.abs(norm_vals.unsqueeze(-1) - elev_lik_bin_centers.unsqueeze(0))
                     evidence = (1.0 - dist).clamp_min(ELEV_STAGE1_CFG.lik_log_eps)
                     loglik_i = torch.log(evidence).clamp_min(ELEV_STAGE1_CFG.lik_log_floor)
                     if reliability < 1.0:
@@ -2952,9 +3254,29 @@ def main():
                         "stage1_total_loss": zero_stage1,
                     }
 
-                loss_couple_i = photometric_i.new_tensor(0.0)
-                w_couple = 0.0
-                loss_i = photometric_i + stage1_out["stage1_total_loss"] + (w_couple * loss_couple_i)
+                coupling_stats = {
+                    "loss": photometric_i.new_tensor(0.0),
+                    "match_rate": 0.0,
+                    "residual_p95": 0.0,
+                    "assoc_w_mean": 0.0,
+                }
+                if couple_compute_enabled:
+                    coupling_stats = compute_chunk4_coupling_for_frame(
+                        frame_idx=frame_idx,
+                        frame_key=frame_key,
+                        training_frames=training_frames,
+                        render_pkg=render_pkg,
+                        gaussians=gaussians,
+                        sonar_config=sonar_config,
+                        sonar_scale_factor=sonar_scale_factor,
+                        pixel_bank=pixel_bank,
+                        p_post_frame=stage1_out.get("p_post"),
+                        elev_angle_bins=elev_angle_bins,
+                        chunk4_cfg=ELEV_CHUNK4_CFG,
+                    )
+
+                loss_couple_i = coupling_stats["loss"]
+                loss_i = photometric_i + stage1_out["stage1_total_loss"] + (couple_weight_iter * loss_couple_i)
 
                 frame_loss_sums[frame_idx] += float(loss_i.item())
                 frame_loss_counts[frame_idx] += 1
@@ -2966,6 +3288,10 @@ def main():
                 batch_loss_lik.append(stage1_out["loss_lik"])
                 batch_loss_ent.append(stage1_out["loss_ent"])
                 batch_stage1.append(stage1_out["stage1_total_loss"])
+                batch_loss_couple.append(loss_couple_i)
+                batch_match_rate.append(float(coupling_stats["match_rate"]))
+                batch_residual_p95.append(float(coupling_stats["residual_p95"]))
+                batch_assoc_w.append(float(coupling_stats["assoc_w_mean"]))
 
             if not batch_loss:
                 continue
@@ -2978,6 +3304,10 @@ def main():
             loss_lik = torch.stack(batch_loss_lik).mean()
             loss_ent = torch.stack(batch_loss_ent).mean()
             loss_stage1 = torch.stack(batch_stage1).mean()
+            loss_couple = torch.stack(batch_loss_couple).mean()
+            couple_match_rate = float(np.mean(batch_match_rate)) if batch_match_rate else 0.0
+            couple_residual_p95 = float(np.mean(batch_residual_p95)) if batch_residual_p95 else 0.0
+            couple_assoc_w = float(np.mean(batch_assoc_w)) if batch_assoc_w else 0.0
             cached_loglik = iter_cached_loglik
             cached_support_mask = iter_cached_support_mask
             p_post = iter_p_post
@@ -3023,6 +3353,12 @@ def main():
                         f"T_model={temp_model_iter:.3f}, T_post={temp_post_iter:.3f}, "
                         f"T_tgt={ELEV_STAGE1_CFG.lik_tgt_temp:.3f}"
                     )
+                    if couple_compute_enabled:
+                        sampler_tail += (
+                            f", couple={loss_couple.item():.6f}, w_couple={couple_weight_iter:.3f}, "
+                            f"match={couple_match_rate:.3f}, p95={couple_residual_p95:.3f}m, "
+                            f"assoc_w={couple_assoc_w:.3f}"
+                        )
                 print(
                     f"  Iter {iteration:3d}: L1={Ll1.item():.6f}, SSIM={ssim_val.item():.4f}, "
                     f"scale={scale_value:.4f}, pts={len(gaussians.get_xyz)}, "
@@ -3117,6 +3453,15 @@ def main():
                 temp_post_end=ELEV_STAGE1_CFG.temp_post_end,
                 horizon=ELEV_STAGE1_CFG.anneal_iters,
             )
+            couple_compute_enabled = (
+                stage3_use_round_robin
+                and ELEV_CHUNK4_CFG.effective_couple_mode in {"shadow", "active"}
+            )
+            couple_weight_iter = (
+                resolve_chunk4_coupling_weight(global_iter, ELEV_CHUNK4_CFG)
+                if mode_enables_weighted_coupling(ELEV_CHUNK4_CFG.effective_couple_mode)
+                else 0.0
+            )
 
             batch_l1 = []
             batch_ssim = []
@@ -3126,6 +3471,10 @@ def main():
             batch_loss_lik = []
             batch_loss_ent = []
             batch_stage1 = []
+            batch_loss_couple = []
+            batch_match_rate = []
+            batch_residual_p95 = []
+            batch_assoc_w = []
             iter_cached_loglik = {}
             iter_cached_support_mask = {}
             iter_p_post = {}
@@ -3172,7 +3521,7 @@ def main():
                     else:
                         reliability = 1.0
 
-                    dist = torch.abs(norm_vals.unsqueeze(-1) - elev_bin_centers.unsqueeze(0))
+                    dist = torch.abs(norm_vals.unsqueeze(-1) - elev_lik_bin_centers.unsqueeze(0))
                     evidence = (1.0 - dist).clamp_min(ELEV_STAGE1_CFG.lik_log_eps)
                     loglik_i = torch.log(evidence).clamp_min(ELEV_STAGE1_CFG.lik_log_floor)
                     if reliability < 1.0:
@@ -3211,9 +3560,29 @@ def main():
                         "stage1_total_loss": zero_stage1,
                     }
 
-                loss_couple_i = photometric_i.new_tensor(0.0)
-                w_couple = 0.0
-                loss_i = photometric_i + stage1_out["stage1_total_loss"] + (w_couple * loss_couple_i)
+                coupling_stats = {
+                    "loss": photometric_i.new_tensor(0.0),
+                    "match_rate": 0.0,
+                    "residual_p95": 0.0,
+                    "assoc_w_mean": 0.0,
+                }
+                if couple_compute_enabled:
+                    coupling_stats = compute_chunk4_coupling_for_frame(
+                        frame_idx=frame_idx,
+                        frame_key=frame_key,
+                        training_frames=training_frames,
+                        render_pkg=render_pkg,
+                        gaussians=gaussians,
+                        sonar_config=sonar_config,
+                        sonar_scale_factor=sonar_scale_factor,
+                        pixel_bank=pixel_bank,
+                        p_post_frame=stage1_out.get("p_post"),
+                        elev_angle_bins=elev_angle_bins,
+                        chunk4_cfg=ELEV_CHUNK4_CFG,
+                    )
+
+                loss_couple_i = coupling_stats["loss"]
+                loss_i = photometric_i + stage1_out["stage1_total_loss"] + (couple_weight_iter * loss_couple_i)
 
                 frame_loss_sums[frame_idx] += float(loss_i.item())
                 frame_loss_counts[frame_idx] += 1
@@ -3225,6 +3594,10 @@ def main():
                 batch_loss_lik.append(stage1_out["loss_lik"])
                 batch_loss_ent.append(stage1_out["loss_ent"])
                 batch_stage1.append(stage1_out["stage1_total_loss"])
+                batch_loss_couple.append(loss_couple_i)
+                batch_match_rate.append(float(coupling_stats["match_rate"]))
+                batch_residual_p95.append(float(coupling_stats["residual_p95"]))
+                batch_assoc_w.append(float(coupling_stats["assoc_w_mean"]))
 
             if not batch_loss:
                 continue
@@ -3237,6 +3610,10 @@ def main():
             loss_lik = torch.stack(batch_loss_lik).mean()
             loss_ent = torch.stack(batch_loss_ent).mean()
             loss_stage1 = torch.stack(batch_stage1).mean()
+            loss_couple = torch.stack(batch_loss_couple).mean()
+            couple_match_rate = float(np.mean(batch_match_rate)) if batch_match_rate else 0.0
+            couple_residual_p95 = float(np.mean(batch_residual_p95)) if batch_residual_p95 else 0.0
+            couple_assoc_w = float(np.mean(batch_assoc_w)) if batch_assoc_w else 0.0
             cached_loglik = iter_cached_loglik
             cached_support_mask = iter_cached_support_mask
             p_post = iter_p_post
@@ -3281,6 +3658,12 @@ def main():
                         f"T_model={temp_model_iter:.3f}, T_post={temp_post_iter:.3f}, "
                         f"T_tgt={ELEV_STAGE1_CFG.lik_tgt_temp:.3f}"
                     )
+                    if couple_compute_enabled:
+                        sampler_tail += (
+                            f", couple={loss_couple.item():.6f}, w_couple={couple_weight_iter:.3f}, "
+                            f"match={couple_match_rate:.3f}, p95={couple_residual_p95:.3f}m, "
+                            f"assoc_w={couple_assoc_w:.3f}"
+                        )
                 print(
                     f"  Iter {iteration:3d}: L1={Ll1.item():.6f}, SSIM={ssim_val.item():.4f}, "
                     f"scale={scale_value:.4f}, pts={len(gaussians.get_xyz)}, "
@@ -3472,6 +3855,10 @@ def main():
                 "elev_anneal_iters": ELEV_STAGE1_CFG.anneal_iters,
                 "elev_temp_post_mode": ELEV_STAGE1_CFG.temp_post_mode,
                 "elev_resume_mismatch_policy": ELEV_STAGE1_CFG.resume_pixellogit_mismatch,
+                "elev_chunk4_couple_mode": ELEV_CHUNK4_CFG.couple_mode,
+                "elev_chunk4_support_mode": ELEV_CHUNK4_CFG.support_mode,
+                "elev_chunk4_effective_couple_mode": ELEV_CHUNK4_CFG.effective_couple_mode,
+                "elev_chunk4_effective_support_mode": ELEV_CHUNK4_CFG.effective_support_mode,
                 "active_frame_fingerprint": active_frame_fingerprint,
                 "sonar_fixed_opacity": int(SONAR_FIXED_OPACITY),
                 "sonar_freeze_scale": int(SONAR_FREEZE_SCALE),

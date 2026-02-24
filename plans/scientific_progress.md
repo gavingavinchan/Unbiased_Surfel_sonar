@@ -598,3 +598,51 @@ Current local fast-suite result:
 
 - `pytest tests/test_elevation_chunk4_coupling_contracts.py tests/test_elevation_chunk4_id_support_lifecycle.py tests/test_elevation_chunk4_checkpoint_contracts.py tests/test_elevation_chunk4_smoke_modes.py tests/test_elevation_chunk4_synthetic_matrix.py -q`
 - `29 passed, 7 skipped`.
+
+## 18. Chunk-4 coupling runtime integration checkpoint (2026-02-24)
+
+### 18.1 Coupling term in the training objective
+
+Chunk-4 coupling is now wired in Stage-2 and Stage-3 runtime loops using Stage-1 posterior caches (`p_post`) from the same iteration. For each sampled frame, expected geometry is formed as:
+
+$$
+\mathbf{x}_{\mathrm{exp},i} = \sum_{k=1}^{K} p_{i,k}^{\mathrm{post}}\,\mathbf{x}_{i,k}^{\mathrm{bin}},
+$$
+
+where $\mathbf{x}_{i,k}^{\mathrm{bin}}$ are back-projected bin points from `back_project_bins` and $p_{i,k}^{\mathrm{post}}$ is normalized per-pixel posterior mass.
+
+The per-frame objective is now:
+
+$$
+\mathcal{L}_{\mathrm{frame}} = \mathcal{L}_{\mathrm{photo}} + \mathcal{L}_{\mathrm{stage1}} + w_{\mathrm{couple}}(t)\,\mathcal{L}_{\mathrm{couple}},
+$$
+
+with a linear warmup schedule:
+
+$$
+w_{\mathrm{couple}}(t) = w_0 + \min\!\left(\frac{t}{T_{\mathrm{warmup}}}, 1\right)(w_1 - w_0).
+$$
+
+Here $w_0 = \texttt{ELEV\_COUPLE\_WEIGHT\_START}$, $w_1 = \texttt{ELEV\_COUPLE\_WEIGHT\_END}$, and $T_{\mathrm{warmup}} = \texttt{ELEV\_COUPLE\_WARMUP}$.
+
+### 18.2 Mode-gated runtime semantics
+
+- `off`: coupling disabled.
+- `shadow`: coupling diagnostics computed, but $w_{\mathrm{couple}}(t)$ is effectively forced to zero in loss aggregation.
+- `active`: diagnostics computed and weighted coupling applied.
+
+This preserves off-mode parity while enabling staged activation of belief-to-geometry enforcement.
+
+### 18.3 Runtime stability and validation evidence
+
+Logging teardown was hardened (stdio restoration before stream close) to avoid subprocess false-fail exits in runtime smoke harnesses.
+
+Post-integration validation in conda env:
+
+- `RUN_CHUNK4_RUNTIME_SMOKES=1 pytest tests/test_elevation_chunk4_smoke_modes.py -q` -> `10 passed`.
+- `RUN_CHUNK4_SYNTHETIC_MATRIX=1 pytest tests/test_elevation_chunk4_synthetic_matrix.py -q` -> `2 passed, 1 skipped`.
+- Full Chunk-4 set with runtime + synthetic opt-ins -> `33 passed, 3 skipped`.
+
+### 18.4 Remaining Chunk-4 closure gap
+
+This checkpoint completes coupling-runtime wiring, but does not yet complete support/prune enforcement runtime integration. Pending items remain the persistent-ID lifecycle, by-ID support buffer updates, hysteresis/grace prune path, and Chunk-4 checkpoint state/schema wiring inside `debug_multiframe.py`.

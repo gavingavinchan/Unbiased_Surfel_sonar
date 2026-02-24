@@ -408,3 +408,20 @@ flowchart TB
 - Local fast-suite status in conda env:
   - `pytest tests/test_elevation_chunk4_coupling_contracts.py tests/test_elevation_chunk4_id_support_lifecycle.py tests/test_elevation_chunk4_checkpoint_contracts.py tests/test_elevation_chunk4_smoke_modes.py tests/test_elevation_chunk4_synthetic_matrix.py -q`
   - result: `29 passed, 7 skipped` (skips are opt-in runtime/synthetic/manual tests).
+
+## Recent Updates (2026-02-24, Chunk-4 coupling runtime integration checkpoint)
+- Integrated Chunk-4 coupling runtime path into `debug_multiframe.py` for Stage-2/Stage-3 loops:
+  - added `ElevationChunk4Config` parsing for `ELEV_COUPLE_*` and mode controls (`ELEV_COUPLE_MODE`, `ELEV_SUPPORT_MODE`),
+  - wired per-frame expected-point computation from Stage-1 posterior cache (`p_post`) via `back_project_bins`,
+  - added association/reduction calls (`associate_expected_points_to_surfels`, `reduce_coupling_loss`) and single insertion into unified loss.
+- Coupling mode behavior is now explicit:
+  - `off`: no coupling diagnostics or weighted term,
+  - `shadow`: diagnostics computed; weighted coupling remains disabled,
+  - `active`: diagnostics + scheduled coupling weight ramp (`ELEV_COUPLE_WEIGHT_START -> ELEV_COUPLE_WEIGHT_END`).
+- Added bounded candidate control (`ELEV_COUPLE_MAX_CANDIDATES`, default `2048`) to cap association cost under dense visibility.
+- Fixed runtime teardown stability in logging (`Tee`/stdio restoration) to remove subprocess false-fail exits during pytest runtime smoke execution.
+- Validation status in conda env (post-integration):
+  - runtime smokes: `RUN_CHUNK4_RUNTIME_SMOKES=1 pytest tests/test_elevation_chunk4_smoke_modes.py -q` -> `10 passed`,
+  - synthetic matrix: `RUN_CHUNK4_SYNTHETIC_MATRIX=1 pytest tests/test_elevation_chunk4_synthetic_matrix.py -q` -> `2 passed, 1 skipped`,
+  - full Chunk-4 suite with runtime+synthetic gates: `33 passed, 3 skipped`.
+- Scope caveat (important): Chunk-4 is still not gate-closed. Support/prune enforcement runtime wiring is pending in `debug_multiframe.py` (persistent surfel IDs, by-ID support buffers, hysteresis/grace prune path, Chunk-4 checkpoint schema/state integration).
