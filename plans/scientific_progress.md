@@ -412,3 +412,118 @@ Both remain above acceptance thresholds.
 - The failure mode is geometric quality, not stochastic instability.
 - Under the current Chunk-2-era feature set, results suggest a quality ceiling for cube face/edge recovery.
 - The most probable next gain is from Chunk 3/4 components (overlap-aware likelihood evidence and belief-to-geometry coupling) rather than additional Stage-2-only budget increases.
+
+## 16. Chunk 3 Stage-1 Runtime Update (2026-02-20 to 2026-02-21)
+
+### 16.1 Runtime contract fixes applied
+
+The Stage-1 likelihood path in `debug_multiframe.py` now matches the intended invalid-sample neutrality contract:
+
+$$
+\text{support\_mask}_{i,k} = \mathbf{1}[\text{sample\_valid}_i]
+$$
+
+instead of all-ones support. Invalid samples continue to use neutral evidence (`loglik=0`), but are now excluded from valid-row CE/entropy aggregation.
+
+Device coupling was also removed from elevation bin-center construction:
+
+$$
+\text{device}(\text{elev\_bin\_centers}) = \text{device}(\mathbf{x}_{\text{gaussians}})
+$$
+
+so CPU/GPU mismatch hazards from hardcoded `"cuda"` are eliminated.
+
+### 16.2 Resume/refresh state behavior
+
+- Resume path now avoids double construction of pixel-logit parameters and `optim_elev`.
+- Refresh/remap path is wired for Stage 2/3 with deterministic behavior:
+  - trigger: `ELEV_BANK_REFRESH_INTERVAL`,
+  - remap policy: `nearest|reset`,
+  - rebuild criterion: optimizer is rebuilt iff any refreshed logit tensor shape changes.
+
+### 16.3 Synthetic gate outcomes after Chunk-3 runtime changes
+
+Dataset A (`S1`, canonical gate):
+
+$$
+G_A = \text{true}
+$$
+
+with run metrics around:
+
+$$
+(\bar d_{\mathrm{rad}}, d_{95}, e_{\mathrm{center}}) \approx (0.0103,\ 0.0320,\ 0.01635)\ \text{m}
+$$
+
+Dataset C (`S2`, canonical gate):
+
+$$
+G_C = \text{false}
+$$
+
+while still deterministic/reproducible, with current run metrics approximately:
+
+$$
+(\bar d_{\mathrm{surf}}, d_{95}, e_{\mathrm{center}}) \approx (0.08797,\ 0.22886,\ 0.02364)\ \text{m}
+$$
+
+Reproducibility repeat (`S3`) remains low-drift relative to `S1` (order `10^{-5}` m deltas in the tracked evaluator metrics).
+
+### 16.4 Resume continuity (`S4`) evidence
+
+Continuation flow on synthetic Dataset C (save checkpoint -> resume -> continue) restores Stage-1 runtime state consistently:
+
+- schema: `checkpoint_schema_version = chunk3_stage1_v1`,
+- active-frame fingerprint: restored and matched,
+- sampler state: restored (`cursor=303`, `epoch=3` in observed run),
+- pixel logits: restored (`restored=500`, `reset=0` in observed run).
+
+This supports the claim that Chunk-3 Stage-1 checkpoint payloads are resume-stable for the tested continuation path.
+
+### 16.5 Dataset-C center-error variance and mode-isolation checks
+
+Let $e_c(s, m)$ denote `center_error_m` on Dataset C for seed $s$ and mode $m \in \{\text{off},\text{shadow}\}$.
+
+Baseline-relative comparison (Chunk-2 comparator vs current Chunk-3 S2 reference) remains:
+
+$$
+e_c^{\text{base}} = 0.00654\ \text{m},\quad e_c^{\text{S2}} = 0.02364\ \text{m},\quad
+\Delta_{\mathrm{rel}} = \frac{e_c^{\text{S2}}-e_c^{\text{base}}}{e_c^{\text{base}}} \approx 261.18\%.
+$$
+
+To isolate Stage-1 runtime influence (without activating Stage-1 weighted losses), paired off-vs-shadow sweeps were run.
+
+Short-budget sweep (`SONAR_STAGE2_ITERS=250`, seeds $\{42,101,202\}$):
+
+$$
+\mu_{\text{off}} \approx 0.02802,\ \sigma_{\text{off}} \approx 0.00619,
+\quad
+\mu_{\text{shadow}} \approx 0.02841,\ \sigma_{\text{shadow}} \approx 0.00668.
+$$
+
+Full-budget parity sweep (`SONAR_STAGE2_ITERS=1000`, seeds $\{77,303,404\}$):
+
+$$
+\mu_{\text{off}} \approx 0.01850,\ \sigma_{\text{off}} \approx 0.01278,
+\quad
+\mu_{\text{shadow}} \approx 0.02061,\ \sigma_{\text{shadow}} \approx 0.01199.
+$$
+
+Paired differences $\Delta_s = e_c(s,\text{shadow}) - e_c(s,\text{off})$ were mixed-sign in both sweeps, rather than consistently positive.
+
+Interpretation:
+- current evidence does not support a strong claim that Stage-1 `shadow` plumbing is a dominant directional regressor by itself;
+- Dataset-C error behavior is better characterized as seed-sensitive variance plus known cube-shape difficulty in the current pipeline.
+
+### 16.6 Comparator hygiene correction (mesh vs surfels)
+
+During seed `303/404` runs, a first-pass evaluator call used `mesh_after_stage3.ply`, yielding much larger center errors than historical surfel-based references.
+
+For apples-to-apples comparison with prior Chunk-2/Chunk-3 gate numbers, evaluator input was corrected to `surfels_after_training.ply`. Corrected artifacts:
+
+- `output/chunk3_seed_sweep_full/seed303_off/eval_surfel_surfels/cube_eval.json`
+- `output/chunk3_seed_sweep_full/seed303_shadow/eval_surfel_surfels/cube_eval.json`
+- `output/chunk3_seed_sweep_full/seed404_off/eval_surfel_surfels/cube_eval.json`
+- `output/chunk3_seed_sweep_full/seed404_shadow/eval_surfel_surfels/cube_eval.json`
+
+This correction restores metric comparability for Chunk-3-to-Chunk-4 handoff tracking.

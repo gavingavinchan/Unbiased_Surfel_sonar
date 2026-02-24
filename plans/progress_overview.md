@@ -365,3 +365,31 @@ flowchart TB
 - Canonical Dataset C gate executed with multi-band poses; consistency and reproducibility gates pass, but both training runs fail cube reconstruction thresholds (`mean~0.090 m`, `p95~0.234 m`).
 - Follow-up tuning experiments (longer stage budgets, range-attenuation-off, zero-elevation init, learnable-opacity ablation) improved little and still fail thresholds (`exp1 mean/p95 ~0.085/0.214`, `exp2 ~0.089/0.231`).
 - Current handoff assessment: likely Chunk-2 quality ceiling; probable unblock is Chunk 3/4 overlap-likelihood + belief-to-geometry coupling work before expecting Dataset C acceptance.
+
+## Recent Updates (2026-02-20 to 2026-02-21, Chunk 3 execution)
+- `debug_multiframe.py` Chunk-3 Stage-1 runtime was tightened: removed hardcoded CUDA bin-center allocation, fixed OOB support masking to validity-aware masks, and removed resume-time double init of pixel logits/optimizer.
+- Added refresh/remap runtime wiring in Stage 2/3 (`ELEV_BANK_REFRESH_INTERVAL`, `ELEV_BANK_REMAP_MODE`, `ELEV_BANK_REMAP_MAX_DIST`) with deterministic `optim_elev` rebuild on shape changes.
+- Unified effective-mode logic to use helper contract (`resolve_effective_stage1_mode`) in config parsing.
+- Fast contract/smoke tests are green in conda env: core contracts (17), checkpoint contracts (10), smoke modes (10).
+- Synthetic matrix execution refresh:
+  - S1 (`output/debug_multiframe_synth_gate_summary.json`): pass.
+  - S2 (`output/debug_multiframe_synth_c_gate_summary.json`): consistency+repro pass, run thresholds still fail (overall false), with current run metrics around mean/p95 `0.08797/0.22886`.
+  - S3 (`output/chunk3_s3/debug_multiframe_synth_s3_gate_summary.json`): pass; low drift vs S1 (mean delta ~`7.39e-06`, p95 delta ~`-3.54e-05`, center delta ~`2.59e-05`).
+  - S4 continuation: checkpoint save/load path validated with restored Stage-1 state (schema/fingerprint/sampler/pixel logits) and continuation evaluator output at `output/chunk3_s4_run2/eval_surfel/cube_eval.json`.
+- Resume-state evidence from S4:
+  - checkpoint saved: `output/chunk3_s4_run1/chunk3_s4_ckpt.pth`,
+  - restore log: `output/chunk3_s4_run2/run.log` shows loaded iter `601`, sampler restore (`cursor=303, epoch=3`), and pixel-logit restore (`restored=500, reset=0`),
+  - checkpoint payload includes `checkpoint_schema_version=chunk3_stage1_v1` and active-frame fingerprint.
+
+## Recent Updates (2026-02-22, Chunk-3 statistical gate refinement)
+- Baseline-relative S2 regression remains formally true versus Chunk-2 comparator (`output/debug_multiframe_synth_c_exp3/eval_surfel/cube_eval.json` -> `output/debug_multiframe_synth_c_run1/eval_surfel/cube_eval.json`), with center error changing `0.00654 -> 0.02364` m.
+- Additional off-vs-shadow parity sweeps were run to check whether Stage-1 plumbing itself is the main source of drift:
+  - short budget seeds (`42/101/202`) in `output/chunk3_seed_sweep/*` show mixed signed center deltas,
+  - full-budget seeds (`77/303/404`) in `output/chunk3_seed_sweep_full/*` also show mixed signed center deltas.
+- Interpretation: no consistent directional evidence that `ELEV_STAGE1_MODE=shadow` is intrinsically worse than `off`; Dataset-C behavior appears seed-sensitive with persistent cube-shape difficulty.
+- Comparator hygiene issue was identified and corrected: for seeds `303/404`, initial mesh-based eval (`mesh_after_stage3.ply`) overstated center error and was replaced by comparable surfel-based eval (`surfels_after_training.ply`) at:
+  - `output/chunk3_seed_sweep_full/seed303_off/eval_surfel_surfels/cube_eval.json`
+  - `output/chunk3_seed_sweep_full/seed303_shadow/eval_surfel_surfels/cube_eval.json`
+  - `output/chunk3_seed_sweep_full/seed404_off/eval_surfel_surfels/cube_eval.json`
+  - `output/chunk3_seed_sweep_full/seed404_shadow/eval_surfel_surfels/cube_eval.json`
+- Practical handoff stance for Chunk 4: carry a documented S2 center-error risk/waiver note, then evaluate whether coupling/support logic reduces center-error variance and cross-view dominance.

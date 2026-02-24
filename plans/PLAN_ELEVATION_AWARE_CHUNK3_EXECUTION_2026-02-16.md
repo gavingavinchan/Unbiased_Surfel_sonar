@@ -717,3 +717,230 @@ Commit message format (repo convention):
 
 Example:
 - `Implement elevation Stage-1 overlap, pixel-bank likelihood, and annealing core (gpt-5.3-codex)`
+
+---
+
+## Intermediate Plan Update (2026-02-21)
+
+Purpose: record post-implementation status, immediate blockers, and the shortest path to a defensible Chunk-3 gate decision.
+
+### Current issues (must be documented before closeout)
+
+1. **S2 (C_clean) baseline-comparison evidence gap in gate narrative**
+   - Current scratchpad/logs report S2 threshold failure, but the Chunk-3 plan requires explicit comparison against Chunk-2 baselines and artifact classification (`improved|unchanged|regressed`).
+
+2. **Material regression on C_clean center error versus Chunk-2 baseline**
+   - Comparator baseline artifact: `output/debug_multiframe_synth_c_exp3/eval_surfel/cube_eval.json`
+   - Chunk-3 S2 artifact: `output/debug_multiframe_synth_c_gate_summary.json` (run1 metrics)
+   - Recomputed deltas:
+     - `mean_surface_error_m`: `0.08538 -> 0.08797` (`+3.04%`)
+     - `p95_surface_error_m`: `0.20835 -> 0.22886` (`+9.84%`)
+     - `center_error_m`: `0.00654 -> 0.02364` (`+261.18%`, **material regression** by plan default `>10%`)
+   - Required classification for Dataset C artifact state: **`regressed`** (unless superseded by new evidence).
+
+3. **Chunk-3 gate decision is currently under-specified**
+   - Given the material-regression rule, Chunk-3 cannot be considered cleanly closed without either:
+     - mitigation that reduces the regression below material threshold, or
+     - an explicit written waiver with rationale and approval.
+
+### Intermediate execution plan (next actions)
+
+1. **Complete evidence narrative update (documentation-first)**
+   - Append a compact S2 baseline-delta table and explicit C artifact classification to gate notes.
+   - Cite artifact paths directly:
+     - `output/debug_multiframe_synth_c_gate_summary.json`
+     - `output/debug_multiframe_synth_c_run1/eval_surfel/cube_eval.json`
+     - `output/debug_multiframe_synth_c_exp3/eval_surfel/cube_eval.json`
+
+2. **Run minimal isolation experiment for root-cause directionality**
+   - Execute short, same-seed C_clean parity runs under:
+     - `ELEV_STAGE1_MODE=off`
+     - `ELEV_STAGE1_MODE=shadow`
+   - Keep all other relevant settings fixed.
+   - Interpretation:
+     - if `off` recovers Chunk-2-like center error and `shadow` does not, suspect Stage-1 plumbing influence;
+     - if both are similar, suspect baseline/config drift or known C-shape instability unrelated to active Stage-1 weighting.
+
+3. **Record explicit go/no-go outcome for Chunk 3**
+   - **Go** only if regression is mitigated or formally waived with rationale.
+   - **No-go** if material regression remains and no waiver is approved.
+
+### Proposed command skeleton for Step 2 (parity isolation)
+
+Use identical command body except Stage-1 mode and output directory:
+
+```bash
+source ~/anaconda3/etc/profile.d/conda.sh && conda activate unbiased_surfel_sonar && \
+SONAR_DATASET=synthetic_c_clean \
+SONAR_DATASET_PATH=./synthetic_datasets/synthetic_cube_C_clean \
+SONAR_NUM_FRAMES=500 \
+SONAR_STAGE2_ITERS=600 \
+SONAR_STAGE3_ITERS=1 \
+SONAR_FREEZE_SCALE=1 \
+ELEVATION_AWARE=1 \
+ELEV_STAGE1_MODE=off \
+SONAR_OUTPUT_DIR=./output/chunk3_c_parity_off \
+python debug_multiframe.py
+```
+
+```bash
+source ~/anaconda3/etc/profile.d/conda.sh && conda activate unbiased_surfel_sonar && \
+SONAR_DATASET=synthetic_c_clean \
+SONAR_DATASET_PATH=./synthetic_datasets/synthetic_cube_C_clean \
+SONAR_NUM_FRAMES=500 \
+SONAR_STAGE2_ITERS=600 \
+SONAR_STAGE3_ITERS=1 \
+SONAR_FREEZE_SCALE=1 \
+ELEVATION_AWARE=1 \
+ELEV_STAGE1_MODE=shadow \
+SONAR_OUTPUT_DIR=./output/chunk3_c_parity_shadow \
+python debug_multiframe.py
+```
+
+Then evaluate both outputs with `scripts/eval_synthetic_cube.py` and compare against the same Chunk-2 comparator used above.
+
+---
+
+## Statistical Addendum for Chunk-4 Handoff (2026-02-22)
+
+Purpose: move key evidence out of scratch notes and into the execution record before Chunk-4 start.
+
+### A) Baseline-relative finding remains true
+
+- Comparator baseline (`Chunk-2` style): `output/debug_multiframe_synth_c_exp3/eval_surfel/cube_eval.json`
+- Current S2 reference (`Chunk-3`): `output/debug_multiframe_synth_c_run1/eval_surfel/cube_eval.json`
+- Delta recap:
+  - `mean_surface_error_m`: `0.08538 -> 0.08797` (`+3.04%`)
+  - `p95_surface_error_m`: `0.20835 -> 0.22886` (`+9.84%`)
+  - `center_error_m`: `0.00654 -> 0.02364` (`+261.18%`, material regression under current rule)
+
+### B) Off-vs-shadow seed sweep (directionality isolation)
+
+Short budget (`SONAR_STAGE2_ITERS=250`) with seeds `42, 101, 202`:
+
+- Artifacts:
+  - `output/chunk3_seed_sweep/seed42_off/eval_surfel/cube_eval.json`
+  - `output/chunk3_seed_sweep/seed42_shadow/eval_surfel/cube_eval.json`
+  - `output/chunk3_seed_sweep/seed101_off/eval_surfel/cube_eval.json`
+  - `output/chunk3_seed_sweep/seed101_shadow/eval_surfel/cube_eval.json`
+  - `output/chunk3_seed_sweep/seed202_off/eval_surfel/cube_eval.json`
+  - `output/chunk3_seed_sweep/seed202_shadow/eval_surfel/cube_eval.json`
+- Center-error aggregate:
+  - off: mean `0.02802`, std `0.00619`, min `0.01934`, max `0.03332`
+  - shadow: mean `0.02841`, std `0.00668`, min `0.01910`, max `0.03445`
+- Paired deltas (`shadow-off`): `-0.00024`, `+0.00303`, `-0.00162` m (mixed sign).
+
+Full budget parity (`SONAR_STAGE2_ITERS=1000`) with seeds `77, 303, 404`:
+
+- Artifacts:
+  - `output/chunk3_seed_sweep_full/seed77_off/eval_surfel/cube_eval.json`
+  - `output/chunk3_seed_sweep_full/seed77_shadow/eval_surfel/cube_eval.json`
+  - `output/chunk3_seed_sweep_full/seed303_off/eval_surfel_surfels/cube_eval.json`
+  - `output/chunk3_seed_sweep_full/seed303_shadow/eval_surfel_surfels/cube_eval.json`
+  - `output/chunk3_seed_sweep_full/seed404_off/eval_surfel_surfels/cube_eval.json`
+  - `output/chunk3_seed_sweep_full/seed404_shadow/eval_surfel_surfels/cube_eval.json`
+- Center-error aggregate:
+  - off: mean `0.01850`, std `0.01278`, min `0.00850`, max `0.03655`
+  - shadow: mean `0.02061`, std `0.01199`, min `0.01033`, max `0.03743`
+- Paired deltas (`shadow-off`): `+0.00089`, `-0.00013`, `+0.00557` m (mixed sign).
+
+Interpretation from B:
+- Stage-1 `shadow` mode is not showing a consistent directional worsening versus `off` under tested seeds.
+- Observed C-clean center offset behavior is better described as seed-sensitive variance plus known cube-shape difficulty than as a clear `shadow`-specific defect.
+
+### C) Comparator hygiene note (important)
+
+For cross-run comparability, use evaluator input `surfels_after_training.ply` consistently.
+
+- A subagent run initially evaluated `mesh_after_stage3.ply` for seeds `303/404`, which produced much larger center errors and is not comparable to prior surfel-based gate values.
+- Corrected comparable artifacts are the `eval_surfel_surfels` JSONs listed above.
+
+### D) Chunk-4 transition assessment
+
+- This addendum does **not** erase the baseline-relative material-regression flag on S2 (`run1` vs `exp3`).
+- It does provide evidence that Stage-1 plumbing in `shadow` is not a dominant new regression mechanism by itself.
+- Recommended transition policy:
+  1. proceed to Chunk 4 with explicit waiver/risk note for C-clean center metric,
+  2. keep multi-seed paired (`off`/`shadow` or `off`/`active`) checks as a standing regression monitor,
+  3. judge Chunk-4 success on whether coupling/support logic reduces center-error variance and cross-view dominance trends.
+
+### E) Consolidated test-result ledger (no omissions)
+
+1. Fast contract tests (rerun in conda env)
+- `python -m py_compile debug_multiframe.py` -> pass
+- `pytest tests/test_elevation_stage1_core_contracts.py -q` -> `17 passed`
+- `pytest tests/test_elevation_stage1_checkpoint_contracts.py -q` -> `10 passed`
+- `pytest tests/test_elevation_stage1_smoke_modes.py -q` -> `10 passed`
+
+2. Synthetic matrix core gates
+- `S1` (`output/debug_multiframe_synth_gate_summary.json`) -> `overall_pass=true`
+  - run1: mean/p95/center = `0.0103008 / 0.0320440 / 0.0163423`
+  - run2: mean/p95/center = `0.0103251 / 0.0320196 / 0.0163662`
+- `S2` (`output/debug_multiframe_synth_c_gate_summary.json`) -> `overall_pass=false`
+  - run1: mean/p95/center = `0.0879734 / 0.2288554 / 0.0236388`
+  - run2: mean/p95/center = `0.0879689 / 0.2288552 / 0.0236388`
+- `S3` (`output/chunk3_s3/debug_multiframe_synth_s3_gate_summary.json`) -> `overall_pass=true`
+  - run1: mean/p95/center = `0.0103082 / 0.0320086 / 0.0163682`
+  - run2: mean/p95/center = `0.0103158 / 0.0320081 / 0.0163716`
+- `S4` continuation evaluator (`output/chunk3_s4_run2/eval_surfel/cube_eval.json`) -> `overall_pass=false`
+  - mean/p95/center = `0.0876985 / 0.2243599 / 0.0296999`
+  - checks: `mean_pass=false`, `p95_pass=false`, `center_pass=true`
+
+3. Resume/schema continuity evidence
+- checkpoint: `output/chunk3_s4_run1/chunk3_s4_ckpt.pth`
+- resume log: `output/chunk3_s4_run2/run.log` shows loaded iter `601`, sampler restore (`cursor=303, epoch=3`), pixel-logit restore (`restored=500, reset=0`)
+- state payload includes `checkpoint_schema_version=chunk3_stage1_v1` and active-frame fingerprint
+
+4. Off-vs-shadow statistical checks (additional)
+- short budget (`SONAR_STAGE2_ITERS=250`, seeds `42/101/202`) center aggregates:
+  - off mean/std = `0.02802 / 0.00619`
+  - shadow mean/std = `0.02841 / 0.00668`
+  - paired deltas (`shadow-off`) = `-0.00024`, `+0.00303`, `-0.00162`
+- full budget (`SONAR_STAGE2_ITERS=1000`, seeds `77/303/404`) center aggregates:
+  - off mean/std = `0.01850 / 0.01278`
+  - shadow mean/std = `0.02061 / 0.01199`
+  - paired deltas (`shadow-off`) = `+0.00089`, `-0.00013`, `+0.00557`
+
+5. Comparator hygiene correction (tracked)
+- non-comparable mesh-based evals for seeds `303/404` remain at:
+  - `output/chunk3_seed_sweep_full/seed303_off/eval_surfel/cube_eval.json`
+  - `output/chunk3_seed_sweep_full/seed303_shadow/eval_surfel/cube_eval.json`
+  - `output/chunk3_seed_sweep_full/seed404_off/eval_surfel/cube_eval.json`
+  - `output/chunk3_seed_sweep_full/seed404_shadow/eval_surfel/cube_eval.json`
+- raw mesh-based values (recorded for traceability only):
+  - seed303 off/shadow center = `0.376317 / 0.339563`
+  - seed404 off/shadow center = `0.418896 / 0.414915`
+- canonical surfel-based corrected evals (used for comparisons) are:
+  - `output/chunk3_seed_sweep_full/seed303_off/eval_surfel_surfels/cube_eval.json`
+  - `output/chunk3_seed_sweep_full/seed303_shadow/eval_surfel_surfels/cube_eval.json`
+  - `output/chunk3_seed_sweep_full/seed404_off/eval_surfel_surfels/cube_eval.json`
+  - `output/chunk3_seed_sweep_full/seed404_shadow/eval_surfel_surfels/cube_eval.json`
+
+6. Manual visual QA snapshot before Chunk-4 transition
+- Reviewer observations (compared to last manual Chunk-2 review):
+  - `output/debug_multiframe_synth_c_run1/surfels_after_training.ply`: torus-like structure and vertical-line pattern persist.
+  - `output/debug_multiframe_synth_c_run1/mesh_after_stage3.ply`: still blob-like / hard to interpret.
+  - `output/debug_multiframe_synth_c_run1/mesh_poisson_after_stage3.ply`: improved; follows surfels and forms regular torus.
+  - `output/debug_multiframe_synth_c_run1/comparison_after_stage3_frame0.png` and `output/debug_multiframe_synth_c_run1/comparison_after_stage3_frame499.png`: low return signal and noticeably weaker than the reviewer remembers from Chunk-2.
+  - Mid-trajectory frames (roughly away from extremes, e.g. around central frame ranges) are visually closer to prior Chunk-2 behavior.
+- Supporting sparsity context (raw synthetic C-clean frames):
+  - source: `synthetic_datasets/synthetic_cube_C_clean/sonar/*.png`
+  - nonzero-pixel fraction across frames is low (mean `~1.80%`, min `~0.62%`, max `~4.08%`), consistent with low-signal appearance in many views.
+- Transition interpretation:
+  - no new visual failure mode was identified specific to Chunk-3 Stage-1 plumbing;
+  - residual torus/bias and mesh-blob issues remain aligned with known Dataset-C and extraction limitations;
+  - proceed to Chunk 4 with explicit risk note and use coupling/support outcomes as the primary improvement criterion.
+
+7. Explicit Chunk-3 waiver / risk note (for closeout decision)
+- **Waiver scope**: Dataset-C (`S2`) center-error regression vs Chunk-2 comparator is accepted as a temporary carry risk into Chunk 4.
+- **Why waiver is requested**:
+  - baseline-relative material regression remains (`0.00654 -> 0.02364` m in `center_error_m`),
+  - but off-vs-shadow seed sweeps show mixed signed deltas (no consistent Stage-1-plumbing-specific degradation),
+  - and visual review indicates edge-frame weakness (near frame 0/499) while mid-trajectory behavior remains closer to prior Chunk-2 quality.
+- **Risk statement**:
+  - Chunk-3 is considered functionally complete on Stage-1 infrastructure and resume contracts,
+  - with known Dataset-C geometric bias/variance risk still open.
+- **Required Chunk-4 acceptance focus tied to this waiver**:
+  1. reduce Dataset-C center-error variance across seeds and reduce edge-frame weakness,
+  2. improve cross-view dominance/support trends (not just single-run point metrics),
+  3. keep comparator hygiene fixed (`surfels_after_training.ply` for cross-run metric comparability).
