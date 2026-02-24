@@ -395,3 +395,16 @@ flowchart TB
   - `output/chunk3_seed_sweep_full/seed404_off/eval_surfel_surfels/cube_eval.json`
   - `output/chunk3_seed_sweep_full/seed404_shadow/eval_surfel_surfels/cube_eval.json`
 - Practical handoff stance for Chunk 4: carry a documented S2 center-error risk/waiver note, then evaluate whether coupling/support logic reduces center-error variance and cross-view dominance.
+
+## Recent Updates (2026-02-24, Chunk-4 TDD test harness)
+- Added Chunk-4 helper contracts and initial implementation in `utils/elevation_chunk4_helpers.py` for coupling association/reduction, persistent surfel-ID lifecycle, by-ID support updates, support schedule/hysteresis/grace logic, and checkpoint resume-policy handling.
+- Added fast contract test files:
+  - `tests/test_elevation_chunk4_coupling_contracts.py` (`C4-T01`, `C4-T02`, `C4-T03`, `C4-T10`),
+  - `tests/test_elevation_chunk4_id_support_lifecycle.py` (`C4-T04`..`C4-T08`),
+  - `tests/test_elevation_chunk4_checkpoint_contracts.py` (`C4-T09`).
+- Added smoke/matrix harness files:
+  - `tests/test_elevation_chunk4_smoke_modes.py` with placeholder mode-gate tests plus opt-in runtime smokes for `C4-T11`..`C4-T14` (`RUN_CHUNK4_RUNTIME_SMOKES=1`),
+  - `tests/test_elevation_chunk4_synthetic_matrix.py` with opt-in synthetic matrix/continuation checks for `C4-T15`..`C4-T16` (`RUN_CHUNK4_SYNTHETIC_MATRIX=1`) and manual placeholder `C4-T17`.
+- Local fast-suite status in conda env:
+  - `pytest tests/test_elevation_chunk4_coupling_contracts.py tests/test_elevation_chunk4_id_support_lifecycle.py tests/test_elevation_chunk4_checkpoint_contracts.py tests/test_elevation_chunk4_smoke_modes.py tests/test_elevation_chunk4_synthetic_matrix.py -q`
+  - result: `29 passed, 7 skipped` (skips are opt-in runtime/synthetic/manual tests).

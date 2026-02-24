@@ -547,3 +547,54 @@ Fast test evidence on current codebase:
 - `python -m py_compile debug_multiframe.py utils/elevation_stage1_helpers.py`
 - `pytest tests/test_elevation_stage1_core_contracts.py tests/test_elevation_stage1_checkpoint_contracts.py tests/test_elevation_stage1_smoke_modes.py -q`
 - Result: `37 passed`.
+
+## 17. Chunk-4 contract test formalization (2026-02-24)
+
+Chunk-4 introduces explicit contract tests for belief-to-geometry coupling and support-by-ID lifecycle.
+
+### 17.1 Association and coupling reduction contracts
+
+The implemented helper path enforces per-expected-point nearest gated association:
+
+$$
+s_{ij} = \left(\frac{\mathrm{pix\_err}_{ij}}{\sigma_{\mathrm{pix}}}\right)^2 +
+\left(\frac{\mathrm{depth\_err}_{ij}}{\sigma_{\mathrm{depth}}}\right)^2,
+\quad
+w_{ij} = \mathrm{clamp}(\exp(-0.5 s_{ij}), w_{\min}, 1).
+$$
+
+Coupling reduction is robust-Huber weighted over matched associations only:
+
+$$
+\mathcal{L}_{\mathrm{couple}} =
+\frac{\sum_{m \in \mathcal{M}} w_m\,\rho_\delta\!\left(\lVert \mathbf{x}_{\mathrm{surfel},m} - \mathbf{x}_{\mathrm{exp},m} \rVert\right)}{\sum_{m \in \mathcal{M}} w_m + \epsilon},
+$$
+
+with zero-match frames constrained to contribute exact zero.
+
+### 17.2 Persistent ID and support schedule contracts
+
+Support state is keyed by persistent surfel ID and remains invariant to row reindexing after prune/reorder:
+
+$$
+\mathrm{EMA}_{sid}^{(t+1)} = \beta\,\mathrm{EMA}_{sid}^{(t)} + (1-\beta)\,\mathrm{raw}_{sid}^{(t)}.
+$$
+
+Effective count floors are encoded as:
+
+$$
+\mathrm{floor}_{\mathrm{eff}} = \min(\mathrm{config\_floor},\, \mathrm{diverse\_candidate\_count}),
+$$
+
+with hysteresis and grace checks covered by unit contracts.
+
+### 17.3 Runtime/synthetic gate harness status
+
+- `C4-T11`..`C4-T14` runtime smokes are present as opt-in tests (env-gated) to avoid default heavy execution.
+- `C4-T15`..`C4-T16` synthetic matrix and continuation checks are present as opt-in tests (env-gated).
+- `C4-T17` remains manual by definition and is represented as an explicit skipped placeholder test requiring artifact review.
+
+Current local fast-suite result:
+
+- `pytest tests/test_elevation_chunk4_coupling_contracts.py tests/test_elevation_chunk4_id_support_lifecycle.py tests/test_elevation_chunk4_checkpoint_contracts.py tests/test_elevation_chunk4_smoke_modes.py tests/test_elevation_chunk4_synthetic_matrix.py -q`
+- `29 passed, 7 skipped`.
