@@ -71,11 +71,22 @@ from utils.elevation_stage1_helpers import (
     optimizer_rebuild_required,
 )
 from utils.elevation_chunk4_helpers import (
+    CHECKPOINT_SCHEMA_VERSION as CHUNK4_CHECKPOINT_SCHEMA_VERSION,
     resolve_effective_chunk4_modes,
     mode_enables_weighted_coupling,
     mode_enables_hard_prune,
     associate_expected_points_to_surfels,
     reduce_coupling_loss,
+    initialize_persistent_surfel_state,
+    apply_densify_to_surfel_state,
+    apply_prune_reorder_to_surfel_state,
+    assert_surfel_id_integrity,
+    update_support_buffers_by_id,
+    compute_support_failure_mask,
+    apply_prune_hysteresis,
+    apply_new_surfel_grace,
+    build_chunk4_checkpoint_payload,
+    resolve_chunk4_resume_action,
 )
 import open3d as o3d
 from PIL import Image
@@ -255,8 +266,18 @@ def is_fully_in_sonar_fov(xyz, scaling, camera, sonar_config, scale_factor):
     return fully_inside
 
 
-def prune_outside_fov(gaussians, training_frames, sonar_config, scale_factor,
-                      require_all=False, check_size=True):
+def prune_outside_fov(
+    gaussians,
+    training_frames,
+    sonar_config,
+    scale_factor,
+    require_all=False,
+    check_size=True,
+    chunk4_runtime_state=None,
+    chunk4_cfg=None,
+    reason="fov",
+    current_iter=0,
+):
     """
     Prune Gaussians that are outside the FOV of training cameras.
 
@@ -307,9 +328,25 @@ def prune_outside_fov(gaussians, training_frames, sonar_config, scale_factor,
     num_to_prune = prune_mask.sum().item()
 
     if num_to_prune > 0:
-        gaussians.prune_points(prune_mask)
+        if chunk4_runtime_state is not None:
+            cfg = chunk4_cfg if chunk4_cfg is not None else ELEV_CHUNK4_CFG
+            ensure_chunk4_state_capacity(
+                chunk4_runtime_state,
+                gaussians,
+                cfg,
+                current_iter=current_iter,
+            )
+            num_to_prune = apply_row_prune_with_chunk4_state(
+                gaussians,
+                chunk4_runtime_state,
+                prune_mask,
+                cfg=cfg,
+                reason=reason,
+            )
+        else:
+            gaussians.prune_points(prune_mask)
 
-    return num_to_prune
+    return int(num_to_prune)
 
 
 def create_pose_pyramid_wireframe(position, rotation_matrix, depth=0.5,
@@ -980,6 +1017,490 @@ def compute_chunk4_coupling_for_frame(
     return out
 
 
+def camera_world_position_tensor(camera, device):
+    r_w2c = torch.as_tensor(camera.R, device=device, dtype=torch.float32)
+    t_w2c = torch.as_tensor(camera.T, device=device, dtype=torch.float32)
+    r_c2w = r_w2c.transpose(0, 1)
+    return -(r_c2w @ t_w2c)
+
+
+def camera_forward_world_tensor(camera, device):
+    r_w2c = torch.as_tensor(camera.R, device=device, dtype=torch.float32)
+    r_c2w = r_w2c.transpose(0, 1)
+    forward = r_c2w[:, 2]
+    return forward / torch.norm(forward).clamp_min(1e-8)
+
+
+def select_diverse_support_frames(sampled_frame_indices, training_frames, min_angle_deg, device):
+    if not sampled_frame_indices:
+        return []
+    min_angle = max(0.0, float(min_angle_deg))
+    if min_angle <= 0.0:
+        return list(sampled_frame_indices)
+
+    selected = []
+    selected_dirs = []
+    cos_thr = math.cos(math.radians(min_angle))
+    for frame_idx in sampled_frame_indices:
+        direction = camera_forward_world_tensor(training_frames[frame_idx], device=device)
+        keep = True
+        for prev in selected_dirs:
+            cos_sim = torch.clamp(torch.dot(direction, prev), -1.0, 1.0)
+            if float(cos_sim.item()) > cos_thr:
+                keep = False
+                break
+        if keep:
+            selected.append(frame_idx)
+            selected_dirs.append(direction)
+    if not selected:
+        selected.append(sampled_frame_indices[0])
+    return selected
+
+
+def compute_chunk4_support_observations_for_frame(
+    frame_idx,
+    training_frames,
+    gaussians,
+    render_pkg,
+    rendered,
+    gt_image,
+    sonar_config,
+    sonar_scale_factor,
+    support_residual_thresh,
+):
+    device = gaussians.get_xyz.device
+    empty_idx = torch.empty((0,), dtype=torch.long, device=device)
+    out = {
+        "candidate_idx": empty_idx,
+        "support_idx": empty_idx,
+        "candidate_count": 0,
+        "support_count": 0,
+        "residual_mean": 0.0,
+        "residual_p95": 0.0,
+        "valid_projection_count": 0,
+        "meaningful_gt_count": 0,
+    }
+
+    visible_mask = render_pkg.get("visibility_filter")
+    if visible_mask is None:
+        return out
+    visible_mask = visible_mask.to(dtype=torch.bool)
+    if not bool(visible_mask.any().item()):
+        return out
+
+    row_idx = torch.where(visible_mask)[0]
+    xyz_visible = gaussians.get_xyz[row_idx]
+    proj = sonar_project_points(
+        xyz_visible,
+        training_frames[frame_idx],
+        sonar_config,
+        scale_factor=sonar_scale_factor,
+    )
+    valid_proj = proj.valid & torch.isfinite(proj.row) & torch.isfinite(proj.col)
+    out["valid_projection_count"] = int(valid_proj.sum().item())
+    if not bool(valid_proj.any().item()):
+        return out
+
+    gt_gray = gt_image.mean(dim=0)
+    rendered_gray = rendered.mean(dim=0)
+    gt_sample, gt_valid = sample_gt(gt_gray, proj.row, proj.col)
+    rendered_sample, rendered_valid = sample_gt(rendered_gray, proj.row, proj.col)
+    meaningful_gt = gt_valid & rendered_valid & (gt_sample > 0.0)
+    out["meaningful_gt_count"] = int(meaningful_gt.sum().item())
+
+    candidate_mask = valid_proj & meaningful_gt
+    if not bool(candidate_mask.any().item()):
+        return out
+
+    residual = torch.abs(rendered_sample - gt_sample)
+    support_mask = candidate_mask & (residual <= float(support_residual_thresh))
+
+    candidate_idx = row_idx[candidate_mask]
+    support_idx = row_idx[support_mask]
+    out["candidate_idx"] = candidate_idx
+    out["support_idx"] = support_idx
+    out["candidate_count"] = int(candidate_idx.shape[0])
+    out["support_count"] = int(support_idx.shape[0])
+
+    if out["support_count"] > 0:
+        support_residual = residual[support_mask].detach()
+        out["residual_mean"] = float(support_residual.mean().item())
+        out["residual_p95"] = float(torch.quantile(support_residual, 0.95).item())
+
+    return out
+
+
+def init_chunk4_runtime_state(gaussians, cfg, init_iter=0):
+    if not bool(cfg.support_use_persistent_ids):
+        return None
+    device = gaussians.get_xyz.device
+    num_surfels = int(gaussians.get_xyz.shape[0])
+    persistent_state = initialize_persistent_surfel_state(
+        num_surfels=num_surfels,
+        device=device,
+        init_birth_iter=init_iter,
+    )
+    if bool(cfg.surfel_id_asserts):
+        assert_surfel_id_integrity(persistent_state)
+    next_surfel_id = int(persistent_state["next_surfel_id"])
+    return {
+        "persistent_state": persistent_state,
+        "support_count_by_id": torch.zeros((next_surfel_id,), dtype=torch.float32, device=device),
+        "diverse_candidate_count_by_id": torch.zeros((next_surfel_id,), dtype=torch.float32, device=device),
+        "last_support_stats": {},
+    }
+
+
+def ensure_chunk4_state_capacity(chunk4_runtime_state, gaussians, cfg, current_iter):
+    if chunk4_runtime_state is None:
+        return None
+
+    state = chunk4_runtime_state["persistent_state"]
+    num_rows = int(gaussians.get_xyz.shape[0])
+    known_rows = int(state["surfel_ids"].shape[0])
+    if num_rows < known_rows:
+        raise RuntimeError(
+            "Chunk-4 persistent state lost row alignment: "
+            f"model_rows={num_rows}, state_rows={known_rows}. "
+            "Use Chunk-4 prune wrappers for topology edits."
+        )
+    if num_rows > known_rows:
+        n_new = num_rows - known_rows
+        state = apply_densify_to_surfel_state(state, n_new=n_new, current_iter=current_iter)
+        chunk4_runtime_state["persistent_state"] = state
+        support_count = chunk4_runtime_state["support_count_by_id"]
+        diverse_count = chunk4_runtime_state["diverse_candidate_count_by_id"]
+        device = support_count.device
+        chunk4_runtime_state["support_count_by_id"] = torch.cat(
+            [support_count, torch.zeros((n_new,), dtype=torch.float32, device=device)],
+            dim=0,
+        )
+        chunk4_runtime_state["diverse_candidate_count_by_id"] = torch.cat(
+            [diverse_count, torch.zeros((n_new,), dtype=torch.float32, device=device)],
+            dim=0,
+        )
+
+    if bool(cfg.surfel_id_asserts):
+        assert_surfel_id_integrity(chunk4_runtime_state["persistent_state"])
+    return chunk4_runtime_state
+
+
+def apply_row_prune_with_chunk4_state(gaussians, chunk4_runtime_state, row_prune_mask, cfg, reason):
+    prune_mask = row_prune_mask.to(dtype=torch.bool)
+    num_to_prune = int(prune_mask.sum().item())
+    if num_to_prune <= 0:
+        return 0
+
+    keep_idx = torch.where(~prune_mask)[0]
+    gaussians.prune_points(prune_mask)
+
+    if chunk4_runtime_state is not None:
+        state = chunk4_runtime_state["persistent_state"]
+        state = apply_prune_reorder_to_surfel_state(state, keep_row_idx=keep_idx)
+        chunk4_runtime_state["persistent_state"] = state
+        if bool(cfg.surfel_id_asserts):
+            assert_surfel_id_integrity(state)
+
+    return num_to_prune
+
+
+def update_chunk4_support_runtime(
+    global_iter,
+    sampled_frame_indices,
+    iter_support_obs,
+    training_frames,
+    gaussians,
+    chunk4_runtime_state,
+    chunk4_cfg,
+):
+    zero_stats = {
+        "match_frames": 0,
+        "diverse_frames": 0,
+        "candidate_obs": 0,
+        "support_obs": 0,
+        "support_ratio": 0.0,
+        "residual_mean": 0.0,
+        "residual_p95": 0.0,
+        "active_support_ge2_frac": 0.0,
+        "active_support_ge3_frac": 0.0,
+        "active_support_median": 0.0,
+        "grace_active_count": 0,
+        "pruned_support_count": 0,
+        "hard_prune_enabled": mode_enables_hard_prune(chunk4_cfg.effective_support_mode),
+        "duplicate_active_ids": 0,
+        "invalid_id_to_row": 0,
+    }
+
+    if chunk4_runtime_state is None:
+        return zero_stats
+
+    ensure_chunk4_state_capacity(chunk4_runtime_state, gaussians, chunk4_cfg, global_iter)
+    state = chunk4_runtime_state["persistent_state"]
+    num_rows = int(gaussians.get_xyz.shape[0])
+    device = gaussians.get_xyz.device
+
+    diverse_frames = select_diverse_support_frames(
+        sampled_frame_indices,
+        training_frames,
+        min_angle_deg=chunk4_cfg.support_view_angle_min_deg,
+        device=device,
+    )
+
+    row_candidate_counts = torch.zeros((num_rows,), dtype=torch.float32, device=device)
+    row_support_counts = torch.zeros((num_rows,), dtype=torch.float32, device=device)
+    residual_values = []
+    match_frames = 0
+    for frame_idx in diverse_frames:
+        obs = iter_support_obs.get(frame_idx)
+        if obs is None:
+            continue
+        cand_idx = obs["candidate_idx"]
+        supp_idx = obs["support_idx"]
+        if cand_idx.numel() > 0:
+            row_candidate_counts[cand_idx] += 1.0
+        if supp_idx.numel() > 0:
+            row_support_counts[supp_idx] += 1.0
+            residual_values.append(float(obs["residual_mean"]))
+            match_frames += 1
+
+    surfel_ids = state["surfel_ids"].to(dtype=torch.long)
+    support_inc_by_id = torch.zeros_like(chunk4_runtime_state["support_count_by_id"])
+    diverse_inc_by_id = torch.zeros_like(chunk4_runtime_state["diverse_candidate_count_by_id"])
+    if surfel_ids.numel() > 0:
+        support_inc_by_id[surfel_ids] = row_support_counts
+        diverse_inc_by_id[surfel_ids] = row_candidate_counts
+
+    chunk4_runtime_state["support_count_by_id"] = (
+        chunk4_runtime_state["support_count_by_id"] + support_inc_by_id
+    )
+    chunk4_runtime_state["diverse_candidate_count_by_id"] = (
+        chunk4_runtime_state["diverse_candidate_count_by_id"] + diverse_inc_by_id
+    )
+
+    row_support_ratio = torch.where(
+        row_candidate_counts > 0,
+        row_support_counts / row_candidate_counts.clamp_min(1.0),
+        torch.zeros_like(row_candidate_counts),
+    )
+    state = update_support_buffers_by_id(
+        state,
+        row_support_raw=row_support_ratio,
+        ema_decay=chunk4_cfg.support_ema_decay,
+    )
+
+    support_count_by_id = chunk4_runtime_state["support_count_by_id"]
+    diverse_count_by_id = chunk4_runtime_state["diverse_candidate_count_by_id"]
+    fail_mask_by_id, _ = compute_support_failure_mask(
+        iteration=global_iter,
+        support_count_by_id=support_count_by_id,
+        diverse_candidate_count_by_id=diverse_count_by_id,
+        warmup_iters=chunk4_cfg.support_warmup_iters,
+        late_phase_start_iter=chunk4_cfg.support_late_phase_start_iter,
+        min_ratio_mid=chunk4_cfg.support_min_ratio_mid,
+        min_ratio_late=chunk4_cfg.support_min_ratio_late,
+        min_count_mid=chunk4_cfg.support_min_count_mid,
+        min_count_late=chunk4_cfg.support_min_count_late,
+        use_ratio=chunk4_cfg.support_use_ratio,
+    )
+    fail_streak_by_id, prune_mask_by_id = apply_prune_hysteresis(
+        fail_streak_by_id=state["fail_streak_by_id"],
+        fail_mask_by_id=fail_mask_by_id,
+        patience=chunk4_cfg.support_prune_patience,
+    )
+    state["fail_streak_by_id"] = fail_streak_by_id
+    prune_mask_by_id = apply_new_surfel_grace(
+        prune_mask_by_id=prune_mask_by_id,
+        birth_iter_by_id=state["birth_iter_by_id"],
+        current_iter=global_iter,
+        grace_iters=chunk4_cfg.support_new_surfel_grace_iters,
+        enabled=chunk4_cfg.support_use_new_surfel_grace,
+    )
+
+    pruned_support_count = 0
+    if mode_enables_hard_prune(chunk4_cfg.effective_support_mode):
+        active_prune_mask = prune_mask_by_id[state["surfel_ids"]]
+        pruned_support_count = apply_row_prune_with_chunk4_state(
+            gaussians,
+            chunk4_runtime_state,
+            active_prune_mask,
+            cfg=chunk4_cfg,
+            reason="support",
+        )
+        state = chunk4_runtime_state["persistent_state"]
+
+    active_ids = state["surfel_ids"]
+    active_support = support_count_by_id[active_ids] if active_ids.numel() > 0 else torch.zeros(0, device=device)
+    ge2 = float((active_support >= 2.0).float().mean().item()) if active_support.numel() > 0 else 0.0
+    ge3 = float((active_support >= 3.0).float().mean().item()) if active_support.numel() > 0 else 0.0
+    median_support = float(active_support.median().item()) if active_support.numel() > 0 else 0.0
+
+    age = global_iter - state["birth_iter_by_id"].to(dtype=torch.long)
+    grace_active = age < int(chunk4_cfg.support_new_surfel_grace_iters)
+    grace_active_count = int(grace_active[active_ids].sum().item()) if active_ids.numel() > 0 else 0
+
+    duplicate_active_ids = 0
+    invalid_id_to_row = 0
+    if bool(chunk4_cfg.surfel_id_asserts):
+        assert_surfel_id_integrity(state)
+    if active_ids.numel() > 0:
+        duplicate_active_ids = int(active_ids.numel() - torch.unique(active_ids).numel())
+    expected_map = torch.full_like(state["id_to_row"], -1)
+    if active_ids.numel() > 0:
+        expected_map[active_ids] = torch.arange(active_ids.shape[0], device=active_ids.device, dtype=torch.long)
+    invalid_id_to_row = int((state["id_to_row"] != expected_map).sum().item())
+
+    candidate_obs = float(row_candidate_counts.sum().item())
+    support_obs = float(row_support_counts.sum().item())
+    support_ratio = float(support_obs / max(candidate_obs, 1.0))
+    residual_mean = float(np.mean(residual_values)) if residual_values else 0.0
+    residual_p95 = float(np.quantile(np.asarray(residual_values, dtype=np.float64), 0.95)) if residual_values else 0.0
+
+    stats = {
+        "match_frames": int(match_frames),
+        "diverse_frames": int(len(diverse_frames)),
+        "candidate_obs": int(candidate_obs),
+        "support_obs": int(support_obs),
+        "support_ratio": support_ratio,
+        "residual_mean": residual_mean,
+        "residual_p95": residual_p95,
+        "active_support_ge2_frac": ge2,
+        "active_support_ge3_frac": ge3,
+        "active_support_median": median_support,
+        "grace_active_count": grace_active_count,
+        "pruned_support_count": int(pruned_support_count),
+        "hard_prune_enabled": mode_enables_hard_prune(chunk4_cfg.effective_support_mode),
+        "duplicate_active_ids": duplicate_active_ids,
+        "invalid_id_to_row": invalid_id_to_row,
+    }
+    chunk4_runtime_state["last_support_stats"] = stats
+    chunk4_runtime_state["persistent_state"] = state
+    return stats
+
+
+def build_chunk4_runtime_checkpoint_state(chunk4_runtime_state, active_frame_keys, cfg):
+    if chunk4_runtime_state is None:
+        return None
+
+    state = chunk4_runtime_state["persistent_state"]
+    support_scheduler_state = {
+        "last_support_stats": dict(chunk4_runtime_state.get("last_support_stats", {})),
+        "warmup_iters": int(cfg.support_warmup_iters),
+        "late_phase_start_iter": int(cfg.support_late_phase_start_iter),
+        "prune_patience": int(cfg.support_prune_patience),
+    }
+    return build_chunk4_checkpoint_payload(
+        surfel_ids=state["surfel_ids"],
+        next_surfel_id=state["next_surfel_id"],
+        id_to_row=state["id_to_row"],
+        ema_by_id=state["ema_by_id"],
+        last_raw_by_id=state["last_raw_by_id"],
+        birth_iter_by_id=state["birth_iter_by_id"],
+        fail_streak_by_id=state["fail_streak_by_id"],
+        active_frame_keys=active_frame_keys,
+        couple_mode=cfg.effective_couple_mode,
+        support_mode=cfg.effective_support_mode,
+        support_scheduler_state=support_scheduler_state,
+        support_count_by_id=chunk4_runtime_state["support_count_by_id"],
+        diverse_candidate_count_by_id=chunk4_runtime_state["diverse_candidate_count_by_id"],
+    )
+
+
+def restore_chunk4_runtime_state_from_checkpoint(chunk4_payload, gaussians, cfg):
+    if not isinstance(chunk4_payload, dict):
+        raise ValueError("Chunk-4 checkpoint payload must be a dict")
+
+    device = gaussians.get_xyz.device
+    num_rows = int(gaussians.get_xyz.shape[0])
+
+    def _load_tensor(name, dtype):
+        value = chunk4_payload.get(name)
+        if value is None:
+            raise ValueError(f"Chunk-4 checkpoint missing '{name}'")
+        return torch.as_tensor(value, dtype=dtype, device=device).reshape(-1)
+
+    surfel_ids = _load_tensor("surfel_ids", torch.long)
+    next_surfel_id = int(chunk4_payload.get("next_surfel_id", -1))
+    id_to_row = _load_tensor("id_to_row", torch.long)
+    ema_by_id = _load_tensor("ema_by_id", torch.float32)
+    last_raw_by_id = _load_tensor("last_raw_by_id", torch.float32)
+    birth_iter_by_id = _load_tensor("birth_iter_by_id", torch.long)
+    fail_streak_by_id = _load_tensor("fail_streak_by_id", torch.long)
+
+    if surfel_ids.shape[0] != num_rows:
+        raise ValueError(
+            "Chunk-4 checkpoint surfel row mismatch: "
+            f"checkpoint_rows={surfel_ids.shape[0]}, runtime_rows={num_rows}"
+        )
+    if next_surfel_id < 0:
+        raise ValueError(f"Chunk-4 checkpoint has invalid next_surfel_id={next_surfel_id}")
+
+    expected_len = int(next_surfel_id)
+    id_tensors = {
+        "id_to_row": id_to_row,
+        "ema_by_id": ema_by_id,
+        "last_raw_by_id": last_raw_by_id,
+        "birth_iter_by_id": birth_iter_by_id,
+        "fail_streak_by_id": fail_streak_by_id,
+    }
+    for name, tensor in id_tensors.items():
+        if int(tensor.shape[0]) != expected_len:
+            raise ValueError(
+                "Chunk-4 checkpoint id-space length mismatch: "
+                f"{name}={tensor.shape[0]}, expected={expected_len}"
+            )
+
+    support_count_by_id = chunk4_payload.get("support_count_by_id")
+    if support_count_by_id is None:
+        support_count_by_id = torch.zeros((expected_len,), dtype=torch.float32, device=device)
+    else:
+        support_count_by_id = torch.as_tensor(support_count_by_id, dtype=torch.float32, device=device).reshape(-1)
+    diverse_candidate_count_by_id = chunk4_payload.get("diverse_candidate_count_by_id")
+    if diverse_candidate_count_by_id is None:
+        diverse_candidate_count_by_id = torch.zeros((expected_len,), dtype=torch.float32, device=device)
+    else:
+        diverse_candidate_count_by_id = torch.as_tensor(
+            diverse_candidate_count_by_id,
+            dtype=torch.float32,
+            device=device,
+        ).reshape(-1)
+
+    if int(support_count_by_id.shape[0]) != expected_len:
+        raise ValueError(
+            "Chunk-4 checkpoint support_count_by_id length mismatch: "
+            f"got={support_count_by_id.shape[0]}, expected={expected_len}"
+        )
+    if int(diverse_candidate_count_by_id.shape[0]) != expected_len:
+        raise ValueError(
+            "Chunk-4 checkpoint diverse_candidate_count_by_id length mismatch: "
+            f"got={diverse_candidate_count_by_id.shape[0]}, expected={expected_len}"
+        )
+
+    persistent_state = {
+        "surfel_ids": surfel_ids,
+        "next_surfel_id": next_surfel_id,
+        "id_to_row": id_to_row,
+        "ema_by_id": ema_by_id,
+        "last_raw_by_id": last_raw_by_id,
+        "birth_iter_by_id": birth_iter_by_id,
+        "fail_streak_by_id": fail_streak_by_id,
+    }
+    if bool(cfg.surfel_id_asserts):
+        assert_surfel_id_integrity(persistent_state)
+
+    scheduler_state = chunk4_payload.get("support_scheduler_state")
+    if isinstance(scheduler_state, dict):
+        last_support_stats = dict(scheduler_state.get("last_support_stats", {}))
+    else:
+        last_support_stats = {}
+
+    return {
+        "persistent_state": persistent_state,
+        "support_count_by_id": support_count_by_id,
+        "diverse_candidate_count_by_id": diverse_candidate_count_by_id,
+        "last_support_stats": last_support_stats,
+    }
+
+
 def apply_opacity_policy(gaussians, fixed_opacity, fixed_target=FIXED_OPACITY_TARGET,
                          learnable_opacity_lr=GAUSSIAN_OPACITY_LR):
     """Apply and re-apply opacity policy while keeping optimizer group structure intact."""
@@ -1005,7 +1526,8 @@ def apply_opacity_policy(gaussians, fixed_opacity, fixed_target=FIXED_OPACITY_TA
 
 
 def save_training_checkpoint(checkpoint_path, gaussians, sonar_scale_factor, scale_optimizer,
-                             iteration, stage_name, metadata=None, stage1_runtime_state=None):
+                             iteration, stage_name, metadata=None, stage1_runtime_state=None,
+                             chunk4_runtime_state=None):
     checkpoint_dir = os.path.dirname(checkpoint_path)
     if checkpoint_dir:
         os.makedirs(checkpoint_dir, exist_ok=True)
@@ -1018,6 +1540,7 @@ def save_training_checkpoint(checkpoint_path, gaussians, sonar_scale_factor, sca
         "scale_optimizer_state_dict": scale_optimizer.state_dict(),
         "metadata": metadata or {},
         "elevation_stage1_state": stage1_runtime_state or {},
+        "elevation_chunk4_state": chunk4_runtime_state,
     }
     torch.save(payload, checkpoint_path)
     print(f"[Checkpoint] Saved: {checkpoint_path} (iter={iteration}, stage={stage_name})")
@@ -1034,7 +1557,7 @@ def load_training_checkpoint(checkpoint_path, gaussians, gaussian_training_args,
         # Compatibility with legacy tuple checkpoints: (gaussians.capture(), iteration)
         model_args, iteration = payload
         gaussians.restore(model_args, gaussian_training_args)
-        return int(iteration), {"format": "legacy_tuple"}, None
+        return int(iteration), {"format": "legacy_tuple"}, None, None
 
     if not isinstance(payload, dict):
         raise RuntimeError(f"Unsupported checkpoint format in {checkpoint_path}")
@@ -1056,7 +1579,8 @@ def load_training_checkpoint(checkpoint_path, gaussians, gaussian_training_args,
     iteration = int(payload.get("iteration", 0))
     metadata = payload.get("metadata", {})
     stage1_runtime_state = payload.get("elevation_stage1_state")
-    return iteration, metadata, stage1_runtime_state
+    chunk4_runtime_state = payload.get("elevation_chunk4_state")
+    return iteration, metadata, stage1_runtime_state, chunk4_runtime_state
 
 
 class Tee:
@@ -1962,6 +2486,22 @@ class ElevationChunk4Config:
     couple_sigma_depth: float
     couple_min_w: float
     couple_max_candidates: int
+    support_warmup_iters: int
+    support_late_phase_start_iter: int
+    support_use_persistent_ids: bool
+    support_use_ratio: bool
+    support_use_new_surfel_grace: bool
+    support_new_surfel_grace_iters: int
+    support_min_ratio_mid: float
+    support_min_ratio_late: float
+    support_min_count_mid: int
+    support_min_count_late: int
+    support_view_angle_min_deg: float
+    support_residual_thresh: float
+    support_ema_decay: float
+    support_prune_patience: int
+    support_resume_mismatch_policy: str
+    surfel_id_asserts: bool
 
 
 def parse_elevation_chunk4_config(elevation_aware):
@@ -1985,6 +2525,27 @@ def parse_elevation_chunk4_config(elevation_aware):
     couple_min_w = env_float("ELEV_COUPLE_MIN_W", 0.10)
     couple_max_candidates = env_int("ELEV_COUPLE_MAX_CANDIDATES", 2048)
 
+    support_warmup_iters = env_int("ELEV_SUPPORT_WARMUP_ITERS", 4000)
+    support_late_phase_start_iter = env_int("ELEV_SUPPORT_LATE_PHASE_START_ITERS", 8000)
+    support_use_persistent_ids = env_bool("ELEV_SUPPORT_USE_PERSISTENT_IDS", True)
+    support_use_ratio = env_bool("ELEV_SUPPORT_USE_RATIO", True)
+    support_use_new_surfel_grace = env_bool("ELEV_SUPPORT_USE_NEW_SURFEL_GRACE", True)
+    support_new_surfel_grace_iters = env_int("ELEV_SUPPORT_NEW_SURFEL_GRACE_ITERS", 1500)
+    support_min_ratio_mid = env_float("ELEV_SUPPORT_MIN_RATIO_MID", 0.25)
+    support_min_ratio_late = env_float("ELEV_SUPPORT_MIN_RATIO_LATE", 0.45)
+    support_min_count_mid = env_int("ELEV_SUPPORT_MIN_COUNT_MID", 2)
+    support_min_count_late = env_int("ELEV_SUPPORT_MIN_COUNT_LATE", 4)
+    support_view_angle_min_deg = env_float("ELEV_SUPPORT_VIEW_ANGLE_MIN_DEG", 8.0)
+    support_residual_thresh = env_float("ELEV_SUPPORT_RESIDUAL_THRESH", 0.20)
+    support_ema_decay = env_float("ELEV_SUPPORT_EMA_DECAY", 0.90)
+    support_prune_patience = env_int("ELEV_SUPPORT_PRUNE_PATIENCE", 4)
+    support_resume_mismatch_policy = env_choice(
+        "ELEV_CHUNK4_RESUME_MISMATCH",
+        "strict",
+        {"strict", "reset_chunk4", "reset_all"},
+    )
+    surfel_id_asserts = env_bool("ELEV_SURFEL_ID_ASSERTS", True)
+
     _require_config("ELEV_COUPLE_WEIGHT_START", couple_weight_start >= 0.0, "must be >= 0")
     _require_config("ELEV_COUPLE_WEIGHT_END", couple_weight_end >= 0.0, "must be >= 0")
     _require_config("ELEV_COUPLE_WARMUP", couple_warmup >= 0, "must be >= 0")
@@ -1995,6 +2556,35 @@ def parse_elevation_chunk4_config(elevation_aware):
     _require_config("ELEV_COUPLE_SIGMA_DEPTH", couple_sigma_depth > 0.0, "must be > 0")
     _require_config("ELEV_COUPLE_MIN_W", 0.0 <= couple_min_w <= 1.0, "must be in [0, 1]")
     _require_config("ELEV_COUPLE_MAX_CANDIDATES", couple_max_candidates >= 0, "must be >= 0")
+    _require_config("ELEV_SUPPORT_WARMUP_ITERS", support_warmup_iters >= 0, "must be >= 0")
+    _require_config(
+        "ELEV_SUPPORT_LATE_PHASE_START_ITERS",
+        support_late_phase_start_iter >= support_warmup_iters,
+        "must be >= ELEV_SUPPORT_WARMUP_ITERS",
+    )
+    _require_config(
+        "ELEV_SUPPORT_NEW_SURFEL_GRACE_ITERS",
+        support_new_surfel_grace_iters >= 0,
+        "must be >= 0",
+    )
+    _require_config("ELEV_SUPPORT_MIN_RATIO_MID", 0.0 <= support_min_ratio_mid <= 1.0, "must be in [0, 1]")
+    _require_config("ELEV_SUPPORT_MIN_RATIO_LATE", 0.0 <= support_min_ratio_late <= 1.0, "must be in [0, 1]")
+    _require_config(
+        "ELEV_SUPPORT_MIN_RATIO_PHASES",
+        support_min_ratio_mid <= support_min_ratio_late,
+        "must satisfy mid <= late",
+    )
+    _require_config("ELEV_SUPPORT_MIN_COUNT_MID", support_min_count_mid >= 0, "must be >= 0")
+    _require_config("ELEV_SUPPORT_MIN_COUNT_LATE", support_min_count_late >= 0, "must be >= 0")
+    _require_config(
+        "ELEV_SUPPORT_MIN_COUNT_PHASES",
+        support_min_count_mid <= support_min_count_late,
+        "must satisfy mid <= late",
+    )
+    _require_config("ELEV_SUPPORT_VIEW_ANGLE_MIN_DEG", support_view_angle_min_deg >= 0.0, "must be >= 0")
+    _require_config("ELEV_SUPPORT_RESIDUAL_THRESH", support_residual_thresh > 0.0, "must be > 0")
+    _require_config("ELEV_SUPPORT_EMA_DECAY", 0.0 <= support_ema_decay <= 1.0, "must be in [0, 1]")
+    _require_config("ELEV_SUPPORT_PRUNE_PATIENCE", support_prune_patience >= 1, "must be >= 1")
 
     return ElevationChunk4Config(
         couple_mode=couple_mode,
@@ -2012,6 +2602,22 @@ def parse_elevation_chunk4_config(elevation_aware):
         couple_sigma_depth=couple_sigma_depth,
         couple_min_w=couple_min_w,
         couple_max_candidates=couple_max_candidates,
+        support_warmup_iters=support_warmup_iters,
+        support_late_phase_start_iter=support_late_phase_start_iter,
+        support_use_persistent_ids=support_use_persistent_ids,
+        support_use_ratio=support_use_ratio,
+        support_use_new_surfel_grace=support_use_new_surfel_grace,
+        support_new_surfel_grace_iters=support_new_surfel_grace_iters,
+        support_min_ratio_mid=support_min_ratio_mid,
+        support_min_ratio_late=support_min_ratio_late,
+        support_min_count_mid=support_min_count_mid,
+        support_min_count_late=support_min_count_late,
+        support_view_angle_min_deg=support_view_angle_min_deg,
+        support_residual_thresh=support_residual_thresh,
+        support_ema_decay=support_ema_decay,
+        support_prune_patience=support_prune_patience,
+        support_resume_mismatch_policy=support_resume_mismatch_policy,
+        surfel_id_asserts=surfel_id_asserts,
     )
 
 
@@ -2198,11 +2804,11 @@ def main():
             "[Elevation Chunk 4] coupling diagnostics are requested but Stage-1 is off; "
             "coupling will remain inactive because no posterior cache is produced"
         )
-    if mode_enables_hard_prune(ELEV_CHUNK4_CFG.effective_support_mode):
-        print(
-            "[Elevation Chunk 4] support hard-prune mode is requested, "
-            "but support-driven prune wiring is not enabled yet in this script"
-        )
+    print(
+        "[Elevation Chunk 4] support runtime wiring: "
+        f"persistent_ids={int(ELEV_CHUNK4_CFG.support_use_persistent_ids)}, "
+        f"hard_prune_active={int(mode_enables_hard_prune(ELEV_CHUNK4_CFG.effective_support_mode))}"
+    )
     if ELEV_STAGE1_CFG.effective_stage1_mode == "off":
         print("[Elevation Stage 1] effective_mode=off -> sampler fallback=legacy single-frame shuffled path")
     if SONAR_FIXED_OPACITY:
@@ -2697,9 +3303,21 @@ def main():
     optim_elev = build_optim_elev(pixel_logits_registry, ELEV_STAGE1_CFG.logit_lr)
 
     training_iter_offset = 0
+    chunk4_resume_enabled = bool(ELEV_CHUNK4_CFG.support_use_persistent_ids)
+    chunk4_runtime_state = None
+    if chunk4_resume_enabled:
+        chunk4_runtime_state = init_chunk4_runtime_state(gaussians, ELEV_CHUNK4_CFG, init_iter=0)
+        if chunk4_runtime_state is not None:
+            print(
+                "[Elevation Chunk 4] runtime initialized: "
+                f"rows={int(gaussians.get_xyz.shape[0])}, "
+                f"schema={CHUNK4_CHECKPOINT_SCHEMA_VERSION}"
+            )
+    elif not bool(ELEV_CHUNK4_CFG.support_use_persistent_ids):
+        print("[Elevation Chunk 4] runtime state skipped: persistent IDs disabled")
 
     if SONAR_LOAD_CHECKPOINT:
-        resumed_iter, resume_meta, resume_stage1_state = load_training_checkpoint(
+        resumed_iter, resume_meta, resume_stage1_state, resume_chunk4_state = load_training_checkpoint(
             SONAR_LOAD_CHECKPOINT,
             gaussians,
             gaussian_training_args,
@@ -2710,6 +3328,64 @@ def main():
         print(f"[Checkpoint] Loaded: {SONAR_LOAD_CHECKPOINT} (iter={resumed_iter})")
         if resume_meta:
             print(f"[Checkpoint] Metadata: {resume_meta}")
+
+        if chunk4_resume_enabled:
+            chunk4_runtime_state = init_chunk4_runtime_state(
+                gaussians,
+                ELEV_CHUNK4_CFG,
+                init_iter=training_iter_offset,
+            )
+            if resume_chunk4_state is None:
+                print("[Elevation Chunk 4] checkpoint has no state; using fresh runtime state")
+            else:
+                chunk4_resume_schema = str(resume_chunk4_state.get("checkpoint_schema_version", ""))
+                chunk4_resume_fingerprint = str(resume_chunk4_state.get("active_frame_fingerprint", ""))
+                chunk4_resume_fingerprint_matches = chunk4_resume_fingerprint == active_frame_fingerprint
+                chunk4_resume_action = resolve_chunk4_resume_action(
+                    checkpoint_schema_version=chunk4_resume_schema,
+                    runtime_schema_version=CHUNK4_CHECKPOINT_SCHEMA_VERSION,
+                    frame_fingerprint_matches=chunk4_resume_fingerprint_matches,
+                    mismatch_policy=ELEV_CHUNK4_CFG.support_resume_mismatch_policy,
+                )
+                if chunk4_resume_action == "load":
+                    try:
+                        chunk4_runtime_state = restore_chunk4_runtime_state_from_checkpoint(
+                            resume_chunk4_state,
+                            gaussians,
+                            ELEV_CHUNK4_CFG,
+                        )
+                        print(
+                            "[Elevation Chunk 4] loaded runtime state: "
+                            f"rows={int(chunk4_runtime_state['persistent_state']['surfel_ids'].shape[0])}, "
+                            f"next_id={int(chunk4_runtime_state['persistent_state']['next_surfel_id'])}, "
+                            f"fingerprint_match={int(chunk4_resume_fingerprint_matches)}"
+                        )
+                    except ValueError as exc:
+                        if ELEV_CHUNK4_CFG.support_resume_mismatch_policy == "strict":
+                            raise
+                        chunk4_runtime_state = init_chunk4_runtime_state(
+                            gaussians,
+                            ELEV_CHUNK4_CFG,
+                            init_iter=training_iter_offset,
+                        )
+                        print(
+                            "[Elevation Chunk 4] reset runtime state after invalid payload: "
+                            f"reason={exc}"
+                        )
+                elif chunk4_resume_action in {"reset_chunk4", "reset_all"}:
+                    chunk4_runtime_state = init_chunk4_runtime_state(
+                        gaussians,
+                        ELEV_CHUNK4_CFG,
+                        init_iter=training_iter_offset,
+                    )
+                    print(
+                        f"[Elevation Chunk 4] resume action={chunk4_resume_action}; "
+                        "using fresh runtime state"
+                    )
+                else:
+                    print(f"[Elevation Chunk 4] resume action={chunk4_resume_action}; state skipped")
+        elif resume_chunk4_state is not None:
+            print("[Elevation Chunk 4] checkpoint state present but runtime restore is disabled; skipped")
 
         if resume_stage1_state and ELEV_STAGE1_CFG.effective_stage1_mode != "off":
             resume_schema = str(resume_stage1_state.get("checkpoint_schema_version", ""))
@@ -3109,6 +3785,13 @@ def main():
         stage2_global_offset = training_iter_offset + STAGE1_ITERATIONS
         for iteration in range(1, STAGE2_ITERATIONS + 1):
             global_iter = stage2_global_offset + iteration
+            if chunk4_runtime_state is not None:
+                ensure_chunk4_state_capacity(
+                    chunk4_runtime_state,
+                    gaussians,
+                    ELEV_CHUNK4_CFG,
+                    current_iter=global_iter,
+                )
             if stage2_use_round_robin:
                 pixel_bank, pixel_logits_registry, optim_elev, _ = maybe_refresh_pixel_bank_and_logits(
                     iteration=global_iter,
@@ -3170,6 +3853,7 @@ def main():
             iter_cached_loglik = {}
             iter_cached_support_mask = {}
             iter_p_post = {}
+            iter_support_obs = {}
             for frame_idx in sampled_frame_indices:
                 viewpoint_cam = training_frames[frame_idx]
                 frame_key = str(viewpoint_cam.image_name)
@@ -3293,6 +3977,19 @@ def main():
                 batch_residual_p95.append(float(coupling_stats["residual_p95"]))
                 batch_assoc_w.append(float(coupling_stats["assoc_w_mean"]))
 
+                if chunk4_runtime_state is not None:
+                    iter_support_obs[frame_idx] = compute_chunk4_support_observations_for_frame(
+                        frame_idx=frame_idx,
+                        training_frames=training_frames,
+                        gaussians=gaussians,
+                        render_pkg=render_pkg,
+                        rendered=rendered,
+                        gt_image=gt_image,
+                        sonar_config=sonar_config,
+                        sonar_scale_factor=sonar_scale_factor,
+                        support_residual_thresh=ELEV_CHUNK4_CFG.support_residual_thresh,
+                    )
+
             if not batch_loss:
                 continue
 
@@ -3315,6 +4012,17 @@ def main():
             # Backward
             loss.backward()
 
+            chunk4_support_stats = {
+                "match_frames": 0,
+                "diverse_frames": 0,
+                "support_ratio": 0.0,
+                "residual_p95": 0.0,
+                "active_support_ge2_frac": 0.0,
+                "active_support_ge3_frac": 0.0,
+                "pruned_support_count": 0,
+            }
+            fov_pruned_count = 0
+
             # Update surfels only
             with torch.no_grad():
                 gaussians.optimizer.step()
@@ -3324,12 +4032,38 @@ def main():
                     optim_elev.zero_grad(set_to_none=True)
                 gaussians.update_learning_rate(iteration)
 
+                if chunk4_runtime_state is not None:
+                    chunk4_support_stats = update_chunk4_support_runtime(
+                        global_iter=global_iter,
+                        sampled_frame_indices=sampled_frame_indices,
+                        iter_support_obs=iter_support_obs,
+                        training_frames=training_frames,
+                        gaussians=gaussians,
+                        chunk4_runtime_state=chunk4_runtime_state,
+                        chunk4_cfg=ELEV_CHUNK4_CFG,
+                    )
+
                 # FOV-aware pruning: remove surfels that drifted outside all training FOVs
                 if FOV_PRUNE_INTERVAL > 0 and iteration % FOV_PRUNE_INTERVAL == 0:
-                    num_pruned = prune_outside_fov(gaussians, training_frames, sonar_config, sonar_scale_factor)
-                    if num_pruned > 0:
+                    fov_pruned_count = prune_outside_fov(
+                        gaussians,
+                        training_frames,
+                        sonar_config,
+                        sonar_scale_factor,
+                        chunk4_runtime_state=chunk4_runtime_state,
+                        chunk4_cfg=ELEV_CHUNK4_CFG,
+                        reason="fov_stage2",
+                        current_iter=global_iter,
+                    )
+                    if fov_pruned_count > 0:
                         sync_opacity_policy(global_iter, f"stage2/fov_prune@{iteration}", force=True)
-                        print(f"  [FOV prune] Removed {num_pruned} surfels outside FOV, {len(gaussians.get_xyz)} remaining")
+                        print(
+                            f"  [FOV prune] Removed {fov_pruned_count} surfels outside FOV, "
+                            f"{len(gaussians.get_xyz)} remaining"
+                        )
+
+                if chunk4_runtime_state is not None and bool(ELEV_CHUNK4_CFG.surfel_id_asserts):
+                    assert_surfel_id_integrity(chunk4_runtime_state["persistent_state"])
 
             scale_value = sonar_scale_factor.get_scale_value()
             record_metrics(loss.item(), scale_value, "stage2")
@@ -3359,6 +4093,15 @@ def main():
                             f"match={couple_match_rate:.3f}, p95={couple_residual_p95:.3f}m, "
                             f"assoc_w={couple_assoc_w:.3f}"
                         )
+                if chunk4_runtime_state is not None:
+                    sampler_tail += (
+                        f", sup_match={chunk4_support_stats['match_frames']}/{chunk4_support_stats['diverse_frames']}, "
+                        f"sup_ratio={chunk4_support_stats['support_ratio']:.3f}, "
+                        f"sup_p95={chunk4_support_stats['residual_p95']:.3f}, "
+                        f"sup_ge2={chunk4_support_stats['active_support_ge2_frac']:.3f}, "
+                        f"sup_ge3={chunk4_support_stats['active_support_ge3_frac']:.3f}, "
+                        f"prune={int(chunk4_support_stats['pruned_support_count']) + int(fov_pruned_count)}"
+                    )
                 print(
                     f"  Iter {iteration:3d}: L1={Ll1.item():.6f}, SSIM={ssim_val.item():.4f}, "
                     f"scale={scale_value:.4f}, pts={len(gaussians.get_xyz)}, "
@@ -3417,6 +4160,13 @@ def main():
         stage3_global_offset = training_iter_offset + STAGE1_ITERATIONS + STAGE2_ITERATIONS
         for iteration in range(1, STAGE3_ITERATIONS + 1):
             global_iter = stage3_global_offset + iteration
+            if chunk4_runtime_state is not None:
+                ensure_chunk4_state_capacity(
+                    chunk4_runtime_state,
+                    gaussians,
+                    ELEV_CHUNK4_CFG,
+                    current_iter=global_iter,
+                )
             if stage3_use_round_robin:
                 pixel_bank, pixel_logits_registry, optim_elev, _ = maybe_refresh_pixel_bank_and_logits(
                     iteration=global_iter,
@@ -3478,6 +4228,7 @@ def main():
             iter_cached_loglik = {}
             iter_cached_support_mask = {}
             iter_p_post = {}
+            iter_support_obs = {}
             for frame_idx in sampled_frame_indices:
                 viewpoint_cam = training_frames[frame_idx]
                 frame_key = str(viewpoint_cam.image_name)
@@ -3599,6 +4350,19 @@ def main():
                 batch_residual_p95.append(float(coupling_stats["residual_p95"]))
                 batch_assoc_w.append(float(coupling_stats["assoc_w_mean"]))
 
+                if chunk4_runtime_state is not None:
+                    iter_support_obs[frame_idx] = compute_chunk4_support_observations_for_frame(
+                        frame_idx=frame_idx,
+                        training_frames=training_frames,
+                        gaussians=gaussians,
+                        render_pkg=render_pkg,
+                        rendered=rendered,
+                        gt_image=gt_image,
+                        sonar_config=sonar_config,
+                        sonar_scale_factor=sonar_scale_factor,
+                        support_residual_thresh=ELEV_CHUNK4_CFG.support_residual_thresh,
+                    )
+
             if not batch_loss:
                 continue
 
@@ -3620,6 +4384,17 @@ def main():
 
             loss.backward()
 
+            chunk4_support_stats = {
+                "match_frames": 0,
+                "diverse_frames": 0,
+                "support_ratio": 0.0,
+                "residual_p95": 0.0,
+                "active_support_ge2_frac": 0.0,
+                "active_support_ge3_frac": 0.0,
+                "pruned_support_count": 0,
+            }
+            fov_pruned_count = 0
+
             with torch.no_grad():
                 gaussians.optimizer.step()
                 gaussians.optimizer.zero_grad(set_to_none=True)
@@ -3629,12 +4404,38 @@ def main():
                 # Scale frozen - no optimizer step
                 gaussians.update_learning_rate(STAGE2_ITERATIONS + iteration)
 
+                if chunk4_runtime_state is not None:
+                    chunk4_support_stats = update_chunk4_support_runtime(
+                        global_iter=global_iter,
+                        sampled_frame_indices=sampled_frame_indices,
+                        iter_support_obs=iter_support_obs,
+                        training_frames=training_frames,
+                        gaussians=gaussians,
+                        chunk4_runtime_state=chunk4_runtime_state,
+                        chunk4_cfg=ELEV_CHUNK4_CFG,
+                    )
+
                 # FOV-aware pruning
                 if FOV_PRUNE_INTERVAL > 0 and iteration % FOV_PRUNE_INTERVAL == 0:
-                    num_pruned = prune_outside_fov(gaussians, training_frames, sonar_config, sonar_scale_factor)
-                    if num_pruned > 0:
+                    fov_pruned_count = prune_outside_fov(
+                        gaussians,
+                        training_frames,
+                        sonar_config,
+                        sonar_scale_factor,
+                        chunk4_runtime_state=chunk4_runtime_state,
+                        chunk4_cfg=ELEV_CHUNK4_CFG,
+                        reason="fov_stage3",
+                        current_iter=global_iter,
+                    )
+                    if fov_pruned_count > 0:
                         sync_opacity_policy(global_iter, f"stage3/fov_prune@{iteration}", force=True)
-                        print(f"  [FOV prune] Removed {num_pruned} surfels outside FOV, {len(gaussians.get_xyz)} remaining")
+                        print(
+                            f"  [FOV prune] Removed {fov_pruned_count} surfels outside FOV, "
+                            f"{len(gaussians.get_xyz)} remaining"
+                        )
+
+                if chunk4_runtime_state is not None and bool(ELEV_CHUNK4_CFG.surfel_id_asserts):
+                    assert_surfel_id_integrity(chunk4_runtime_state["persistent_state"])
 
             scale_value = sonar_scale_factor.get_scale_value()
             record_metrics(loss.item(), scale_value, "stage3")
@@ -3664,6 +4465,15 @@ def main():
                             f"match={couple_match_rate:.3f}, p95={couple_residual_p95:.3f}m, "
                             f"assoc_w={couple_assoc_w:.3f}"
                         )
+                if chunk4_runtime_state is not None:
+                    sampler_tail += (
+                        f", sup_match={chunk4_support_stats['match_frames']}/{chunk4_support_stats['diverse_frames']}, "
+                        f"sup_ratio={chunk4_support_stats['support_ratio']:.3f}, "
+                        f"sup_p95={chunk4_support_stats['residual_p95']:.3f}, "
+                        f"sup_ge2={chunk4_support_stats['active_support_ge2_frac']:.3f}, "
+                        f"sup_ge3={chunk4_support_stats['active_support_ge3_frac']:.3f}, "
+                        f"prune={int(chunk4_support_stats['pruned_support_count']) + int(fov_pruned_count)}"
+                    )
                 print(
                     f"  Iter {iteration:3d}: L1={Ll1.item():.6f}, SSIM={ssim_val.item():.4f}, "
                     f"scale={scale_value:.4f}, pts={len(gaussians.get_xyz)}, "
@@ -3698,11 +4508,22 @@ def main():
                           f"el=[{el.min().item():.1f}, {el.max().item():.1f}]°")
 
         # Force final prune
-        num_pruned = prune_outside_fov(gaussians, training_frames, sonar_config, sonar_scale_factor)
+        final_global_iter = training_iter_offset + STAGE1_ITERATIONS + STAGE2_ITERATIONS + STAGE3_ITERATIONS
+        num_pruned = prune_outside_fov(
+            gaussians,
+            training_frames,
+            sonar_config,
+            sonar_scale_factor,
+            chunk4_runtime_state=chunk4_runtime_state,
+            chunk4_cfg=ELEV_CHUNK4_CFG,
+            reason="fov_final",
+            current_iter=final_global_iter,
+        )
         if num_pruned > 0:
-            final_global_iter = training_iter_offset + STAGE1_ITERATIONS + STAGE2_ITERATIONS + STAGE3_ITERATIONS
             sync_opacity_policy(final_global_iter, "final_prune", force=True)
             print(f"  [Final prune] Removed {num_pruned} surfels, {len(gaussians.get_xyz)} remaining")
+        if chunk4_runtime_state is not None and bool(ELEV_CHUNK4_CFG.surfel_id_asserts):
+            assert_surfel_id_integrity(chunk4_runtime_state["persistent_state"])
 
         # Save final surfel positions as point cloud (for verification)
         final_xyz = gaussians.get_xyz.detach().cpu().numpy()
@@ -3825,6 +4646,11 @@ def main():
     elevation_stage1_runtime_state["optim_elev_state"] = (
         optim_elev.state_dict() if optim_elev is not None else None
     )
+    elevation_chunk4_runtime_state = build_chunk4_runtime_checkpoint_state(
+        chunk4_runtime_state,
+        active_frame_keys,
+        ELEV_CHUNK4_CFG,
+    )
 
     if cached_loglik:
         print(
@@ -3867,6 +4693,7 @@ def main():
                 "stage3_iterations": STAGE3_ITERATIONS,
             },
             stage1_runtime_state=elevation_stage1_runtime_state,
+            chunk4_runtime_state=elevation_chunk4_runtime_state,
         )
 
     print("\n" + "=" * 60)

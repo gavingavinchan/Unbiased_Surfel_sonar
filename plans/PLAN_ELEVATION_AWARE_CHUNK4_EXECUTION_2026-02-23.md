@@ -1,7 +1,7 @@
 # Plan: Elevation-Aware Chunk 4 Execution
 
 **Date:** 2026-02-23  
-**Status:** Draft for review (gpt-5.3-codex)  
+**Status:** Closeout executed; gate currently **NO-GO** on documented blockers (gpt-5.3-codex)  
 **Scope:** Chunk 4 only (Belief-to-geometry enforcement)
 
 ---
@@ -581,3 +581,155 @@ Commit message format (repo convention):
 
 Example:
 - `Implement coupling, persistent surfel IDs, and support-pruning enforcement for elevation Stage 1 (gpt-5.3-codex)`
+
+---
+
+## 2026-02-24 Closeout Execution Snapshot
+
+Closeout/gating was executed with consolidated evidence in:
+
+- `output/chunk4_closeout/chunk4_gate_closeout_report_2026-02-24.md`
+- `output/chunk4_closeout/chunk4_gate_closeout_report_2026-02-24.json`
+- `output/chunk4_closeout/gate_logs/`
+
+Test/gate ledger summary from this closeout pass:
+
+- `C4-T01`..`C4-T16`: pass.
+- `C4-T17`: manual placeholder skipped (expected by contract).
+- `C4-S1`: pass.
+- `C4-S2`: fail.
+- `C4-S3`: fail.
+- `C4-S4`: continuation path pass, evaluator threshold fail.
+
+Key quantitative gate outcomes:
+
+- Off-mode parity (`C4-T11`) passes (`rel_loss_delta=0.0012866`, `abs_ssim_delta=0.0006394`).
+- Active coupling tail match rate passes (`median=0.9465`).
+- Active coupling tail residual gate narrowly fails (`p95_of_p95=0.30195 m` vs `<=0.30 m`).
+- Assoc weight bounds pass (`0.662..0.772` within `[0.10,1.0]`).
+
+Gate decision at this snapshot: **NO-GO**
+
+Blockers requiring resolution or explicit waiver:
+
+1. Dataset-C synthetic gate (`C4-S2`) remains threshold-failing.
+2. Coupling residual threshold miss by `0.00195 m`.
+3. Manual artifact verdict (`C4-T17`) not yet recorded.
+
+---
+
+## 2026-02-24 Post-Closeout Probes and Observations Addendum
+
+Additional directed probes were run after the initial closeout snapshot to test whether stronger Chunk-4 enforcement (especially support-prune pressure) can produce meaningful cube-shape correction.
+
+### Probe A: Aggressive (stronger but not extreme)
+
+- Run directory: `output/chunk4_aggressive_probe_run1/`
+- Core intent: increase coupling strength and make support-prune activate earlier without immediate collapse.
+- Key results:
+  - Eval (`output/chunk4_aggressive_probe_run1/eval_surfel/cube_eval.json`):
+    - `mean_surface_error_m = 0.088276`
+    - `p95_surface_error_m = 0.231174`
+    - `center_error_m = 0.022764`
+    - `overall_pass = false`
+  - Movement vs Chunk-3 baseline (`output/debug_multiframe_synth_c_run1/surfels_after_training.ply`):
+    - symmetric NN mean/p95/max = `0.006794 / 0.016430 / 0.080364` m
+  - Support-prune engagement from run log:
+    - nonzero prune events: `1`
+    - max per-iter prune: `3`
+    - total pruned: `3`
+- Interpretation: geometry changed only modestly; still visually/functionally close to Chunk-3 outcome.
+
+### Probe B: Harsh (force prune engagement)
+
+- Run directory: `output/chunk4_aggressive_probe_run2_harsh/`
+- Core intent: force hard support-prune engagement (near-zero warmup, strict thresholds, low patience).
+- Key results:
+  - Eval (`output/chunk4_aggressive_probe_run2_harsh/eval_surfel/cube_eval.json`):
+    - `mean_surface_error_m = 0.124671`
+    - `p95_surface_error_m = 0.280349`
+    - `center_error_m = 0.083447`
+    - `overall_pass = false`
+  - Movement vs Chunk-3 baseline (`output/debug_multiframe_synth_c_run1/surfels_after_training.ply`):
+    - symmetric NN mean/p95/max = `0.258681 / 0.930141 / 1.183765` m
+  - Support-prune engagement from run log:
+    - nonzero prune events: `23`
+    - max per-iter prune: `80984`
+    - total pruned: `83083`
+    - final surfel count: `1571`
+- Manual visual verdict (recorded):
+  - Note path: `output/chunk4_aggressive_probe_run2_harsh/manual_visual_note_2026-02-24.md`
+  - Observed behavior: torus did not move toward cube geometry; approximately half the torus disappeared.
+  - Verdict: `regressed` (collapse-by-pruning, not corrective reshaping).
+
+### Consolidated post-probe assessment
+
+- Forcing stronger support-prune/coupling is not sufficient and appears to be the wrong primary direction for this failure mode.
+- Mild aggression gives only small geometric displacement; harsh aggression causes deletion/collapse rather than cube-shape convergence.
+- Chunk-4 therefore remains **NO-GO** and blocked on Dataset-C geometry behavior.
+- Working hypothesis for next stage: bottleneck is likely upstream evidence/association quality (Stage-1 posterior/evidence fidelity), not simply enforcement strength.
+
+---
+
+## 2026-02-24 Independent Review (claude-opus-4-6)
+
+### Mechanical completeness
+
+The Chunk-4 implementation is **mechanically complete**:
+- `utils/elevation_chunk4_helpers.py`: 19 pure functions covering coupling, ID lifecycle, support scheduling, checkpoint/resume.
+- `debug_multiframe.py`: ~218 lines of Chunk-4 integration across Stage 2 and Stage 3, with 21 config knobs.
+- 16/16 fast contract tests pass (`C4-T01`..`C4-T10`, `C4-T11`..`C4-T14`).
+- Off-mode parity is excellent (`rel_loss_delta=0.0013`, `abs_ssim_delta=0.0006`).
+- Sphere-A (C4-S1) passes all gates cleanly.
+- Resume/continuation path works correctly.
+
+No bugs or implementation gaps were found in the coupling, ID, support, or checkpoint code.
+
+### Blocker triage
+
+| Blocker | Verdict | Rationale |
+|---------|---------|-----------|
+| **B2** (coupling residual 0.30195 vs 0.30m) | **Waivable** | 0.002m overshoot on a cube-class dataset where sphere-A passes easily. Threshold can be relaxed to 0.31m or left as-is with waiver. |
+| **B3** (C4-T17 manual visual verdict) | **Administrative** | Just needs someone to record the verdict. Not a code issue. |
+| **B1** (Dataset-C cube gate fails) | **Real blocker, but not a Chunk-4 problem** | See root cause analysis below. |
+
+### Root cause analysis for B1
+
+The post-closeout probes are decisive evidence that **Chunk-4 enforcement cannot fix this failure mode**:
+
+- **Probe A** (mild): 3 surfels pruned. Geometry displacement 0.007m mean. Torus shape unchanged.
+- **Probe B** (harsh): 83,083 surfels pruned (113k → 1,571). Half the torus deleted. Verdict: `regressed` (collapse, not correction).
+
+This reveals a causal chain:
+
+```
+Chunk-3 parity gap (Stage-1 still uses interim surrogate, not full back_project_bins evidence)
+  → Posterior does not encode correct elevation for cube corners/edges
+    → Expected points from posterior land on torus surface, not cube surface
+      → Coupling pulls surfels toward torus (no corrective signal)
+        → Support evidence says torus surfels are "well supported"
+          → Pruning either does nothing (mild) or mass-deletes (harsh)
+```
+
+Coupling and support-pruning can only act on the evidence they receive. If the Stage-1 posterior says "the torus is correct," then:
+- Coupling reinforces torus geometry (not cube).
+- Support confirms torus surfels as well-supported.
+- Increasing enforcement strength amplifies deletion, not correction.
+
+**B1 traces back to the Chunk-3 open parity gap**, not to any Chunk-4 deficiency.
+
+### Recommended path forward
+
+1. **Close the Chunk-3 Stage-1 likelihood parity gap.** The `back_project_bins` overlap-neighbor evidence assembly must match the detailed-plan contract, replacing the interim surrogate. This is the prerequisite for any meaningful Chunk-4 re-evaluation.
+
+2. **Re-run Chunk-4 gates against corrected Stage-1 evidence.** Do not tune Chunk-4 parameters in isolation — the current parameters are reasonable and well-tested on sphere-A. The cube failure is an evidence-quality problem, not a coupling/support parameter problem.
+
+3. **Waive B2 and B3 explicitly.** B2 is a 0.002m epsilon miss. B3 is documentation. Neither blocks progress.
+
+4. **Do not start Chunk 5** until the Chunk-3 parity gap is closed and Chunk-4 is re-gated with real evidence. Chunk 5 (normals ramp, expected-elevation normals) depends on correct posterior beliefs, which depend on correct Stage-1 evidence.
+
+### What NOT to do
+
+- Do not keep tuning Chunk-4 coupling/support parameters to fix Dataset-C. The probes already showed this is the wrong lever.
+- Do not relax Dataset-C thresholds to force a gate pass. The thresholds are reasonable; the evidence feeding the system is wrong.
+- Do not skip Chunk-3 parity closure and jump to Chunk 5. The normals path will have the same upstream evidence problem.

@@ -424,4 +424,29 @@ flowchart TB
   - runtime smokes: `RUN_CHUNK4_RUNTIME_SMOKES=1 pytest tests/test_elevation_chunk4_smoke_modes.py -q` -> `10 passed`,
   - synthetic matrix: `RUN_CHUNK4_SYNTHETIC_MATRIX=1 pytest tests/test_elevation_chunk4_synthetic_matrix.py -q` -> `2 passed, 1 skipped`,
   - full Chunk-4 suite with runtime+synthetic gates: `33 passed, 3 skipped`.
-- Scope caveat (important): Chunk-4 is still not gate-closed. Support/prune enforcement runtime wiring is pending in `debug_multiframe.py` (persistent surfel IDs, by-ID support buffers, hysteresis/grace prune path, Chunk-4 checkpoint schema/state integration).
+- Scope caveat (important): Chunk-4 runtime wiring is now present for both coupling and support/prune paths, but gate closeout is still **NO-GO** on quantitative/synthetic blockers.
+
+## Recent Updates (2026-02-24, Chunk-4 closeout/gating pass)
+- Executed closeout evidence collection with persistent artifacts under `output/chunk4_closeout/gate_logs/`:
+  - fast/contract suite log: `c4_fast_contracts.log` (`29 passed, 7 skipped`),
+  - runtime smokes log: `c4_runtime_smokes_verbose.log` (`C4-T11`..`C4-T14` all pass),
+  - synthetic matrix log: `c4_synthetic_matrix_verbose.log` (`C4-T15`, `C4-T16` pass; `C4-T17` manual skip placeholder).
+- Added explicit off-mode parity artifact `output/chunk4_closeout/gate_logs/c4_t11_offmode_parity.json`:
+  - relative loss delta `0.0012866` (<= `0.05`),
+  - absolute SSIM delta `0.0006394` (<= `0.01`).
+- Added coupling-threshold artifact `output/chunk4_closeout/gate_logs/c4_coupling_tail_metrics.json` from active run log parsing:
+  - median match rate (tail) `0.9465` (pass),
+  - p95-of-p95 coupling residual `0.30195 m` (fails threshold `<= 0.30 m` by `0.00195 m`),
+  - assoc weight tail range `0.662..0.772` (pass).
+- Published consolidated gate ledger/report:
+  - `output/chunk4_closeout/chunk4_gate_closeout_report_2026-02-24.md`,
+  - `output/chunk4_closeout/chunk4_gate_closeout_report_2026-02-24.json`.
+- Gate outcome recorded as **NO-GO** with explicit blockers:
+  - `C4-S2` cube gate remains fail (`output/chunk4_closeout/c4_s2_summary.json`),
+  - active coupling residual threshold miss (`0.30195 > 0.30`),
+  - manual artifact-panel verdict (`C4-T17`) remains pending by design.
+
+## Recent Updates (2026-02-24, post-closeout harsh ablation visual verdict)
+- Ran a harsher Chunk-4 ablation to force support-prune engagement: `output/chunk4_aggressive_probe_run2_harsh/`.
+- Manual visual review verdict: **regressed**; the torus did not move toward cube geometry, and approximately half the torus disappeared (collapse-by-pruning behavior).
+- Recorded observer note in `output/chunk4_aggressive_probe_run2_harsh/manual_visual_note_2026-02-24.md`.

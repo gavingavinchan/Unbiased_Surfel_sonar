@@ -643,6 +643,54 @@ Post-integration validation in conda env:
 - `RUN_CHUNK4_SYNTHETIC_MATRIX=1 pytest tests/test_elevation_chunk4_synthetic_matrix.py -q` -> `2 passed, 1 skipped`.
 - Full Chunk-4 set with runtime + synthetic opt-ins -> `33 passed, 3 skipped`.
 
-### 18.4 Remaining Chunk-4 closure gap
+### 18.4 Closure status update
 
-This checkpoint completes coupling-runtime wiring, but does not yet complete support/prune enforcement runtime integration. Pending items remain the persistent-ID lifecycle, by-ID support buffer updates, hysteresis/grace prune path, and Chunk-4 checkpoint state/schema wiring inside `debug_multiframe.py`.
+Runtime integration now includes both coupling and support/prune enforcement paths in `debug_multiframe.py` (persistent IDs, by-ID support state, hysteresis/grace pruning logic, and Chunk-4 checkpoint payload handling).
+
+Chunk-4 remains open only at the gate-evidence level (not wiring completeness).
+
+## 19. Chunk-4 closeout gate results (2026-02-24)
+
+Closeout artifacts were generated under:
+
+- `output/chunk4_closeout/chunk4_gate_closeout_report_2026-02-24.md`
+- `output/chunk4_closeout/chunk4_gate_closeout_report_2026-02-24.json`
+- `output/chunk4_closeout/gate_logs/`
+
+### 19.1 Contract/smoke ledger
+
+- Fast contract suite: `29 passed, 7 skipped`.
+- Runtime smokes (`C4-T11`..`C4-T14`): all pass.
+- Synthetic matrix (`C4-T15`, `C4-T16`): pass.
+- Manual visual panel (`C4-T17`): intentionally skipped placeholder pending human verdict.
+
+### 19.2 Quantitative gate metrics
+
+From parsed active run logs (`c4_s2_run1`) over the last 20% iterations:
+
+- median match rate: $0.9465$ (passes $\ge 0.01$),
+- coupling residual gate metric ($\mathrm{p95}$ over per-iter coupling $\mathrm{p95}$): $0.30195\,\mathrm{m}$,
+- assoc weight tail range: $[0.662, 0.772]$ (inside required $[0.10, 1.0]$),
+- off-mode parity: relative loss delta $0.0012866$ and absolute SSIM delta $0.0006394$ (both pass configured limits).
+
+Thus the coupling residual gate misses by a small margin:
+
+$$
+0.30195 - 0.30 = 0.00195\,\mathrm{m}.
+$$
+
+### 19.3 Dataset-C directional movement
+
+Against the Chunk-3 comparator (`output/debug_multiframe_synth_c_run1/eval_surfel/cube_eval.json`) using the closeout run (`output/chunk4_closeout/c4_s2_run1/eval_surfel/cube_eval.json`):
+
+- mean surface error: $0.087973 \rightarrow 0.087923$ (unchanged/slightly improved),
+- p95 surface error: $0.228855 \rightarrow 0.227167$ (improved),
+- center error: $0.023639 \rightarrow 0.023750$ (slightly regressed).
+
+### 19.4 Gate decision
+
+Current closeout decision is **NO-GO** due to:
+
+1. `C4-S2` synthetic cube gate overall fail,
+2. coupling residual threshold miss ($0.30195 > 0.30$),
+3. pending manual `C4-T17` visual verdict.

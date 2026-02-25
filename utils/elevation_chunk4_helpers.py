@@ -324,9 +324,11 @@ def build_chunk4_checkpoint_payload(
     couple_mode: str,
     support_mode: str,
     support_scheduler_state,
+    support_count_by_id: torch.Tensor = None,
+    diverse_candidate_count_by_id: torch.Tensor = None,
 ):
     keys = list(active_frame_keys)
-    return {
+    payload = {
         "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
         "active_frame_keys": keys,
         "active_frame_fingerprint": _compute_active_frame_fingerprint(keys),
@@ -341,6 +343,11 @@ def build_chunk4_checkpoint_payload(
         "support_mode": str(support_mode),
         "support_scheduler_state": support_scheduler_state,
     }
+    if support_count_by_id is not None:
+        payload["support_count_by_id"] = support_count_by_id
+    if diverse_candidate_count_by_id is not None:
+        payload["diverse_candidate_count_by_id"] = diverse_candidate_count_by_id
+    return payload
 
 
 def resolve_chunk4_resume_action(
