@@ -669,6 +669,110 @@ Additional directed probes were run after the initial closeout snapshot to test 
 - Chunk-4 therefore remains **NO-GO** and blocked on Dataset-C geometry behavior.
 - Working hypothesis for next stage: bottleneck is likely upstream evidence/association quality (Stage-1 posterior/evidence fidelity), not simply enforcement strength.
 
+### 2026-02-25 Quantified Diagnostics (requested follow-up)
+
+Using existing run artifacts (`chunk4_closeout`, `chunk4_aggressive_probe_run1`, `chunk4_aggressive_probe_run2_harsh`), three diagnostics were executed.
+
+1) Criterion-level failure map (default vs aggressive)
+
+- Default closeout (`output/chunk4_closeout/c4_s2_run1/`):
+  - Coupling diagnostics: finite pass, match-rate pass (`0.9465`), assoc-weight bounds pass (`0.662..0.772`), residual gate fail (`p95_of_p95=0.30195 > 0.30`).
+  - Dataset-C evaluator gates: mean fail (`0.087923 > 0.05`), p95 fail (`0.227167 > 0.10`), center pass (`0.023750 <= 0.03`).
+- Aggressive probe (`output/chunk4_aggressive_probe_run1/`):
+  - Coupling diagnostics: finite pass, match-rate pass (`0.957`), residual pass (`~0.284`), assoc-weight bounds pass (`~0.689..0.789`).
+  - Dataset-C evaluator gates: mean fail (`0.088276 > 0.05`), p95 fail (`0.231174 > 0.10`), center pass (`0.022764 <= 0.03`).
+- Harsh probe (`output/chunk4_aggressive_probe_run2_harsh/`):
+  - Coupling diagnostics: finite pass, match-rate pass (`0.596`), residual pass (`~0.29275`), assoc-weight bounds fail (`assoc_w_min~0.0`).
+  - Dataset-C evaluator gates: mean fail (`0.124671 > 0.05`), p95 fail (`0.280349 > 0.10`), center fail (`0.083447 > 0.03`).
+
+Net: stronger enforcement can clear the closeout residual gate but does not close Dataset-C geometry thresholds; harsh settings regress to collapse.
+
+2) Coupling-weight utilization and prune-eligibility timing
+
+- Default closeout config (`Stage2=1000`, `couple_weight=0.1->0.5`, `warmup=2000`):
+  - effective coupling ramp utilization by Stage-2 end: `50%`;
+  - effective `w_couple` at Stage-2 end: `~0.300` (not full configured end weight).
+- Aggressive probe (`Stage2=800`, `couple_weight=0.5->1.2`, `warmup=200`):
+  - ramp utilization by Stage-2 end: `100%`;
+  - end-of-Stage-2 `w_couple`: `1.2`.
+- Harsh probe (`Stage2=800`, `couple_weight=1.2->2.0`, `warmup=50`):
+  - ramp utilization by Stage-2 end: `100%`;
+  - end-of-Stage-2 `w_couple`: `2.0`.
+
+Prune timing from logs:
+- Default/aggressive: only sparse prune activity (first nonzero at iter `100`, aligned with FOV-prune cadence, total `3`).
+- Harsh: early non-FOV prune engagement (first at iter `30`), `23` nonzero events, total pruned `83083`, max single event `80984`.
+
+3) Stage-1 posterior sharpness / entropy trend on Dataset-C
+
+- 7-bin maximum entropy is `ln(7)=1.9459`.
+- Stage-2 logged entropies remain close to this ceiling in all three configs:
+  - default mean entropy `1.9175` (`~98.54%` of max),
+  - aggressive mean entropy `1.9180` (`~98.56%` of max),
+  - harsh mean entropy `1.9180` (`~98.56%` of max).
+- Late-phase entropy decreases slightly but remains high-information-poor (default late mean `1.9130`, still `~98.31%` of max).
+
+Interpretation: posterior evidence remains broad/weak; changing Chunk-4 enforcement strength alone does not materially sharpen Stage-1 belief quality for cube-shape correction.
+
+## 2026-02-25 Diagnosis Addendum (No-Fix Pass)
+
+Findings from code/tests/runtime inspection without applying fixes:
+
+- Runtime wiring and contracts are present and executable (Chunk-4 helper/contract tests and opt-in runtime/synthetic smokes are green in this workspace).
+- The failure mode is gate-quality, not a hard crash/import fault: Dataset-C acceptance remains the blocking axis.
+- Current default schedule materially under-activates enforcement in typical short/medium budgets:
+  - coupling warmup (`ELEV_COUPLE_WARMUP=2000`) exceeds the common Stage-2 budget (`SONAR_STAGE2_ITERS=1000`), so active coupling weight only reaches the ramp midpoint by Stage-2 end;
+  - support warmup (`ELEV_SUPPORT_WARMUP_ITERS=4000`) delays hard support-prune eligibility well beyond the same budget.
+- Stage-1 posterior signals observed during active runs remain high-entropy/low-information (entropy near the 7-bin maximum), consistent with weakly discriminative expected-point supervision for Chunk-4 coupling.
+- Directed aggression in support-prune pressure can increase movement but tends to produce deletion/collapse behavior rather than corrective cube-shape convergence.
+
+Immediate diagnostic work items queued from this addendum:
+
+1. Build a criterion-level failure map versus gate thresholds for default vs aggressive settings.
+2. Quantify effective coupling-weight utilization and first prune eligibility timing under each config.
+3. Track Stage-1 posterior sharpness (entropy/proxy confidence) over time on Dataset-C to validate the evidence-quality bottleneck hypothesis.
+
+## 2026-02-25 Independent Diagnosis Addendum (gpt-5.3-codex)
+
+Method constraints for this addendum:
+- Diagnosis derived from code and run artifacts only.
+- No reliance on post-line-671 opinion sections of this plan.
+
+### What is wrong with Chunk-4 performance
+
+1. **Support-prune schedule is effectively disabled in standard Chunk-4 gate runs.**
+   - Config default is `ELEV_SUPPORT_WARMUP_ITERS=4000` (`debug_multiframe.py`:2528).
+   - Closeout cube run uses `Stage2=1000` (`output/chunk4_closeout/c4_s2_run1/run.log`:13).
+   - `compute_support_failure_mask` returns no failures during warmup (`debug_multiframe.py`:263-264).
+   - Result: support-prune path rarely activates under normal closeout settings (only tiny prune activity outside harsh probes).
+
+2. **Coupling is under-ramped for the same run budget.**
+   - Config default is `ELEV_COUPLE_WARMUP=2000` (`debug_multiframe.py`:2518).
+   - With 1000 Stage-2 iterations, coupling weight reaches only `0.300` by iter 1000 (`output/chunk4_closeout/c4_s2_run1/run.log`:5245), not the configured end value.
+   - This limits how strongly Chunk-4 can move geometry in the very runs used for gating.
+
+3. **Stage-1 evidence feeding Chunk-4 remains weak/surrogate-like in the active path.**
+   - Stage-1 likelihood is currently built from normalized intensity distance to bin centers (`debug_multiframe.py`:3902-3905).
+   - Pose-overlap table is built (`debug_multiframe.py`:452-552, 2938-2939) but not used inside the per-iteration likelihood/evidence assembly path.
+   - Observed log behavior is consistent with low-information posteriors (7-bin entropy close to `ln(7)=1.9459`): e.g., `lik` near `1.94` and `ent` near `1.90-1.92` through training (`output/chunk4_closeout/c4_s2_run1/run.log`:5143, 5245).
+
+4. **Measured geometry movement is negligible in default/aggressive runs and destructive in harsh runs.**
+   - Chunk-4 closeout vs Chunk-3 comparator (cube eval):
+     - mean error delta: `-0.000050 m`
+     - p95 error delta: `-0.001689 m`
+     - center error delta: `+0.000111 m`
+     - Sources: `output/chunk4_closeout/c4_s2_run1/eval_surfel/cube_eval.json`, `output/debug_multiframe_synth_c_run1/eval_surfel/cube_eval.json`.
+   - Aggressive run movement vs Chunk-3 baseline remains small (symmetric NN mean `0.00679 m`) (`output/chunk4_aggressive_probe_run1/movement_vs_chunk3.json`).
+   - Harsh run forces prune engagement but collapses geometry (final surfels `1571`; much worse cube metrics) (`output/chunk4_aggressive_probe_run2_harsh/run.log`:5224, `output/chunk4_aggressive_probe_run2_harsh/eval_surfel/cube_eval.json`).
+
+### Diagnosis conclusion
+
+- Chunk-4 is not failing due to a single obvious mechanical bug in the coupling/support code path.
+- The practical failure mode is a combination of:
+  1) schedules that do not activate strongly within current gate budgets, and
+  2) weak Stage-1 evidence quality feeding posterior-driven expected points.
+- Under current conditions, stronger enforcement mostly increases deletion pressure (harsh settings) rather than corrective cube-shape convergence.
+
 ---
 
 ## 2026-02-24 Independent Review (claude-opus-4-6)
@@ -733,3 +837,35 @@ Coupling and support-pruning can only act on the evidence they receive. If the S
 - Do not keep tuning Chunk-4 coupling/support parameters to fix Dataset-C. The probes already showed this is the wrong lever.
 - Do not relax Dataset-C thresholds to force a gate pass. The thresholds are reasonable; the evidence feeding the system is wrong.
 - Do not skip Chunk-3 parity closure and jump to Chunk 5. The normals path will have the same upstream evidence problem.
+
+---
+
+## 2026-02-25 Root Cause and Fix Path (Consolidated)
+
+### What is wrong
+
+Chunk-4 is blocked by a coupled upstream/downstream problem, not by missing implementation mechanics.
+
+First, the Stage-1 evidence path is still on the interim surrogate likelihood route instead of the detailed-plan overlap-neighbor `back_project_bins` multi-view evidence assembly. The overlap table is built and checkpointed, but it is not consumed in the active per-iteration training evidence path. As a result, posterior beliefs remain broad and weak on Dataset-C, so expected points do not provide a strong corrective signal for cube geometry.
+
+Second, current Chunk-4 schedules are structurally mismatched to gate budgets. With typical closeout settings (`SONAR_STAGE2_ITERS=1000`), `ELEV_COUPLE_WARMUP=2000` only reaches partial coupling strength by Stage-2 end, and `ELEV_SUPPORT_WARMUP_ITERS=4000` keeps support-failure masking in warmup for the whole gate run. In practice this means support-prune cannot engage meaningfully in standard closeout runs.
+
+Third, enforcement-only escalation is confirmed to be the wrong lever under weak evidence. Mild aggression produces little geometric movement; harsh aggression primarily increases deletion pressure and can collapse geometry rather than reshape torus artifacts toward cube surfaces.
+
+### What to fix
+
+Fix order is mandatory:
+
+1. Close the Chunk-3 Stage-1 parity gap by replacing surrogate likelihood assembly with the detailed multi-view overlap-neighbor evidence contract (`back_project_bins` -> neighbor projection -> robust normalized log-evidence -> valid-support normalization -> `loglik`/`support_mask`/posterior).
+
+2. Keep same-iteration cache semantics (`cached_loglik`, `cached_support_mask`) unchanged so Chunk-4 coupling continues consuming detached same-iteration evidence tensors.
+
+3. Retune Chunk-4 schedule parameters to run budget after Step 1 (schedule tuning is required and not optional): use budget-scaled warmups instead of large absolute constants. For Stage-2=1000, start with approximately `ELEV_COUPLE_WARMUP=200-400` and `ELEV_SUPPORT_WARMUP_ITERS=300-600`, then calibrate from diagnostics.
+
+4. Preserve anti-collapse guardrails during re-validation (no harsh prune regimes that can mass-delete surfels before evidence quality improves).
+
+5. Re-run Chunk-4 gate sequence (`C4-S2`, `C4-S3`, `C4-S4`) only after Step 1 is implemented, and evaluate directional geometry correction first, then threshold closure.
+
+### Consolidated conclusion
+
+Chunk-4 code integration is largely complete, but gate failure persists because evidence quality is upstream-limited and schedules are budget-misaligned. Reliable Dataset-C recovery requires Stage-1 parity closure first, then budget-aligned Chunk-4 schedules; tuning enforcement strength alone is insufficient.
