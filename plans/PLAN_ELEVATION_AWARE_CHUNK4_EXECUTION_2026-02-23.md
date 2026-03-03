@@ -740,21 +740,21 @@ Method constraints for this addendum:
 
 ### What is wrong with Chunk-4 performance
 
-1. **Support-prune schedule is effectively disabled in standard Chunk-4 gate runs.**
-   - Config default is `ELEV_SUPPORT_WARMUP_ITERS=4000` (`debug_multiframe.py`:2528).
-   - Closeout cube run uses `Stage2=1000` (`output/chunk4_closeout/c4_s2_run1/run.log`:13).
-   - `compute_support_failure_mask` returns no failures during warmup (`debug_multiframe.py`:263-264).
-   - Result: support-prune path rarely activates under normal closeout settings (only tiny prune activity outside harsh probes).
+1. **Support-prune under-activation was observed in the original closeout config, but this is no longer the code default.**
+   - Historical closeout run used a long warmup relative to budget (`Stage2=1000`), delaying hard support-prune eligibility.
+   - Current code computes budget-scaled defaults in `parse_elevation_chunk4_config` (`debug_multiframe.py`:2649-2660), so warmup is no longer a fixed long constant by default.
+   - `compute_support_failure_mask` still correctly bypasses failures during warmup by contract (`utils/elevation_chunk4_helpers.py`:263-264).
+   - Practical implication: diagnose with the *effective runtime warmup values in logs/env* rather than assuming `4000`.
 
-2. **Coupling is under-ramped for the same run budget.**
-   - Config default is `ELEV_COUPLE_WARMUP=2000` (`debug_multiframe.py`:2518).
-   - With 1000 Stage-2 iterations, coupling weight reaches only `0.300` by iter 1000 (`output/chunk4_closeout/c4_s2_run1/run.log`:5245), not the configured end value.
-   - This limits how strongly Chunk-4 can move geometry in the very runs used for gating.
+2. **Coupling under-ramp was true for the original closeout config, but current defaults are budget-scaled.**
+   - Historical closeout used a long coupling warmup relative to Stage-2 budget, so `w_couple` did not reach end weight.
+   - Current code computes warmup from Stage-2 budget (`debug_multiframe.py`:2649-2654) and then applies `resolve_chunk4_coupling_weight` (`debug_multiframe.py`:991-997).
+   - Practical implication: verify per-run `ELEV_COUPLE_WARMUP` and observed `w_couple` instead of assuming a fixed `2000` default.
 
-3. **Stage-1 evidence feeding Chunk-4 remains weak/surrogate-like in the active path.**
-   - Stage-1 likelihood is currently built from normalized intensity distance to bin centers (`debug_multiframe.py`:3902-3905).
-   - Pose-overlap table is built (`debug_multiframe.py`:452-552, 2938-2939) but not used inside the per-iteration likelihood/evidence assembly path.
-   - Observed log behavior is consistent with low-information posteriors (7-bin entropy close to `ln(7)=1.9459`): e.g., `lik` near `1.94` and `ent` near `1.90-1.92` through training (`output/chunk4_closeout/c4_s2_run1/run.log`:5143, 5245).
+3. **Stage-1 evidence quality remains a likely bottleneck, but parity wiring has progressed.**
+   - Active Stage-1 likelihood is assembled through overlap-neighbor multi-view projection in `build_stage1_multiview_loglik` (`debug_multiframe.py`:637-743), including `back_project_bins` and neighbor projections.
+   - Overlap table is consumed per iteration via `resolve_stage1_overlap_neighbors` + neighbor loop (`debug_multiframe.py`:680-687).
+   - Remaining concern is *information quality* (posterior sharpness/discriminativeness), not absence of overlap wiring.
 
 4. **Measured geometry movement is negligible in default/aggressive runs and destructive in harsh runs.**
    - Chunk-4 closeout vs Chunk-3 comparator (cube eval):
@@ -846,9 +846,9 @@ Coupling and support-pruning can only act on the evidence they receive. If the S
 
 Chunk-4 is blocked by a coupled upstream/downstream problem, not by missing implementation mechanics.
 
-First, the Stage-1 evidence path is still on the interim surrogate likelihood route instead of the detailed-plan overlap-neighbor `back_project_bins` multi-view evidence assembly. The overlap table is built and checkpointed, but it is not consumed in the active per-iteration training evidence path. As a result, posterior beliefs remain broad and weak on Dataset-C, so expected points do not provide a strong corrective signal for cube geometry.
+First, Stage-1 parity wiring has moved closer to the detailed overlap-neighbor `back_project_bins` contract and is consumed in the active per-iteration path. The remaining blocker appears to be evidence *quality* (posterior still broad/weak on Dataset-C), so expected points can remain weakly corrective for cube geometry.
 
-Second, current Chunk-4 schedules are structurally mismatched to gate budgets. With typical closeout settings (`SONAR_STAGE2_ITERS=1000`), `ELEV_COUPLE_WARMUP=2000` only reaches partial coupling strength by Stage-2 end, and `ELEV_SUPPORT_WARMUP_ITERS=4000` keeps support-failure masking in warmup for the whole gate run. In practice this means support-prune cannot engage meaningfully in standard closeout runs.
+Second, schedule-to-budget mismatch can still happen depending on explicit env overrides, but defaults are now budget-scaled in code (`debug_multiframe.py`:2649-2669). Gate analysis should therefore use effective run configs, not historical fixed-default assumptions.
 
 Third, enforcement-only escalation is confirmed to be the wrong lever under weak evidence. Mild aggression produces little geometric movement; harsh aggression primarily increases deletion pressure and can collapse geometry rather than reshape torus artifacts toward cube surfaces.
 
@@ -869,3 +869,254 @@ Fix order is mandatory:
 ### Consolidated conclusion
 
 Chunk-4 code integration is largely complete, but gate failure persists because evidence quality is upstream-limited and schedules are budget-misaligned. Reliable Dataset-C recovery requires Stage-1 parity closure first, then budget-aligned Chunk-4 schedules; tuning enforcement strength alone is insufficient.
+
+---
+
+## 2026-02-27 Baseline Renderer Diagnosis (claude-opus-4-6)
+
+### Problem statement
+
+Rendered sonar images appear as "speckled dots" instead of matching the GT's smooth intensity arcs. The 3D reconstruction shows a torus with structured streak lines. Even ignoring elevation (which is expected to be unconstrained), the 2D (azimuth, range) projected shape fails to converge to the correct geometry.
+
+### Root cause: Random normal initialization discarded by GaussianModel
+
+The initialization code (`debug_multiframe.py:3275-3283`) computes camera-facing normals for every surfel:
+
+```python
+for j in range(len(points)):
+    dir_to_cam = cam_pos - points[j]
+    normals[j] = dir_to_cam / np.linalg.norm(dir_to_cam)
+```
+
+These normals are passed into `BasicPointCloud` and handed to `create_from_pcd`. However, `GaussianModel.create_from_pcd` (`scene/gaussian_model.py:139`) **ignores the normals entirely** and initializes rotation quaternions randomly:
+
+```python
+rots = torch.rand((fused_point_cloud.shape[0], 4), device="cuda")
+```
+
+The `pcd.normals` field is never read. All computed normals are discarded.
+
+### Physical inconsistency
+
+Every initialized surfel exists because the sonar received a reflection from that surface point. By definition, the surface at that location was facing the sonar — `lambertian > 0` is a physical invariant at initialization. The computed camera-facing normals (`debug_multiframe.py:3275-3283`) correctly encode this. Discarding them for random quaternions introduces surfels with `lambertian < 0` (facing away from the sonar that detected them), which is physically impossible and immediately corrupts ~50% of the reconstruction.
+
+### How random normals cause speckled dots
+
+`render_sonar` (`gaussian_renderer/__init__.py:436-451`) uses a Lambertian intensity model:
+
+```python
+normals_world = quaternion_to_normal(rotations)           # random directions
+lambertian = clamp(dot(normals_world, dir_to_sonar), min=0)  # ~50% are zero
+base_intensity = opacity * lambertian
+```
+
+With uniformly random quaternions, `quaternion_to_normal` produces uniformly random normals on the unit sphere. For any given sonar view direction:
+- ~50% of surfels have `dot(normal, dir_to_sonar) < 0` → `lambertian = 0` → **invisible**
+- The visible ~50% are a random sparse subset that changes per view
+- Result: **speckled dot pattern** instead of dense smooth surface coverage
+
+### Why rotations fail to learn correct normals
+
+The rotation optimizer is active (`rotation_lr=0.001`), but convergence is blocked by a dead zone:
+
+1. **`torch.clamp(min=0)` kills the gradient** when `dot(normal, dir) < 0`. Surfels facing away from the current sonar view receive **zero gradient on rotation** from that view — they cannot learn to turn around.
+2. **Gradient signal is view-biased**: each surfel only learns from views where it happens to face correctly (lambertian > 0). This creates view-dependent normal biases rather than convergence to true surface normals.
+3. **Fixed opacity** (`SONAR_FIXED_OPACITY=True`, default at line 2823) freezes opacity at ~0.999. Wrong-facing surfels cannot fade out; they occupy parameter budget while contributing nothing.
+
+### Why this affects cubes but not spheres
+
+- **Sphere**: rotationally symmetric. The "correct" normal at any point is similar to many random orientations, and all views provide consistent gradient signal. Random normals converge because the loss landscape is forgiving.
+- **Cube**: 6 discrete face normal directions. A surfel on a cube face must find one specific normal direction. The dead zone in `clamp(min=0)` makes this much harder — the surfel can only learn from the subset of views where its random normal happens to partially align.
+
+### Why streaks form in 3D
+
+Surfels initialized from each training camera develop normal biases toward that camera's direction (the only views giving them gradient). Over training, this creates structured clusters in normal space aligned with individual camera poses. These clusters project as streak patterns in the 3D point cloud.
+
+### Relationship to elevation chunks
+
+This is a **baseline renderer defect** predating all elevation-aware work (Chunks 1-5). None of the chunks modify `render_sonar` or the rotation initialization. The elevation system builds on top of a renderer that cannot properly learn surface normals for non-trivially-shaped objects. This compounds the evidence-quality problems identified in earlier addenda but is an independent, lower-level failure mode.
+
+### Additional baseline renderer issues identified
+
+1. **Point splatting, not Gaussian splatting**: `render_sonar` splats each surfel to exactly 4 pixels via bilinear interpolation (`gaussian_renderer/__init__.py:482-536`). `pc.get_scaling` is never used for the spatial footprint. The standard `render()` uses the full CUDA rasterizer with 2D Gaussian covariance covering potentially hundreds of pixels per surfel.
+
+2. **Densification disabled**: `debug_multiframe.py` Stage 2 never calls `densify_and_clone/split`. Surfel count is fixed from initialization (~113K) and only decreases via FOV pruning. Even if enabled, densification would fail because `screenspace_points` in `render_sonar` is a zero tensor that accumulates no gradients.
+
+3. **No surfel scale effect on rendering**: since `render_sonar` ignores surfel scale, the scale parameters receive no useful gradient from the photometric loss and cannot influence surface coverage.
+
+### Severity assessment
+
+The random-normal + Lambertian dead-zone issue is the most impactful finding. It explains why the rendered images show dots instead of smooth arcs (the immediate visual symptom the user observes), and why optimization struggles to converge for non-spherical geometry. The point-splatting and disabled-densification issues are secondary but compounding.
+
+### Recommended investigation before fixing
+
+1. Verify by initializing rotations from the computed normals (convert camera-facing normals to quaternions at init) and comparing rendered image quality at iteration 0.
+2. Quantify the lambertian dead-zone fraction per view in a diagnostic pass.
+3. Evaluate whether proper normal init alone resolves the speckled-dot pattern, or whether Gaussian splatting / densification changes are also required.
+
+---
+
+## 2026-03-01 Lambertian Dead Zone and Surfel Drift Concerns (claude-opus-4-6)
+
+### The Lambertian clamp is a ReLU dead-zone problem
+
+The `torch.clamp(dot(normal, dir_to_sonar), min=0)` in `render_sonar` (line 447) is mathematically identical to a ReLU activation. The resulting failure mode — surfels that face away get zero gradient and can never recover — is the well-known **dead neuron problem** from neural network training.
+
+| Neural network | Sonar renderer |
+|---|---|
+| `ReLU(x) = max(x, 0)` | `lambertian = clamp(dot(n, d), min=0)` |
+| Neuron outputs 0 → zero gradient → permanently dead | Surfel faces away → zero lambertian → permanently invisible |
+| ~10-30% neurons can die during training | ~50% surfels dead at init with random normals |
+
+### Surfel drift concern: permanently trapped surfels
+
+Even after fixing initialization (so all surfels start with correct camera-facing normals), surfels can **drift into a dead configuration during training**. Specific scenario:
+
+A surfel positioned right in front of a cube's front surface but facing the wrong way (both the surfel's outer surface and the cube's outer surface face each other). This surfel is permanently trapped:
+
+- **From the front**: `lambertian = 0` (normal faces away from sonar) → invisible, zero gradient on rotation.
+- **From the rear**: the cube physically occludes it — the sonar beam cannot reach the surfel through the solid cube.
+- **Result**: no view provides gradient to correct the normal. The surfel is a permanent parameter zombie — it cannot learn, cannot fade (fixed opacity), and cannot be pruned (no mechanism to detect it).
+
+This concern generalizes: any surfel that ends up near a surface with its normal facing into that surface becomes trapped in the Lambertian dead zone on one side and physically/acoustically shadowed on the other. This can happen through:
+- Noisy gradient updates during training (multiple views pulling the normal in conflicting directions)
+- Position drift that moves a surfel from its original visible location to a trapped configuration
+- Topology changes (densification, if ever enabled) creating surfels in problematic locations
+
+### Why opacity adjustment is not appropriate for sonar
+
+In standard 2DGS (camera rendering), opacity learning is the natural self-pruning mechanism: useless surfels fade to zero. However, for sonar rendering of solid objects, opacity does not have a physical analog. Acoustic surfaces either reflect the sonar beam or they don't — there is no case (in the environments being modeled) where sound propagates through a surface with partial attenuation. Fixed opacity at ~1.0 is the physically correct model. The dead-surfel problem must be solved through other means.
+
+### Candidate fixes for the dead-zone problem
+
+All options are borrowed from the neural network dead-neuron literature, adapted to the rendering context:
+
+**1. Leaky Lambertian** (analogous to Leaky ReLU, most standard)
+```python
+alpha = 0.01
+dot_val = torch.sum(normals_world * dir_to_sonar, dim=-1)
+lambertian = torch.where(dot_val >= 0, dot_val, alpha * dot_val)
+```
+Wrong-facing surfels contribute 1% intensity. Minimal rendering artifact; gradient always flows. The 1% leak is physically defensible — real rough surfaces scatter small amounts of energy at reverse angles. `alpha=0.01` is the standard default in deep learning.
+
+**2. ELU-style** (smoother transition)
+```python
+lambertian = torch.where(dot_val >= 0, dot_val, alpha * (torch.exp(dot_val) - 1))
+```
+Exponential decay for the leak — vanishes quickly for strongly wrong-facing surfels. Smoother gradient near zero.
+
+**3. Straight-through estimator** (no rendering change, gradient-only fix)
+```python
+lambertian_hard = torch.clamp(dot_val, min=0)        # forward: physically correct
+lambertian_soft = torch.clamp(dot_val, min=0.01)      # backward: gradient flows
+lambertian = lambertian_hard + (lambertian_soft - lambertian_soft.detach())
+```
+Renders identically to the current model. Backward pass sees a floor. Used in quantization-aware training. More complex but zero visual change.
+
+**Current recommendation**: Leaky Lambertian with `alpha=0.01`. One-line change, well-understood behavior, physically defensible for sonar. Combined with proper normal initialization, the leak would rarely activate in steady state — it serves as a safety net against drift into the dead zone. Decision pending.
+
+---
+
+## 2026-03-01 Missing Acoustic Occlusion in render_sonar (claude-opus-4-6)
+
+### Problem statement
+
+`render_sonar` (`gaussian_renderer/__init__.py:471-536`) uses purely additive `scatter_add_` accumulation with no depth ordering or occlusion. Every surfel that passes the FOV check contributes to the rendered image regardless of whether a closer surface blocks the acoustic beam path.
+
+The standard camera `render()` function uses the CUDA rasterizer with front-to-back alpha compositing, transmittance tracking, and early termination — none of which exist in the sonar path.
+
+### Physical sonar occlusion model
+
+Sonar occlusion differs from camera occlusion:
+- In a camera image, two objects at different depths project to the **same pixel** → need alpha compositing to blend/occlude.
+- In a sonar image, two objects at different ranges project to **different rows** (different pixels). They do not compete for the same pixel in the normal sense.
+- However, a solid surface at range R1 **blocks the acoustic beam** so that nothing at range R2 > R1 along the **same azimuth AND same elevation angle** should produce a return. The farther return appears at a different pixel (different row) but should not exist at all.
+
+Correct occlusion rule: a surfel is occluded if and only if another surfel with sufficient opacity lies **closer in range along the same (azimuth, elevation) ray**. Surfels at different azimuth or different elevation angles do not occlude each other, even if they are at different ranges.
+
+### Current behavior and consequences
+
+1. **Ghost returns from inner/back surfaces**: Poisson reconstruction creates closed meshes, so surfels exist on all sides of a solid object — including back faces that no sonar ever observed. These back-face surfels project to range rows where the GT has no signal, creating spurious intensity.
+2. **Photometric loss fights ghost returns**: The optimizer sees extra intensity at ghost-return pixels and tries to suppress it. With fixed opacity, the only levers are position and rotation — surfels contort to minimize their contribution rather than simply disappearing.
+3. **Compounds with Lambertian dead zone**: Random normals make ~50% of front-face surfels invisible while no occlusion makes back-face surfels visible. The renderer simultaneously suppresses correct surfaces and hallucinates incorrect ones.
+
+### Proposed approach: per-ray front-to-back accumulation with transmittance
+
+The sonar beam travels along rays defined by **(azimuth, elevation)** pairs. For each ray, surfels should be processed front-to-back (sorted by range), with a transmittance variable that drops as solid surfaces are encountered. Once transmittance is exhausted, remaining surfels on that ray contribute nothing.
+
+#### Approach sketch
+
+1. **Ray binning**: Discretize the (azimuth, elevation) space. Each surfel maps to a ray bin based on its projected azimuth and computed elevation angle.
+2. **Range sorting within each ray**: For surfels in the same ray bin, sort by range (ascending).
+3. **Front-to-back accumulation with transmittance**:
+   ```
+   T = 1.0  (initial transmittance)
+   for each surfel in range-sorted order:
+       alpha_i = opacity_i * lambertian_i
+       contribution_i = alpha_i * T
+       accumulate contribution_i to pixel (col, row) via bilinear splat
+       T = T * (1 - alpha_i)
+       if T < epsilon: break  (fully occluded)
+   ```
+4. **Pixel mapping**: Each surfel still maps to its own (col, row) pixel based on (azimuth, range). The transmittance determines **whether** it contributes, not **where** it contributes.
+
+#### Key design decisions to resolve
+
+- **Elevation bin resolution for ray grouping**: How finely to discretize elevation for ray binning. Too coarse → surfels at different elevations incorrectly occlude each other. Too fine → sparse bins, inefficient. The elevation FOV is ±10° with typical objects subtending a few degrees, so ~1° bins may suffice.
+- **Differentiability**: The sort operation and transmittance multiplication must be differentiable. The standard 2DGS approach (cumulative product of `(1 - alpha)`) is differentiable. Sorting can use straight-through or soft-sort if needed, though hard sort with detached indices is simpler and usually sufficient (gradients flow through `alpha` and `contribution`, not through the sort order).
+- **Performance**: Per-ray sorting is more expensive than flat `scatter_add_`. For ~113K surfels across ~256 azimuth bins and ~7-20 elevation bins, each ray bin has on average 20-60 surfels. Sorting within small bins is fast.
+- **Interaction with Lambertian model**: If the Lambertian dead-zone fix (leaky Lambertian) is also applied, wrong-facing surfels behind correct ones would get occluded anyway, providing a natural cleanup mechanism for inner-surface surfels.
+
+#### What this does NOT change
+
+- Pixel coordinates: each surfel still maps to (col, row) based on (azimuth, range). The sonar image layout is unchanged.
+- FOV checking: unchanged.
+- Loss computation: unchanged.
+- The occlusion model only gates **whether** a surfel's contribution reaches the image, not where it goes.
+
+### Interaction with other identified issues
+
+| Issue | Occlusion fix impact |
+|-------|---------------------|
+| Random normals / dead zone | Orthogonal — occlusion gates by range ordering, not normal direction. Both fixes needed. |
+| Point splatting | Orthogonal — occlusion determines contribution weight, splatting determines pixel spread. Both can be addressed independently. |
+| Fixed opacity | Occlusion makes fixed opacity more viable: solid front surfaces naturally block back surfaces, so back-face surfels don't need opacity decay to disappear. |
+| Densification disabled | Orthogonal. |
+| Elevation-aware chunks | Occlusion is upstream of all elevation work. Correct occlusion improves the fidelity of the rendered image that the photometric loss trains against, which in turn improves the gradient signal for all downstream systems. |
+
+### Priority relative to other fixes
+
+1. **Normal initialization from computed normals** — simplest, highest immediate impact on speckled dots.
+2. **Leaky Lambertian** — prevents dead-zone drift, one-line change.
+3. **Acoustic occlusion** — architecturally significant, eliminates ghost returns and inner-surface contamination. Required for physically correct sonar rendering of solid objects.
+
+All three are independent and can be developed/tested separately. Normal init and leaky Lambertian are quick wins; occlusion is a larger change that should be designed carefully.
+
+### Correct occlusion rule (from user)
+
+An outer-surface surfel blocks what is behind it **only if they are on the same azimuth AND same elevation angle**. Otherwise no occlusion. Specifically:
+- Two surfels at the same (azimuth, elevation) but different ranges: the closer one occludes the farther one (the acoustic beam is blocked by the closer surface).
+- Two surfels at different azimuth angles: no occlusion, regardless of range.
+- Two surfels at different elevation angles: no occlusion, regardless of range. The sonar beam at one elevation does not block the beam at another elevation.
+
+This means occlusion is per-(azimuth, elevation) ray, not per-pixel. Two surfels that land on the same pixel in the sonar image (same azimuth, similar range) but at different elevation angles do NOT occlude each other — they both contribute independently. This is physically correct: the sonar integrates returns from the full elevation beam, and surfaces at different elevations along that beam all reflect independently.
+
+### Note on plan hierarchy
+
+This section records the diagnosis and proposed approach in the Chunk-4 plan for immediate reference. Once the approach is settled, the highest-level plan (`plans/PLAN_ELEVATION_AWARE_TRAINING_2026-01-28.md`) and its dependent plans (`PLAN_ELEVATION_AWARE_TRAINING_detailed_2026-02-01.md`, `PLAN_ELEVATION_AWARE_IMPLEMENTATION_EXECUTION_2026-02-10.md`, and downstream chunk plans) must be updated to reflect the renderer-level changes, since they currently assume the baseline `render_sonar` behavior throughout. The highest-level plan already contains decisions on the Lambertian model (line 786), fixed opacity (line 736), and sonar intensity physics (line 786) that will need addenda for the normal initialization fix, leaky Lambertian, and acoustic occlusion.
+
+---
+
+## 2026-03-02 Planning Notes (No-Regeneration Yet)
+
+1. **Synthetic refresh required after renderer-level changes**
+   - Treat current synthetic gate artifacts/results as pre-renderer-fix baseline evidence only.
+   - Any accepted change to normal initialization, Lambertian transfer, or sonar occlusion model requires synthetic dataset/evaluator refresh before new gate conclusions are considered current.
+
+2. **Synthetic guide must carry explicit refresh triggers/versioning**
+   - Add a concise trigger list and dataset-version marker policy to `docs/SYNTHETIC_DATASET_GUIDE.md` in a later planning pass.
+   - Trigger examples: renderer intensity model change, occlusion semantics change, projection-convention change, or evaluator metric-definition change.
+
+3. **Re-baseline checklist required before post-fix gate claims**
+   - Define a minimal rerun checklist for Chunk-4 synthetic evidence (`C4-S1`..`C4-S4`) plus baseline deltas and artifact verdict panel updates.
+   - Keep this as planning-only for now; do not regenerate datasets or rerun synthetic gates in this step.
