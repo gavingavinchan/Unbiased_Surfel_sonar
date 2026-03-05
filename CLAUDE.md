@@ -263,6 +263,8 @@ Examples:
 - `Add size-aware FOV constraints for surfels (opus4.5)`
 - `Fix scale factor gradient flow (sonnet3.5)`
 
+Do **not** add `Co-Authored-By` trailers to commits. The LLM tag in the title is sufficient.
+
 ### Progress Documents (Update Before Git Commits)
 
 **`plans/progress_overview.md`**: High-level project state

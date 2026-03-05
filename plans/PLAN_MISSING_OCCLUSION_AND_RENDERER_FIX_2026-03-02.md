@@ -1093,6 +1093,125 @@ Resolve H1–H3 (rendering architecture, depth sorting, frustum culling) before 
 
 ---
 
+## Appendix — 2026-03-05 R0 Test Suite Review (claude-opus-4-6)
+
+Status: **All plan test IDs covered. Several issues found — some critical, some moderate.**
+
+### Coverage
+
+Every test ID in the plan catalog (RB-T01 through RB-T22, smokes T11–T14, T17) has at least one test across 8 files. Multiple IDs have additional variant tests (T12, T14, T15, T17, T19, T21).
+
+### Already-GREEN tests (not actually RED)
+
+Several R1 features are already implemented. These tests pass against current code, contradicting the "R0 = write failing tests" premise:
+
+| Test | Why it passes now |
+|------|-------------------|
+| **T01** | `_normals_to_quaternions` exists at `scene/gaussian_model.py:26`; `create_from_pcd:166-177` already uses it |
+| **T02** | Same — deterministic init already in place |
+| **T03** | `compute_sonar_lambertian` exists at `gaussian_renderer/__init__.py:299` with leaky mode |
+| **T04** | Same function, clamp0 mode |
+| **T22** | `resolve_sonar_render_contract:324` already rejects `legacy` |
+
+Not a blocking problem (the tests are valid regression coverage), but these are not gating TDD red-light tests — the implementation preceded the test authoring.
+
+### Critical Issues
+
+#### C1. Compositing model is implicit — could trip up implementers
+
+T05, T06, and T16 encode a specific compositing formula where `event_return = value * transmittance` — alpha only reduces transmittance, does NOT scale the event return. This is **not the standard alpha compositing** formula (`alpha * value * transmittance`).
+
+Verification:
+
+- **T05** expects `event_returns[1] == 0.3` with alpha=0.7, value=1.0, one prior event at alpha=0.7:
+  - Standard compositing: `0.7 * 1.0 * 0.3 = 0.21` — would FAIL
+  - Tests' model: `1.0 * 0.3 = 0.3` — passes
+
+- **T16** expects `ray_returns[0] == 1.08`:
+  - Standard compositing: `0.6*1.0 + 0.6*0.2*0.4 = 0.648` — would FAIL
+  - Tests' model: `1.0*1.0 + 0.2*0.4 = 1.08` — passes
+
+The plan does not precisely specify this formula. An implementer using standard alpha compositing will get failing tests with no explanation.
+
+**Required fix:** Add a compositing contract docstring/comment at the top of `test_renderer_baseline_r0_red_r2_contracts.py` specifying the exact formula, or add the formula to the plan's R2a section.
+
+#### C2. T08 (densification) will likely NameError at runtime
+
+`_load_renderer_fn` in `test_renderer_baseline_r0_red_densification_contracts.py` loads all function/class definitions from the renderer and `exec`s them. The mocked globals are sparse:
+
+```python
+ns = {"torch", "math", "os", "dataclass", "F", "GaussianModel",
+      "get_scaled_world_to_view_transform", "sonar_ranges_to_points",
+      "sonar_points_to_normals"}
+```
+
+But `render_sonar` uses many **imported** names at runtime (`SurfelRasterizationSettings`, `SurfelRasterizer`, `getWorld2View2`, etc.) that are not functions/classes defined in the file — they're module-level imports. The AST extraction skips imports, so these will be missing from the exec namespace.
+
+The test will fail with `NameError` (missing imported dependency), not with a meaningful assertion failure about densification signals.
+
+**Required fix:** Either (a) add the missing imported symbols to the mock namespace, (b) restructure the test to call only the specific sub-functions that produce `radii`/`viewspace_points`, or (c) accept this as a known limitation and document it.
+
+#### C3. T09 expected results depend on function internals beyond the mask logic
+
+The test mocks `apply_row_prune_with_chunk4_state` to return 0 and `ensure_chunk4_state_capacity` to no-op. The expected `pruned_all == 3` assumes the function returns a count that comes directly from `prune_points` call accounting. If the function's return type or internal accounting changes (e.g., returns a dict, or includes row-prune counts), the test breaks for structural reasons rather than contract reasons.
+
+**Recommended:** Add a comment documenting the assumed return-value contract.
+
+### Moderate Issues
+
+#### M1. T20 inconsistently skips `_call_with_supported_kwargs`
+
+T05, T06, T16 all call `compose_ray_binned_occlusion` via `_call_with_supported_kwargs` (lenient about extra kwargs), but T20 calls it directly with a `surfel_ids=` kwarg. If the implementation ignores surfel IDs (since ray isolation is already guaranteed by `ray_ids`), T20 fails with `TypeError` while the others pass.
+
+**Required fix:** Either all tests for `compose_ray_binned_occlusion` should use `_call_with_supported_kwargs`, or all should call directly. Recommend making T20 consistent with T05/T06/T16.
+
+#### M2. Inconsistent `sonar_config` handling across `project_sonar_footprint` tests
+
+- T07 (`remaining_contracts.py`): **does not pass `sonar_config` at all**
+- T15 (`remaining_contracts.py`): passes a real `SonarConfig` object (via `_load_sonar_utils_module()`)
+- T15 (`nonlinear_boundary_contracts.py`): passes a plain **dict** from `_dummy_sonar_cfg()`
+
+This means the implementation must accept a `SonarConfig` object, a dict, AND treat `sonar_config` as optional — all simultaneously. The tests pull in different directions on the API contract.
+
+**Required fix:** Standardize on one convention. Recommend always passing a `SonarConfig` object (or always a dict with documented keys), and making it required.
+
+#### M3. T13 default occlusion mode will remain RED throughout R1
+
+T13 asserts the default `occlusion_mode` is `"ray_binned"`, but the current default is `"none"` (`resolve_sonar_render_contract:329`). Per the execution order, R2a changes this default. T13 will be RED throughout R1 implementation — expected behavior, but potentially confusing if someone runs the full test suite during R1 and sees unexpected failures.
+
+**Recommended:** Add a comment in T13 noting it gates R2a, not R1.
+
+#### M4. Duplicated test coverage across files
+
+T14 and T17 assertions appear in both `test_renderer_baseline_r0_red_runtime_metadata_contracts.py` and `test_renderer_baseline_smoke_contracts.py` with overlapping (but not identical) formulations. Adds maintenance burden and ambiguity about which is authoritative.
+
+### Minor Issues
+
+#### m1. T10 roundtrip tolerance is generous
+
+0.10m tolerance on a 256x200 image with 2.8m range extent gives ~0.014m/pixel. The threshold allows ~7 pixels of error, which could mask real coordinate issues.
+
+#### m2. T21 AST hardcoded-zero check is bypassable
+
+The test checks for literal `0.0` constants in the AST. An implementer could write `float(0)` or `0.0 + 0` and bypass the check. Reasonable heuristic but not airtight.
+
+#### m3. T15 oracle setup guard could mislead
+
+`assert oracle_pixels.shape[0] >= 20` is a setup guard in `test_renderer_baseline_r0_red_remaining_contracts.py:196`. If the surfel projects fewer than 20 valid samples, the test fails with "insufficient projected samples" — a misleading message unrelated to the actual contract.
+
+### Summary
+
+The test suite is structurally complete and the logic is mostly correct. The main risks for execution are:
+
+1. **Document the compositing formula** (C1) — the tests encode it but it's not written anywhere
+2. **T08 will likely NameError** (C2) — the renderer has too many imported dependencies for AST extraction to work cleanly
+3. **Normalize the `sonar_config` API** (M2) across T07/T15 variants
+4. **Make T20 consistent** (M1) with T05/T06/T16 on `_call_with_supported_kwargs`
+
+The 5 already-GREEN tests (T01, T02, T03, T04, T22) are not a problem — they're valid regression coverage for already-landed R1 work.
+
+---
+
 ## Appendix — 2026-03-05 R0 TDD Readiness Assessment (claude-opus-4-6)
 
 Status: **16 of 17 unit/contract tests can be written now.** H1–H3 architectural gaps affect integration wiring, not unit contracts. TDD tests the contract.
@@ -1135,3 +1254,189 @@ The three HIGH architectural gaps (H1: rendering architecture, H2: depth sort ke
 ### Conclusion
 
 R0 can proceed immediately with 16 tests. `RB-T08` should be deferred until M4 is resolved (define sonar `viewspace_points` semantics). Smoke tests are post-integration by design.
+
+---
+
+## Appendix — 2026-03-05 R0 Test Quality Audit (claude-opus-4-6)
+
+Status: **R0 tests must be rewritten.** All 25 tests use source-code string/AST grep instead of behavioral contract testing. This violates TDD methodology and produces tests that are fragile, non-discriminating, and unable to gate implementation correctness.
+
+### Audit Method
+
+- Read all 5 test files (`tests/test_renderer_baseline_r0_red_*.py`, `tests/test_renderer_baseline_smoke_contracts.py`)
+- Ran full suite: `pytest tests/test_renderer_baseline_*.py -v`
+- Cross-referenced each test against its plan contract (Test Catalog, lines 590–620)
+- Verified current source file state against test expectations
+
+### Results: 12 failed, 11 passed, 2 skipped
+
+### Finding 1 — Fundamental TDD violation: no behavioral tests
+
+Every R0 "red" test uses one of two approaches:
+- **AST analysis**: Parse source code with `ast` module and check for specific AST node patterns
+- **String grep**: `assert "SOME_STRING" in source_text`
+
+**Zero tests** construct inputs, call a function, or assert on outputs. No test file imports `torch`. The R0 TDD readiness assessment (this plan, line 1096) explicitly confirmed 16 tests are writable NOW as behavioral contract tests with synthetic tensor inputs. None were written that way.
+
+### Finding 2 — 9 tests PASS prematurely (should be RED)
+
+In TDD, R0 tests must fail against the pre-implementation codebase. The following 9 tests pass, meaning they cannot gate whether the implementation is correct:
+
+| Test | Why it passes prematurely |
+|------|--------------------------|
+| `RB-T01` (normal init) | AST finds `pcd.normals` reference in `create_from_pcd` even though normals are not consumed for quaternion init |
+| `RB-T02` (init determinism) | Checks `torch.rand` absent from AST — may already be absent without normals being used |
+| `RB-T03` (Lambertian gradient) | `"SONAR_LAMBERTIAN_MODE"` string found in working-tree modifications |
+| `RB-T04` (clamp0 parity) | Exact source string match found in working-tree modifications |
+| `RB-T05/06` (occlusion) | `"SONAR_OCCLUSION_MODE"` + `"ray_binned"` strings found in working-tree modifications |
+| `RB-T09` (FOV prune) | AST check passes — either bug already fixed or AST match too loose |
+| `RB-T18` (elevation marginalization) | `"SONAR_ELEV_BINS"` string found in working-tree modifications |
+| `RB-T22` (render mode, r2 file) | `"2dgs_nonlinear"` string found in working-tree modifications |
+| `RB-T22` (legacy rejection, occ file) | Exact error message string found in working-tree modifications |
+
+### Finding 3 — Per-test contract violations
+
+| Test ID | Plan contract | What was written | What should be written |
+|---------|--------------|-----------------|----------------------|
+| **RB-T01** | `create_from_pcd` consumes normals into quaternions | AST check for `pcd.normals` reference | Create `GaussianModel` with known normals → verify quaternion output aligns with input normal direction |
+| **RB-T02** | Quaternion init deterministic under fixed seed | Checks `torch.rand` absent from AST | Call `create_from_pcd` twice with same seed + normals → assert identical quaternion output |
+| **RB-T03** | Wrong-facing surfels get non-zero gradient under leaky mode | Checks `"SONAR_LAMBERTIAN_MODE"` string exists | Create wrong-facing surfel tensor → compute leaky Lambertian → backprop → assert `grad != 0` on rotation |
+| **RB-T04** | `clamp0` reproduces pre-leaky transfer behavior | Exact source string match | Compute Lambertian both ways on same tensor input → assert outputs match within tolerance |
+| **RB-T05** | Closer surfel suppresses farther on same ray | String check for `"ray_binned"` | Two surfels on same `(az_bin, el_bin)` at different ranges → front-to-back compose → assert back is suppressed |
+| **RB-T06** | Different rays don't occlude each other | Combined with T05 as single string check | Two surfels on different `(az_bin, el_bin)` → verify both contribute independently |
+| **RB-T07** | Scale changes rendered spatial support | AST check for `pc.get_scaling` | Render same surfel at 2 scales → assert different pixel footprint size |
+| **RB-T09** | `require_all=True/False` produce distinct results | AST check for `.all()` vs `.any()` | Construct geometry where `all` and `any` diverge → call `prune_outside_fov` both ways → assert different mask outputs |
+| **RB-T10** | Forward/backward projection roundtrip within tolerance | Comment string matching in `point_utils.py` | Project 3D point → sonar image → back to 3D → assert Euclidean distance < tolerance |
+| **RB-T15** | Sigma-point mode beats Jacobian for large/oblique surfels | Env var string check | Brute-force project surfel grid as oracle → compare sigma-point vs Jacobian footprint error |
+| **RB-T16** | Occlusion uses sonar range, not camera-Z | String check for `"argsort"` | Two surfels where range order differs from Z order → verify range order governs occlusion |
+| **RB-T18** | `I[a,r] = sum_e w_e * R[a,e,r]` | String check for env vars | Construct synthetic `R[a,e,r]` volume + weights → marginalize → compare to hand-computed `I[a,r]` |
+| **RB-T19** | `Sigma_2D → T` roundtrip + gradient flow | String check for `"transMat_precomp"` | Known `Sigma_2D` → convert to T → reconstruct covariance → assert matches; verify `grad` flows through chain |
+| **RB-T20** | Wide surfel contributes to multiple rays, occluded independently per ray | String check for `topk(` | Create wide surfel → verify events emitted on multiple ray bins with correct per-ray occlusion |
+| **RB-T21** | Mass-loss telemetry from support capping | String check for `"quantile"` | Cap known weights via top-K → compute mass loss → verify summary stats match expected values |
+| **RB-T22** | Legacy mode rejected | String check for error message | Set `SONAR_RENDER_MODE=legacy` → call render entry point → assert raises `ValueError` or equivalent |
+
+### Finding 4 — Duplicate test coverage
+
+RB-T20, RB-T21, and RB-T22 each appear in **two files** with different implementations:
+- `test_renderer_baseline_r0_red_r2_contracts.py` — string checks for env vars
+- `test_renderer_baseline_r0_red_occlusion_semantics_contracts.py` — slightly different string checks
+
+These will conflict when one version passes and the other fails, creating ambiguous gate status.
+
+### Finding 5 — RB-T08 written despite explicit deferral
+
+The R0 TDD readiness assessment (this plan, line 1131) states: "RB-T08 (densification signals): Requires defining what `viewspace_points` means for sonar (M4). Cannot write meaningful assertions until this is specified." The test was written anyway as an AST check on the return dictionary of `render_sonar`.
+
+### Finding 6 — Extreme fragility
+
+Tests like RB-T04 check for exact source code strings:
+```python
+assert 'if lambertian_mode == "clamp0"' in renderer_source
+assert "torch.clamp(dot_val, min=0.0)" in renderer_source
+```
+
+A variable rename (`dot_val` → `cos_theta`), whitespace change, or `0` vs `0.0` breaks these without any semantic difference. Multiple other tests share this fragility pattern.
+
+### Required remediation
+
+All R0 tests must be rewritten as **behavioral contract tests**:
+
+1. Import the module under test (or define a standalone contract function when the module API doesn't exist yet)
+2. Construct synthetic tensor inputs (surfel positions, normals, scales, sonar config)
+3. Call the target function
+4. Assert on numerical output behavior (values, shapes, gradient flow, ordering)
+
+Tests for contracts where the implementation function doesn't exist yet (e.g., ray-binned compositor, sigma-point projection) should define the expected function signature and test against it. The implementation fills in the function body to make the test pass — that is standard TDD.
+
+### Tests that can remain as-is (with caveats)
+
+- `test_rb_t11_rb_t12_debug_script_compiles_for_smoke_contracts` — compile check is fine as a smoke gate
+- Runtime smoke tests (`RB-T11`, `RB-T12` runtime variants) — correctly gated behind `RUN_RENDERER_BASELINE_RUNTIME_SMOKES=1`
+
+All other tests require rewrite before R0 can be considered complete.
+
+---
+
+## Appendix — 2026-03-05 R0 Test Rewrite Review (claude-opus-4-6)
+
+Status: **Major improvement. Three bugs remain, plus one housekeeping item.** After fixes, R0 is complete.
+
+### What changed
+
+All 25 source-string/AST-grep tests were replaced with behavioral contract tests. Every unit test now constructs synthetic tensor inputs, calls the function under test, and asserts on numerical outputs. The approach uses AST extraction + `exec` to isolate individual functions from CUDA-dependent modules — creative and practical for avoiding heavy import chains.
+
+### Rewrite results: 12 failed, 5 passed, 2 skipped (19 tests total)
+
+| Status | Tests | Notes |
+|--------|-------|-------|
+| FAIL (correct — function doesn't exist) | T05, T06, T07, T15, T16, T18, T19, T20, T21 | Proper TDD red: `pytest.fail("missing renderer callable")` |
+| FAIL (wrong reason — mock bug) | T01, T02 | DummyModel incomplete — see Bug 1 |
+| FAIL (wrong reason — assertion bug) | T09 | See Bug 2 |
+| PASS (R1 already implemented) | T03, T04, T22 | `compute_sonar_lambertian` and `resolve_sonar_render_contract` exist in working tree |
+| PASS (existing infrastructure) | T10 | Roundtrip works with current sonar_utils — correct |
+| PASS (compile check) | T11/T12 compile | Expected |
+| SKIP (env-gated runtime) | T11, T12 runtime | Correctly gated behind `RUN_RENDERER_BASELINE_RUNTIME_SMOKES=1` |
+| Deferred (correct) | T08 | Per readiness assessment (M4 unresolved) |
+
+### What's good
+
+- **10 of 16 unit tests fail for the correct reason** — target function doesn't exist yet
+- **No more duplicates** — each test ID appears exactly once
+- **Compositing model is consistent across T05/T06/T16/T20** — all use `event_return = T * value` with `T *= (1 - alpha)`, producing verifiable numerical expectations
+- **T16 correctly discriminates range-order vs camera-Z order** — range-sorted gives 1.08, Z-sorted would give 0.6
+- **T19 tests both roundtrip fidelity AND gradient flow** through `Sigma_2D → T` conversion
+- **T21 tests precise weight-cap normalization** with exact expected values for retained weights and mass-loss stats
+- **T22 tests runtime rejection** via `pytest.raises(ValueError, match="legacy")`
+- **T10 does real forward/backward roundtrip** using existing sonar_utils infrastructure
+- **RB-T08 correctly deferred** per readiness assessment
+
+### Bug 1 — T01/T02: DummyModel missing `get_xyz` property
+
+`create_from_pcd` sets `self._xyz = nn.Parameter(...)` at `scene/gaussian_model.py:185`, then accesses `self.get_xyz.shape[0]` at line 191. `get_xyz` is a `@property` on the real `GaussianModel` class, but the test's `DummyModel` doesn't implement it. Both T01 and T02 fail with `AttributeError: 'DummyModel' object has no attribute 'get_xyz'` before the actual contract assertion is reached.
+
+**Fix:** Add to DummyModel:
+```python
+@property
+def get_xyz(self):
+    return self._xyz
+```
+
+### Bug 2 — T09: Wrong assertion when nothing needs pruning
+
+The `require_all=False` path correctly identifies that all 3 surfels are visible from at least one camera, so `num_to_prune = 0`. The function then skips `prune_points` entirely (`debug_multiframe.py:330`: `if num_to_prune > 0`), which is correct behavior. But the test asserts:
+
+```python
+assert torch.equal(g_any.last_prune_mask, torch.tensor([False, False, False]))
+```
+
+Since `prune_points` was never called, `g_any.last_prune_mask` is `None`, causing `TypeError`. The first three assertions all pass correctly (`pruned_all == 3`, `pruned_any == 0`, `g_all.last_prune_mask == [True, True, True]`).
+
+**Fix:** Replace the final assertion with:
+```python
+assert g_any.last_prune_mask is None, "RB-T09: no prune_points call expected when nothing to prune"
+```
+
+### Bug 3 — T15: Oracle doesn't use sonar projection
+
+The plan contract for RB-T15 is: "2dgs_nonlinear better matches brute-force nonlinear projection oracle than Jacobian mode for large/oblique surfels." The oracle should project points through the actual nonlinear sonar projection to produce a reference 2D covariance in image space. Instead, the test computes a sample covariance in world XY space:
+
+```python
+pts = local * scale_xy.cpu().numpy()[None, :] + mean_3d[:2].cpu().numpy()[None, :]
+oracle_cov = _oracle_covariance_from_points(pts)
+```
+
+This covariance is in meters², not pixels². It doesn't go through `atan2` / `sqrt` / pixel mapping. Comparing `sigma_2d` (image-space, pixels²) against this oracle is dimensionally wrong and will produce meaningless pass/fail results.
+
+**Fix:** The oracle must:
+1. Generate a dense grid of 3D points on the surfel disc (using quaternion and scale to parameterize the disc in world coordinates)
+2. Project each point through the full nonlinear sonar projection: `azimuth = -atan2(x, z)`, `range = sqrt(x² + y² + z²)`, then to pixel coordinates via the sonar config
+3. Compute sample covariance of the projected 2D pixel positions
+4. Compare both `2dgs` and `2dgs_nonlinear` footprints against this pixel-space oracle
+
+### Housekeeping — Smoke tests T12 (active diagnostics), T13, T14, T17 absent
+
+The v1 string-check versions of these tests were correctly removed, and the plan categorizes them as post-integration. However, having no trace of these test IDs in the test files makes the catalog harder to audit. Adding `pytest.skip("post-integration: requires full pipeline wired up")` placeholder functions for T13, T14, and T17 would keep the test catalog traceable without implying they should pass now.
+
+### Conclusion
+
+After fixing Bugs 1–3 and optionally adding smoke placeholders, the R0 test suite is complete. The rewrite addresses all six findings from the prior audit: behavioral testing, correct red/fail status, no duplicates, T08 deferred, and no fragile string matching.

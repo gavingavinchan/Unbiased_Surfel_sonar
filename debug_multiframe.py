@@ -286,8 +286,8 @@ def prune_outside_fov(
         training_frames: List of camera objects
         sonar_config: SonarConfig
         scale_factor: SonarScaleFactor
-        require_all: If True, prune if outside ALL cameras' FOV
-                     If False, keep if visible from ANY camera (default)
+        require_all: If True, keep only points visible from ALL training cameras
+                     If False, keep points visible from ANY training camera (default)
         check_size: If True, also check that surfel size doesn't extend beyond FOV
 
     Returns:
@@ -317,11 +317,11 @@ def prune_outside_fov(
     all_masks = torch.stack(visible_masks, dim=0)
 
     if require_all:
-        # Prune if outside ALL cameras (very aggressive)
-        visible_from_any = all_masks.any(dim=0)  # [N]
-        prune_mask = ~visible_from_any
+        # Strict mode: points must be visible from every training camera
+        visible_from_all = all_masks.all(dim=0)  # [N]
+        prune_mask = ~visible_from_all
     else:
-        # Keep if visible from at least one camera (conservative)
+        # Conservative mode: keep if visible from at least one camera
         visible_from_any = all_masks.any(dim=0)  # [N]
         prune_mask = ~visible_from_any
 

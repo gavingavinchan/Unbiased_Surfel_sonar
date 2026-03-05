@@ -13,6 +13,7 @@ import torch
 import numpy as np
 from utils.general_utils import inverse_sigmoid, get_expon_lr_func, build_rotation
 from torch import nn
+import torch.nn.functional as F
 import os
 from utils.system_utils import mkdir_p
 from plyfile import PlyData, PlyElement
@@ -20,6 +21,29 @@ from utils.sh_utils import RGB2SH
 from simple_knn._C import distCUDA2
 from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
+
+
+def _normals_to_quaternions(normals: torch.Tensor) -> torch.Tensor:
+    """Map world-space normals to quaternions rotating +Z onto each normal."""
+    eps = 1e-8
+    normals = F.normalize(normals, dim=-1, eps=eps)
+    z_axis = torch.tensor([0.0, 0.0, 1.0], device=normals.device, dtype=normals.dtype).unsqueeze(0).expand_as(normals)
+
+    dot = torch.sum(z_axis * normals, dim=-1).clamp(-1.0, 1.0)
+    cross = torch.cross(z_axis, normals, dim=-1)
+
+    s = torch.sqrt(torch.clamp(1.0 + dot, min=eps) * 2.0)
+    inv_s = 1.0 / s
+
+    quat = torch.zeros((normals.shape[0], 4), dtype=normals.dtype, device=normals.device)
+    quat[:, 0] = 0.5 * s
+    quat[:, 1:] = cross * inv_s.unsqueeze(-1)
+
+    antiparallel = dot < (-1.0 + 1e-4)
+    if antiparallel.any():
+        quat[antiparallel] = torch.tensor([0.0, 1.0, 0.0, 0.0], dtype=normals.dtype, device=normals.device)
+
+    return F.normalize(quat, dim=-1, eps=eps)
 
 class GaussianModel:
 
@@ -126,7 +150,8 @@ class GaussianModel:
 
     def create_from_pcd(self, pcd : BasicPointCloud, spatial_lr_scale : float):
         self.spatial_lr_scale = spatial_lr_scale
-        fused_point_cloud = torch.tensor(np.asarray(pcd.points)).float().cuda()
+        points_np = np.asarray(pcd.points)
+        fused_point_cloud = torch.tensor(points_np).float().cuda()
         fused_color = RGB2SH(torch.tensor(np.asarray(pcd.colors)).float().cuda())
         features = torch.zeros((fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2)).float().cuda()
         features[:, :3, 0 ] = fused_color
@@ -134,9 +159,26 @@ class GaussianModel:
 
         print("Number of points at initialisation : ", fused_point_cloud.shape[0])
 
-        dist2 = torch.clamp_min(distCUDA2(torch.from_numpy(np.asarray(pcd.points)).float().cuda()), 0.0000001)
+        dist2 = torch.clamp_min(distCUDA2(torch.from_numpy(points_np).float().cuda()), 0.0000001)
         scales = torch.log(torch.sqrt(dist2))[...,None].repeat(1, 2)
-        rots = torch.rand((fused_point_cloud.shape[0], 4), device="cuda")
+
+        num_points = fused_point_cloud.shape[0]
+        rots = torch.zeros((num_points, 4), dtype=torch.float32, device="cuda")
+        rots[:, 0] = 1.0
+        normals_np = np.asarray(pcd.normals)
+        if normals_np.shape == points_np.shape and normals_np.size > 0:
+            normals = torch.tensor(normals_np, dtype=torch.float32, device="cuda")
+            valid = torch.isfinite(normals).all(dim=-1) & (torch.linalg.norm(normals, dim=-1) > 1e-8)
+            if valid.any():
+                rots[valid] = _normals_to_quaternions(normals[valid])
+                if (~valid).any():
+                    print(
+                        "Warning: Some input normals are invalid; using identity quaternion fallback for those points."
+                    )
+            else:
+                print("Warning: Input normals are present but invalid; using identity quaternion fallback.")
+        elif normals_np.size > 0:
+            print("Warning: Input normal shape mismatch; using identity quaternion fallback.")
 
         opacities = self.inverse_opacity_activation(0.1 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))
 

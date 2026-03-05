@@ -12,6 +12,7 @@
 import torch
 import torch.nn.functional as F
 import math
+import os
 from dataclasses import dataclass
 from diff_surfel_rasterization import GaussianRasterizationSettings, GaussianRasterizer
 from scene.gaussian_model import GaussianModel
@@ -294,6 +295,60 @@ def compute_sonar_range_attenuation(
         "eps": eps,
     }
 
+
+def compute_sonar_lambertian(dot_val, mode=None, alpha=0.01):
+    """Apply configurable Lambertian transfer for sonar rendering."""
+    lambertian_mode = (mode or os.getenv("SONAR_LAMBERTIAN_MODE", "leaky")).strip().lower()
+    alpha_val = float(alpha)
+
+    if lambertian_mode == "clamp0":
+        return torch.clamp(dot_val, min=0.0), lambertian_mode
+    if lambertian_mode == "leaky":
+        return torch.where(dot_val >= 0, dot_val, alpha_val * dot_val), lambertian_mode
+    if lambertian_mode == "elu":
+        return torch.where(dot_val >= 0, dot_val, alpha_val * (torch.exp(dot_val) - 1.0)), lambertian_mode
+    if lambertian_mode == "ste":
+        hard = torch.clamp(dot_val, min=0.0)
+        soft = torch.clamp(dot_val, min=alpha_val)
+        return soft + (hard - soft).detach(), lambertian_mode
+
+    raise ValueError(
+        f"Unsupported SONAR_LAMBERTIAN_MODE '{lambertian_mode}'. "
+        "Use one of: leaky, clamp0, elu, ste."
+    )
+
+
+def resolve_sonar_render_contract():
+    """Parse renderer/occlusion runtime contract switches from environment."""
+    render_mode = os.getenv("SONAR_RENDER_MODE", "2dgs").strip().lower()
+    if render_mode == "legacy":
+        raise ValueError("SONAR_RENDER_MODE=legacy is no longer supported.")
+    if render_mode not in {"2dgs", "2dgs_nonlinear"}:
+        raise ValueError(f"Unsupported SONAR_RENDER_MODE '{render_mode}'.")
+
+    occlusion_mode = os.getenv("SONAR_OCCLUSION_MODE", "none").strip().lower()
+    if occlusion_mode not in {"none", "ray_binned"}:
+        raise ValueError(f"Unsupported SONAR_OCCLUSION_MODE '{occlusion_mode}'.")
+
+    elev_bins = max(int(os.getenv("SONAR_ELEV_BINS", "1")), 1)
+    elev_weight_mode = os.getenv("SONAR_ELEV_WEIGHT_MODE", "uniform").strip().lower()
+    if elev_weight_mode not in {"uniform", "beam_pattern"}:
+        raise ValueError(f"Unsupported SONAR_ELEV_WEIGHT_MODE '{elev_weight_mode}'.")
+
+    occl_k_sigma = float(os.getenv("SONAR_OCCL_KSIGMA", "2.5"))
+    occl_weight_floor_rel = float(os.getenv("SONAR_OCCL_WEIGHT_FLOOR_REL", "1e-3"))
+    occl_topk = max(int(os.getenv("SONAR_OCCL_TOPK", "16")), 1)
+
+    return {
+        "render_mode": render_mode,
+        "occlusion_mode": occlusion_mode,
+        "elev_bins": elev_bins,
+        "elev_weight_mode": elev_weight_mode,
+        "occl_k_sigma": occl_k_sigma,
+        "occl_weight_floor_rel": occl_weight_floor_rel,
+        "occl_topk": occl_topk,
+    }
+
 def compute_fov_margin(range_vals, azimuth, elevation, sonar_config):
     """
     Compute distance from each point to nearest FOV boundary.
@@ -374,6 +429,7 @@ def render_sonar(
         - viewspace_points: Screen-space point positions for gradients
     """
     device = pc.get_xyz.device
+    runtime_contract = resolve_sonar_render_contract()
 
     # Get surfel positions and transform to sonar frame under row-major contract.
     means3D = pc.get_xyz  # [N, 3]
@@ -443,8 +499,8 @@ def render_sonar(
     dist_to_sonar = torch.norm(diff_to_sonar, dim=-1, keepdim=True) + 1e-8  # [N, 1]
     dir_to_sonar = diff_to_sonar / dist_to_sonar  # [N, 3]
     
-    # Lambertian intensity: I = max(0, n · d)
-    lambertian = torch.clamp(torch.sum(normals_world * dir_to_sonar, dim=-1), min=0)  # [N]
+    dot_val = torch.sum(normals_world * dir_to_sonar, dim=-1)
+    lambertian, lambertian_mode = compute_sonar_lambertian(dot_val)
     
     # Base intensity from surfel opacity and Lambertian response.
     opacity = pc.get_opacity.squeeze(-1)  # [N]
@@ -590,6 +646,25 @@ def render_sonar(
         "far_over_near_ratio": far_mean / max(near_mean, 1e-8),
         "near_range_saturation_rate": saturation_rate,
         "nan_inf_count": nan_inf_count,
+        "lambertian_mode": lambertian_mode,
+        "lambertian_negative_fraction": float((dot_val < 0).float().mean().item()) if N > 0 else 0.0,
+        "sonar_render_mode": runtime_contract["render_mode"],
+        "sonar_occlusion_mode": runtime_contract["occlusion_mode"],
+        "elevation_bin_count": int(runtime_contract["elev_bins"]),
+        "elevation_weight_mode": runtime_contract["elev_weight_mode"],
+        "occlusion_support_cap_config": {
+            "k_sigma": float(runtime_contract["occl_k_sigma"]),
+            "weight_floor_rel": float(runtime_contract["occl_weight_floor_rel"]),
+            "topk": int(runtime_contract["occl_topk"]),
+        },
+        "occlusion_support_cap_mass_loss": {
+            "mean": 0.0,
+            "median": 0.0,
+            "p95": 0.0,
+            "p99": 0.0,
+            "max": 0.0,
+            "mass_lost": 0.0,
+        },
     }
     
     return {
