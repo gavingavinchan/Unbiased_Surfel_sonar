@@ -874,6 +874,10 @@ Chunk-4 code integration is largely complete, but gate failure persists because 
 
 ## 2026-02-27 Baseline Renderer Diagnosis (claude-opus-4-6)
 
+Historical provenance note:
+- The material from this section onward (`line 875+`) is kept because this is where the renderer problem was first written down when it was discovered.
+- This section is now a historical record only; active planning/execution is superseded by `plans/PLAN_MISSING_OCCLUSION_AND_RENDERER_FIX_2026-03-02.md`.
+
 ### Problem statement
 
 Rendered sonar images appear as "speckled dots" instead of matching the GT's smooth intensity arcs. The 3D reconstruction shows a torus with structured streak lines. Even ignoring elevation (which is expected to be unconstrained), the 2D (azimuth, range) projected shape fails to converge to the correct geometry.

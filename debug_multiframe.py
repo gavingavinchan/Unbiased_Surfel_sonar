@@ -620,6 +620,129 @@ def sample_gt(frame_gray, row, col):
     return sampled, valid
 
 
+def resolve_stage1_overlap_neighbors(frame_key, overlap_table, topk_use):
+    entry = overlap_table.get(str(frame_key), {}) if isinstance(overlap_table, dict) else {}
+    raw_neighbors = entry.get("topk_use", []) if isinstance(entry, dict) else []
+    neighbors = []
+    for key in raw_neighbors:
+        key_str = str(key)
+        if key_str not in neighbors:
+            neighbors.append(key_str)
+    limit = max(0, int(topk_use))
+    if limit > 0:
+        neighbors = neighbors[:limit]
+    return neighbors
+
+
+def build_stage1_multiview_loglik(
+    *,
+    frame_idx,
+    frame_key,
+    training_frames,
+    frame_key_to_index,
+    overlap_table,
+    pixel_bank,
+    gt_frame_cache,
+    frame_stats_cache,
+    elev_angle_bins,
+    sonar_config,
+    sonar_scale_factor,
+    cfg,
+):
+    if str(cfg.lik_invalid_mode) != "neutral":
+        raise ValueError(f"Unsupported ELEV_LIK_INVALID_MODE: {cfg.lik_invalid_mode}")
+
+    bank_entry = pixel_bank[str(frame_key)]
+    rows = bank_entry["rows"]
+    cols = bank_entry["cols"]
+    p = int(rows.shape[0])
+    k = int(elev_angle_bins.shape[0])
+    device = rows.device
+
+    loglik = torch.full((p, k), float(cfg.lik_log_floor), dtype=torch.float32, device=device)
+    support_mask = torch.zeros((p, k), dtype=torch.bool, device=device)
+    if p <= 0 or k <= 0:
+        return loglik, support_mask
+
+    pts_bins = back_project_bins(
+        frame_idx=int(frame_idx),
+        rows=rows,
+        cols=cols,
+        elev_bins=elev_angle_bins,
+        cameras=training_frames,
+        sonar_config=sonar_config,
+        scale_factor=sonar_scale_factor,
+    )
+    pts_flat = pts_bins.reshape(-1, 3)
+
+    loglik_sum = torch.zeros_like(loglik)
+    valid_w = torch.zeros_like(loglik)
+    neighbors = resolve_stage1_overlap_neighbors(
+        frame_key=frame_key,
+        overlap_table=overlap_table,
+        topk_use=cfg.overlap_topk_use,
+    )
+
+    for neighbor_key in neighbors:
+        neighbor_idx = frame_key_to_index.get(neighbor_key)
+        if neighbor_idx is None:
+            continue
+        if neighbor_key not in gt_frame_cache:
+            continue
+        if neighbor_key not in frame_stats_cache:
+            continue
+
+        neighbor_cam = training_frames[int(neighbor_idx)]
+        proj = sonar_project_points(
+            pts_flat,
+            neighbor_cam,
+            sonar_config,
+            scale_factor=sonar_scale_factor,
+        )
+
+        sampled_i, sampled_valid = sample_gt(
+            gt_frame_cache[neighbor_key]["gt_gray"],
+            proj.row,
+            proj.col,
+        )
+
+        sampled_i = sampled_i.reshape(p, k)
+        sampled_valid = sampled_valid.reshape(p, k)
+        proj_valid = proj.valid.reshape(p, k)
+        valid_mask = proj_valid & sampled_valid
+        if not bool(valid_mask.any().item()):
+            continue
+
+        frame_stats = frame_stats_cache[neighbor_key]
+        norm_vals = normalize_by_percentiles(
+            sampled_i,
+            lo=frame_stats["p_lo"],
+            hi=frame_stats["p_hi"],
+            eps=cfg.lik_log_eps,
+        )
+        log_evidence = torch.log(norm_vals.clamp_min(cfg.lik_log_eps)).clamp(
+            min=cfg.lik_log_floor,
+            max=0.0,
+        )
+
+        reliability = float(frame_stats["reliability"]) if cfg.lik_use_frame_reliability else 1.0
+        weighted_valid = valid_mask.to(dtype=torch.float32)
+        if reliability < 1.0:
+            weighted_valid = weighted_valid * reliability
+
+        loglik_sum = loglik_sum + (weighted_valid * log_evidence)
+        valid_w = valid_w + weighted_valid
+
+    supported = valid_w > 0.0
+    loglik = torch.where(
+        supported,
+        loglik_sum / valid_w.clamp_min(1e-8),
+        torch.full_like(loglik_sum, float(cfg.lik_log_floor)),
+    )
+    support_mask = valid_w > float(cfg.lik_min_support)
+    return loglik, support_mask
+
+
 def select_topk_bright_pixels(gt_gray, k):
     h, w = gt_gray.shape
     flat = gt_gray.reshape(-1)
@@ -2504,7 +2627,17 @@ class ElevationChunk4Config:
     surfel_id_asserts: bool
 
 
-def parse_elevation_chunk4_config(elevation_aware):
+def _scaled_warmup_default(stage2_iters, frac, min_iters, max_iters):
+    total = max(0, int(stage2_iters))
+    if total <= 0:
+        return 0
+    scaled = int(round(float(frac) * float(total)))
+    scaled = max(int(min_iters), scaled)
+    scaled = min(int(max_iters), scaled)
+    return min(total, scaled)
+
+
+def parse_elevation_chunk4_config(elevation_aware, stage2_iters):
     couple_mode = env_choice("ELEV_COUPLE_MODE", "shadow", {"off", "shadow", "active"})
     support_mode = env_choice("ELEV_SUPPORT_MODE", "shadow", {"off", "shadow", "active"})
     effective_couple_mode, effective_support_mode = resolve_effective_chunk4_modes(
@@ -2513,9 +2646,34 @@ def parse_elevation_chunk4_config(elevation_aware):
         requested_support_mode=support_mode,
     )
 
+    couple_warmup_default = _scaled_warmup_default(
+        stage2_iters=stage2_iters,
+        frac=0.30,
+        min_iters=50,
+        max_iters=400,
+    )
+    support_warmup_default = _scaled_warmup_default(
+        stage2_iters=stage2_iters,
+        frac=0.50,
+        min_iters=100,
+        max_iters=600,
+    )
+    if int(stage2_iters) > 0:
+        support_late_default = max(
+            support_warmup_default,
+            _scaled_warmup_default(
+                stage2_iters=stage2_iters,
+                frac=0.80,
+                min_iters=support_warmup_default,
+                max_iters=max(int(stage2_iters), support_warmup_default),
+            ),
+        )
+    else:
+        support_late_default = 0
+
     couple_weight_start = env_float("ELEV_COUPLE_WEIGHT_START", 0.10)
     couple_weight_end = env_float("ELEV_COUPLE_WEIGHT_END", 0.50)
-    couple_warmup = env_int("ELEV_COUPLE_WARMUP", 2000)
+    couple_warmup = env_int("ELEV_COUPLE_WARMUP", couple_warmup_default)
     couple_max_pix_err = env_float("ELEV_COUPLE_MAX_PIX_ERR", 3.0)
     couple_max_depth_err = env_float("ELEV_COUPLE_MAX_DEPTH_ERR", 0.08)
     couple_huber_delta = env_float("ELEV_COUPLE_HUBER_DELTA", 0.03)
@@ -2525,8 +2683,8 @@ def parse_elevation_chunk4_config(elevation_aware):
     couple_min_w = env_float("ELEV_COUPLE_MIN_W", 0.10)
     couple_max_candidates = env_int("ELEV_COUPLE_MAX_CANDIDATES", 2048)
 
-    support_warmup_iters = env_int("ELEV_SUPPORT_WARMUP_ITERS", 4000)
-    support_late_phase_start_iter = env_int("ELEV_SUPPORT_LATE_PHASE_START_ITERS", 8000)
+    support_warmup_iters = env_int("ELEV_SUPPORT_WARMUP_ITERS", support_warmup_default)
+    support_late_phase_start_iter = env_int("ELEV_SUPPORT_LATE_PHASE_START_ITERS", support_late_default)
     support_use_persistent_ids = env_bool("ELEV_SUPPORT_USE_PERSISTENT_IDS", True)
     support_use_ratio = env_bool("ELEV_SUPPORT_USE_RATIO", True)
     support_use_new_surfel_grace = env_bool("ELEV_SUPPORT_USE_NEW_SURFEL_GRACE", True)
@@ -2648,7 +2806,7 @@ NUM_TRAINING_FRAMES = env_int("SONAR_NUM_FRAMES", NUM_TRAINING_FRAMES_DEFAULT)
 SONAR_HOLDOUT_FRAMES = max(0, env_int("SONAR_HOLDOUT_FRAMES", 0))
 SONAR_FREEZE_SCALE = env_bool("SONAR_FREEZE_SCALE", IS_SYNTHETIC_DATASET)
 ELEV_STAGE1_CFG = parse_elevation_stage1_config(STAGE2_ITERATIONS)
-ELEV_CHUNK4_CFG = parse_elevation_chunk4_config(ELEV_STAGE1_CFG.elevation_aware)
+ELEV_CHUNK4_CFG = parse_elevation_chunk4_config(ELEV_STAGE1_CFG.elevation_aware, STAGE2_ITERATIONS)
 
 if SONAR_FREEZE_SCALE and STAGE1_ITERATIONS > 0:
     STAGE1_ITERATIONS = 0
@@ -3742,13 +3900,6 @@ def main():
         save_comparison_images(training_frames, gaussians, background, sonar_config,
                                sonar_scale_factor, OUTPUT_DIR, "after_stage1")
 
-    elev_lik_bin_centers = torch.linspace(
-        0.0,
-        1.0,
-        steps=ELEV_STAGE1_CFG.bins,
-        device=gaussians.get_xyz.device,
-        dtype=torch.float32,
-    )
     elev_angle_bins = torch.linspace(
         -sonar_config.half_elevation_rad,
         sonar_config.half_elevation_rad,
@@ -3880,37 +4031,20 @@ def main():
 
                 if stage2_use_round_robin:
                     logits_i = pixel_logits_registry[frame_key]
-                    bank_entry = pixel_bank[frame_key]
-                    sample_vals, sample_valid = sample_gt(
-                        gt_frame_cache[frame_key]["gt_gray"],
-                        bank_entry["rows"],
-                        bank_entry["cols"],
+                    loglik_i, support_mask_i = build_stage1_multiview_loglik(
+                        frame_idx=frame_idx,
+                        frame_key=frame_key,
+                        training_frames=training_frames,
+                        frame_key_to_index=frame_key_to_index,
+                        overlap_table=overlap_table,
+                        pixel_bank=pixel_bank,
+                        gt_frame_cache=gt_frame_cache,
+                        frame_stats_cache=frame_stats_cache,
+                        elev_angle_bins=elev_angle_bins,
+                        sonar_config=sonar_config,
+                        sonar_scale_factor=sonar_scale_factor,
+                        cfg=ELEV_STAGE1_CFG,
                     )
-                    frame_stats = frame_stats_cache[frame_key]
-                    norm_vals = normalize_by_percentiles(
-                        sample_vals,
-                        lo=frame_stats["p_lo"],
-                        hi=frame_stats["p_hi"],
-                        eps=ELEV_STAGE1_CFG.lik_log_eps,
-                    )
-
-                    if ELEV_STAGE1_CFG.lik_use_frame_reliability:
-                        reliability = float(frame_stats["reliability"])
-                    else:
-                        reliability = 1.0
-
-                    dist = torch.abs(norm_vals.unsqueeze(-1) - elev_lik_bin_centers.unsqueeze(0))
-                    evidence = (1.0 - dist).clamp_min(ELEV_STAGE1_CFG.lik_log_eps)
-                    loglik_i = torch.log(evidence).clamp_min(ELEV_STAGE1_CFG.lik_log_floor)
-                    if reliability < 1.0:
-                        loglik_i = loglik_i * reliability
-
-                    invalid_mask = ~sample_valid
-                    if invalid_mask.any():
-                        loglik_i = loglik_i.clone()
-                        loglik_i[invalid_mask] = 0.0
-
-                    support_mask_i = sample_valid.unsqueeze(-1).expand_as(loglik_i)
                     stage1_out = run_stage1_likelihood_step(
                         logits=logits_i,
                         loglik=loglik_i,
@@ -4253,37 +4387,20 @@ def main():
 
                 if stage3_use_round_robin:
                     logits_i = pixel_logits_registry[frame_key]
-                    bank_entry = pixel_bank[frame_key]
-                    sample_vals, sample_valid = sample_gt(
-                        gt_frame_cache[frame_key]["gt_gray"],
-                        bank_entry["rows"],
-                        bank_entry["cols"],
+                    loglik_i, support_mask_i = build_stage1_multiview_loglik(
+                        frame_idx=frame_idx,
+                        frame_key=frame_key,
+                        training_frames=training_frames,
+                        frame_key_to_index=frame_key_to_index,
+                        overlap_table=overlap_table,
+                        pixel_bank=pixel_bank,
+                        gt_frame_cache=gt_frame_cache,
+                        frame_stats_cache=frame_stats_cache,
+                        elev_angle_bins=elev_angle_bins,
+                        sonar_config=sonar_config,
+                        sonar_scale_factor=sonar_scale_factor,
+                        cfg=ELEV_STAGE1_CFG,
                     )
-                    frame_stats = frame_stats_cache[frame_key]
-                    norm_vals = normalize_by_percentiles(
-                        sample_vals,
-                        lo=frame_stats["p_lo"],
-                        hi=frame_stats["p_hi"],
-                        eps=ELEV_STAGE1_CFG.lik_log_eps,
-                    )
-
-                    if ELEV_STAGE1_CFG.lik_use_frame_reliability:
-                        reliability = float(frame_stats["reliability"])
-                    else:
-                        reliability = 1.0
-
-                    dist = torch.abs(norm_vals.unsqueeze(-1) - elev_lik_bin_centers.unsqueeze(0))
-                    evidence = (1.0 - dist).clamp_min(ELEV_STAGE1_CFG.lik_log_eps)
-                    loglik_i = torch.log(evidence).clamp_min(ELEV_STAGE1_CFG.lik_log_floor)
-                    if reliability < 1.0:
-                        loglik_i = loglik_i * reliability
-
-                    invalid_mask = ~sample_valid
-                    if invalid_mask.any():
-                        loglik_i = loglik_i.clone()
-                        loglik_i[invalid_mask] = 0.0
-
-                    support_mask_i = sample_valid.unsqueeze(-1).expand_as(loglik_i)
                     stage1_out = run_stage1_likelihood_step(
                         logits=logits_i,
                         loglik=loglik_i,
