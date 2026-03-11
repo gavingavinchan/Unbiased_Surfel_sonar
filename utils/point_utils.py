@@ -74,11 +74,11 @@ def sonar_ranges_to_points(view, range_image, sonar_config, scale_factor=None):
       - Top row = range_min (closest)
       - Bottom row = range_max (farthest)
     
-    Sonar frame convention:
-    - +X = forward (boresight direction)
-    - +Y = right
-    - +Z = down
-    - Azimuth θ: +X direction = negative azimuth, -Y direction = positive azimuth
+    Sonar/view frame convention:
+    - +X = right
+    - +Y = down
+    - +Z = forward (boresight direction)
+    - Positive azimuth maps to the left side of the image
     
     Args:
         view: Sonar view object (provides world_view_transform for pose)
@@ -94,8 +94,8 @@ def sonar_ranges_to_points(view, range_image, sonar_config, scale_factor=None):
         range_image = range_image.squeeze(0)  # [H, W]
     H, W = range_image.shape
     
-    # Get azimuth angles for each column
-    # Center column = 0 degrees, left = negative, right = positive
+    # Get azimuth angles for each column.
+    # Canonical convention: left columns = positive azimuth, right = negative.
     azimuth_grid = sonar_config.azimuth_grid[:W]  # [W]
     
     # Expand to full grid
@@ -104,15 +104,14 @@ def sonar_ranges_to_points(view, range_image, sonar_config, scale_factor=None):
     # Range values come directly from the image (already in meters)
     r = range_image  # [H, W]
     
-    # Convert polar to Cartesian in sonar frame
-    # Assumption: elevation = 0 (flat fan beam)
-    # Convention: +X = negative azimuth, so we negate y component
-    # x = r * cos(θ) (forward)
-    # y = -r * sin(θ) (right, negated because positive azimuth = left)
-    # z = 0 (no elevation info)
-    x_s = r * torch.cos(azimuth)
-    y_s = -r * torch.sin(azimuth)  # Negate to flip azimuth direction
-    z_s = torch.zeros_like(r)
+    # Convert polar to Cartesian in the canonical sonar/view frame.
+    # We assume zero elevation for the collapsed range image used here.
+    # right   = -r * sin(azimuth)
+    # down    = 0
+    # forward =  r * cos(azimuth)
+    x_s = -r * torch.sin(azimuth)
+    y_s = torch.zeros_like(r)
+    z_s = r * torch.cos(azimuth)
     
     # Stack to get points in sonar frame [H, W, 3]
     points_sonar = torch.stack([x_s, y_s, z_s], dim=-1)

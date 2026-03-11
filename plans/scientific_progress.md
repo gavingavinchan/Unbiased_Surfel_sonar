@@ -3,6 +3,27 @@
 ## Abstract
 We extended 2D Gaussian Splatting to forward-looking multibeam sonar by introducing polar rendering, backward projection, metric scale alignment, and sonar-specific training constraints. The work adds sonar mode data flow, pose interpolation from camera trajectories, a learnable global scale factor, camera-to-sonar extrinsics, differentiable polar rendering with intensity modeling, size-aware field-of-view (FOV) constraints, and loss shaping for bright sonar returns. We also introduced mesh tuning workflows and dataset preparation guidelines to support real-world sonar reconstructions.
 
+## 2026-03-10 Renderer Stability Addendum
+The active renderer-baseline remediation now includes a stability patch to the sonar accumulation path. The practical issue was not just incorrect visibility semantics but broken optimization plumbing: intermediate event volumes in `render_sonar` were being materialized through non-differentiable write patterns, so the photometric objective could become disconnected from surfel parameters during synthetic gate replays.
+
+The current WIP renderer uses two additional numerical safeguards:
+
+1. Ray-binned transmittance is accumulated in log space,
+$$
+\log T_i = \sum_{j < i} \log(1 - \alpha_j),
+\quad
+R_i = \exp(\log T_i) \cdot V_i,
+$$
+where $\alpha_j$ is the per-event opacity share, $V_i$ is the event value, $T_i$ is transmittance before event $i$, and $R_i$ is the visible return contributed by that event.
+
+2. Event-volume outputs are sanitized before loss-side use,
+$$
+\tilde{X} = \operatorname{nan\_to\_num}(X; 0, 0, 0),
+$$
+for rendered return, range numerator, and support accumulators, so NaN/Inf values do not poison optimization or downstream mesh extraction.
+
+Empirically, this restores finite training losses and successful smoke-scale synthetic runs for both sphere and cube datasets. However, the visual reconstruction quality has not yet shown a corresponding qualitative jump, so the renderer work remains scientifically incomplete despite the improved stability.
+
 ## 1. Problem Setting
 The base system renders surfels via a pinhole camera model. Sonar imaging instead measures intensity as a function of azimuth and range with a narrow elevation beam. This introduces two core challenges: the geometry is polar rather than pinhole, and COLMAP camera poses are up-to-scale while sonar ranges are metric.
 

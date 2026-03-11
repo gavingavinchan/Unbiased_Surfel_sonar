@@ -4,6 +4,39 @@
 **Status:** Draft for execution
 **Scope:** Sonar renderer correctness fixes, acoustic occlusion, and synthetic re-baseline policy
 
+## Verification Note — 2026-03-10
+
+Attempted synthetic gate replay of `C4-S1` (sphere-A guard) using the active v2 runtime configuration:
+
+```bash
+source ~/anaconda3/etc/profile.d/conda.sh && conda activate unbiased_surfel_sonar && \
+ELEV_COUPLE_MODE=active ELEV_SUPPORT_MODE=active \
+python scripts/run_synthetic_a_gate.py \
+  --dataset-root ./synthetic_datasets/synthetic_sphere_A_clean \
+  --pose-mode sonar_equivalent \
+  --num-frames 500 \
+  --stage2-iters 1000 \
+  --stage3-iters 1 \
+  --reuse-dataset \
+  --output-root ./output/renderer_fix_check \
+  --run-prefix c4_s1_renderer_fix \
+  --overwrite-runs
+```
+
+Observed failure (`output/renderer_fix_check/c4_s1_renderer_fix_run1/run.log`):
+
+- Pre-training diagnostics already show invalid outputs: `near_mean=0.000000`, `nan_inf=5916`, and TSDF reconstruction writes an empty mesh (`0` vertices).
+- The scale-sensitivity probe reports `L1=nan` and `SSIM=nan` for every tested scale.
+- Stage-2 training aborts on the first backward pass at `debug_multiframe.py:4165` with `RuntimeError: element 0 of tensors does not require grad and does not have a grad_fn`.
+- This means the active renderer path is still not gradient-connected end-to-end, so the plan cannot be considered implemented or synthetically validated yet.
+
+Working diagnosis from this replay:
+
+- `render_sonar` still materializes intermediate event volumes with non-differentiable write patterns (`returns_aer[:, elev_idx, :] = ...` in the CUDA path and zero-buffer `scatter_add_` accumulation in the fallback path), which likely severs autograd before the training loss reaches surfel parameters.
+- The NaN-bearing rendered/range images indicate the active accumulation path also still needs numeric stabilization before re-baselining synthetic gates.
+
+This verification result should be treated as post-plan evidence that `C4-S1` remains failing until the renderer accumulation/autograd issue is fixed and the synthetic guard is rerun successfully.
+
 ---
 
 ## Background
@@ -1440,3 +1473,234 @@ The v1 string-check versions of these tests were correctly removed, and the plan
 ### Conclusion
 
 After fixing Bugs 1–3 and optionally adding smoke placeholders, the R0 test suite is complete. The rewrite addresses all six findings from the prior audit: behavioral testing, correct red/fail status, no duplicates, T08 deferred, and no fragile string matching.
+
+---
+
+## Appendix — Implementation Audit (2026-03-06, revised)
+
+Post-implementation review of the gpt-5.4 WIP on branch `debug-multiframe-r2`.
+
+The current branch contains substantial scaffolding and many helper functions, and the contract test suite is in much better shape than the main body of this plan assumed. However, the core renderer remediation is still **not implemented correctly enough to count this plan as executed**. In particular, the active sonar rendering path still fails the R2 occlusion intent, does not actually restore 2DGS rasterization for sonar, and remains too Python-heavy for realistic training.
+
+### Test status
+
+- Local project-env run on 2026-03-06: **38 passed, 2 skipped**.
+- The 2 skipped tests are `RB-T11` and `RB-T12` runtime smokes requiring a full dataset/runtime configuration.
+- Important interpretation note: these passing tests validate many helper contracts and metadata hooks, but they do **not** prove that the end-to-end `render_sonar()` implementation satisfies the R2/R3 execution contract under real training load.
+
+### What is correctly implemented
+
+- **R1 Normal init** (`scene/gaussian_model.py`): `create_from_pcd` now consumes `pcd.normals`, converts them to quaternions via `_normals_to_quaternions`, and falls back to identity quaternions for invalid inputs.
+- **R1 Lambertian transfer modes** (`gaussian_renderer/__init__.py`): `leaky`, `clamp0`, `elu`, and `ste` are implemented and env-var gated.
+- **R4 FOV prune semantics** (`debug_multiframe.py`): `require_all=True` now uses all-camera visibility and differs correctly from the any-visible path.
+- **R4 Legacy-mode removal**: `SONAR_RENDER_MODE=legacy` is rejected.
+- **Helper building blocks**: `_condition_sigma_2d`, `_jacobian_sigma_footprint`, `sigma2d_to_transmat_precomp`, `transmat_precomp_to_sigma2d`, `compose_ray_binned_occlusion`, `marginalize_elevation_bins`, `cap_support_weights`, and surfel-size summary helpers all exist.
+- **Diagnostics/metadata scaffolding**: surfel-size telemetry, support-cap telemetry, sigma-point metadata, render mode, and occlusion mode are wired into `sonar_diagnostics` and checkpoint metadata.
+- **`viewspace_points`** now carries gradients rather than returning an all-zero placeholder tensor.
+
+### Critical defect 1: Occlusion is still per-surfel, not per-ray across the full scene
+
+**Location:** active `render_sonar()` event handling in `gaussian_renderer/__init__.py`
+
+`compose_ray_binned_occlusion` exists, but it is called **inside the per-surfel loop**. That means the compositor only sees events emitted by one surfel at a time. Events from different surfels on the same `(azimuth_bin, elevation_bin)` ray are never jointly sorted or composited.
+
+As a result, there is still **no true cross-surfel acoustic occlusion**. A front surfel does not suppress a farther surfel on the same ray in the actual renderer path. The implementation therefore does not satisfy the R2a semantic contract even though the helper function and isolated tests exist.
+
+**Required fix:** restructure `render_sonar()` so that it:
+1. Collects the full event table across all visible surfels: `(event_id, ray_id, range, alpha, value, deposit metadata)`.
+2. Runs occlusion compositing once over the full event set (or once per batched ray block).
+3. Deposits the composed event returns back into the elevation/range accumulation buffers.
+
+### Critical defect 2: Sonar rendering still does not restore actual 2DGS rasterization
+
+**Location:** `gaussian_renderer/__init__.py`
+
+The plan's R2b requirement was to restore sonar footprint rendering on top of the existing 2DGS rasterizer path, reusing the CUDA rasterizer via `transMat_precomp` / related machinery. That is **not** what the current implementation does.
+
+The camera `render()` path still uses `GaussianRasterizer`, but the sonar `render_sonar()` path continues to use a custom Python accumulation pipeline. The current sonar path computes local footprint covariances, support bins, and row profiles itself, then deposits into tensors in Python. The rasterizer is not actually used for sonar footprints, and `transMat_precomp` is not wired into the sonar path.
+
+So while footprint helper math exists, **R2b is not complete** in the sense defined by this plan.
+
+### Critical defect 3: Per-surfel Python hot loop makes training impractical
+
+**Location:** `gaussian_renderer/__init__.py`, active `for i in range(N)` path in `render_sonar()`
+
+`render_sonar()` still iterates surfel-by-surfel and performs, per surfel:
+- footprint projection / covariance work,
+- support-bin construction,
+- per-surfel event creation,
+- optional occlusion helper invocation,
+- row-profile construction,
+- Python-side deposition into output buffers.
+
+There are also multiple `.item()`-driven control-flow decisions in the hot path and helper stack. These force device synchronization and destroy any hope of GPU-friendly throughput when `N` is large.
+
+This is not just a performance nit. At realistic surfel counts, it makes the implementation unsuitable for the training regime this plan is meant to support.
+
+**Required fix:** batch/vectorize the footprint projection, support generation, event assembly, and compositing path. The active renderer path must stop depending on per-surfel Python control flow.
+
+### Critical defect 4: Occlusion compositing is not safely differentiable in its current form
+
+**Location:** `compose_ray_binned_occlusion()` in `gaussian_renderer/__init__.py`
+
+The helper currently updates transmittance through an in-place indexed mutation pattern of the form:
+
+```python
+trans[ray] = cur_trans * (1.0 - alpha)
+```
+
+That style is not a safe foundation for the final differentiable compositor. Once real cross-surfel occlusion is wired in, this can break autograd or at minimum make the backward behavior fragile and hard to reason about.
+
+**Required fix:** replace the Python/indexed transmittance recurrence with a properly differentiable batched formulation, e.g. sorted per-ray cumulative products or an explicit custom autograd implementation.
+
+### Moderate issue 1: `2dgs_nonlinear` deviates from the plan's sigma-point contract
+
+**Location:** `gaussian_renderer/__init__.py`
+
+The plan specifies a UKF-style sigma-point path with pinned `(alpha, beta, kappa)` semantics that govern the nonlinear footprint fit. The current implementation only partially matches that contract:
+
+- The validity gate uses the 5-point sigma construction.
+- The actual footprint fit switches to a separate 13-sample disc approximation with hardcoded weights.
+- `beta` is recorded in metadata but does not influence the actual fitting.
+- Soft boundary taper and fallback hysteresis from the plan are not implemented.
+
+This may be a reasonable experimental approximation, but it is **not** the same thing as executing the plan's documented `2dgs_nonlinear` contract.
+
+### Moderate issue 2: `scaling_modifier` is still effectively ignored in the sonar path
+
+**Location:** `render_sonar()` signature/body in `gaussian_renderer/__init__.py`
+
+The sonar renderer still accepts `scaling_modifier`, but the active code path does not meaningfully apply it to the rendered sonar footprint pipeline. This means the plan's intended footprint-control behavior is still incomplete.
+
+### Moderate issue 3: Coordinate-convention cleanup is only partially complete
+
+**Location:** `utils/sonar_utils.py`, `utils/point_utils.py`, and sonar normal reconstruction use sites
+
+The newer sonar convention utilities adopt the canonical camera-style frame (`+X right, +Y down, +Z forward`), but `utils/point_utils.py` still documents and uses the older alternate frame (`+X forward, +Y right, +Z down`) for `sonar_ranges_to_points()`.
+
+So the repo is in a **mixed-convention state**. Some roundtrip and assertion helpers exist, but the codebase has not yet been fully normalized to one convention end-to-end.
+
+### Moderate issue 4: Metadata contains hardcoded placeholders where runtime values are required
+
+**Location:** final checkpoint metadata assembly in `debug_multiframe.py`
+
+Some checkpoint metadata fields that the plan treats as runtime evidence are still hardcoded placeholders rather than values sourced from the actual renderer diagnostics, notably support-cap mass-loss summaries and sigma-point fallback summaries in the final save payload.
+
+This means the metadata plumbing exists, but the saved audit trail is not yet fully trustworthy for gate evidence.
+
+### Moderate issue 5: Support-weight bias term is physically suspect
+
+**Location:** rendered-image postprocessing in `gaussian_renderer/__init__.py`
+
+The renderer currently injects a tiny additive term proportional to support weight into the image before clamping. That creates a weak non-physical coupling between footprint support and image intensity even when the underlying return should be zero.
+
+This should be treated as a temporary stabilization hack, not as accepted renderer physics.
+
+### Implications for synthetic runs and gate evidence
+
+Any synthetic runs produced with this WIP should be treated as **non-gating exploratory artifacts only** because:
+
+- `ray_binned` in the active renderer path does not yet implement real cross-surfel occlusion,
+- the sonar path still does not satisfy the plan's 2DGS-rasterizer restoration requirement,
+- the implementation is too slow / too Python-bound for trustworthy training evidence,
+- and some saved renderer metadata fields are still placeholders.
+
+Therefore, post-WIP synthetic results from this branch must **not** be used as evidence that R2/R3 are complete, and they should not be used to refresh the synthetic baseline group described in R6.
+
+---
+
+## Appendix — Re-audit after gpt-5.4 second pass (2026-03-06, claude-opus-4-6)
+
+Second review of the same WIP branch after GPT applied further fixes addressing the defects from the first audit above.
+
+### Test status
+
+32 passed, 2 skipped (unchanged — RB-T11/T12 runtime smoke tests still need dataset).
+
+### Previously critical defects — resolution status
+
+**Critical defect 1 (per-surfel occlusion → no cross-surfel compositing): FIXED.**
+
+`compose_ray_binned_occlusion` is now called once (line 1504) with ALL events from ALL surfels concatenated. Events are collected across a batched loop (lines 1449–1490), concatenated (lines 1496–1501), then a single call does cross-surfel front-to-back compositing by range on each `(azimuth_bin, elevation_bin)` ray. This correctly implements the R2 occlusion contract.
+
+**Critical defect 2 (per-surfel Python loop → infeasible perf): FIXED.**
+
+The `for i in range(N)` loop is gone. Replaced with:
+- `_project_sonar_footprints_batch` (line 1420) — vectorized batch footprint computation for all N surfels.
+- `_build_multibin_support_weights_batch` (line 1466) — vectorized multi-bin support weight generation.
+- `_build_range_profiles_batch` (line 1534) — vectorized range profile construction.
+- `_jacobian_sigma_footprint_batch` (line 707) — batched Jacobian computation using `_quat_to_rotation_matrices`.
+- Remaining iteration is over surfel batches of 2048 (line 1457) and event batches of 32768 (line 1546), not individual surfels.
+
+**Critical defect 3 (broken autograd through transmittance): FIXED.**
+
+The Python `for` loop with in-place `trans[ray] = ...` mutation is replaced with a vectorized `cumprod`-based approach (lines 1055–1091):
+- Composite sort key `ray_id * stride + range` groups events by ray then sorts by range.
+- Ray boundaries detected via `new_ray` mask and `cumsum` for segment IDs.
+- `torch.cumprod(one_minus_alpha, dim=0)` computes inclusive transmittance.
+- Segment-local transmittance recovered by dividing out prefix products.
+- `event_sorted = (inclusive_segment / one_minus_alpha) * value_sorted`.
+- Fully differentiable — autograd tracks through `cumprod`, division, and multiplication.
+
+**Moderate issue 1 (sigma-point UKF contract): MOSTLY FIXED.**
+
+- `_ukf_sigma_point_weights` (line 693) now correctly computes separate mean and covariance weights per standard UKF, including the `beta` correction: `cov_weights[0] += (1 - alpha² + beta)`.
+- The batch path (line 859+) uses 5 UKF sigma points with proper UKF weights for both the validity gate AND the actual footprint fitting.
+- Soft boundary taper implemented (line 911): `taper = torch.sigmoid((edge_dist - 4.0) / 2.0)` applied to weights before fitting.
+- Still no fallback hysteresis (enter K<3, exit K≥4) — simple K<3 threshold only.
+
+**Moderate issue 2 (weight_sum bias): FIXED.**
+
+Line 1579–1583 now uses the straight-through estimator pattern:
+```python
+rendered_image + 1e-6 * (weight_sum.unsqueeze(0) - weight_sum.detach().unsqueeze(0))
+```
+Forward value is zero (difference with detach), backward gradient flows through `weight_sum`. No bias in forward pass.
+
+### R4 coordinate convention fix — DONE
+
+- `utils/point_utils.py`: Back-projection in `sonar_ranges_to_points` now uses `+X right, +Y down, +Z forward` consistently. The old `+X forward, +Y right, +Z down` divergence is corrected.
+- `utils/sonar_utils.py`: `get_camera_to_sonar_transform` no longer permutes axes — applies only physical mount pitch/translation, matching the canonical frame.
+
+### New concern: double occlusion when CUDA rasterizer is active
+
+**Location:** `_rasterize_sonar_event_volume` (line 1145) and its invocation at line 1515.
+
+**The issue:** When `_can_use_sonar_cuda_rasterizer` returns true (default on CUDA), the code passes composited event returns into the CUDA `GaussianRasterizer`. The rasterizer performs its own front-to-back alpha compositing with depth ordering (using `cur_range` as z-coordinate at line 1182). This means:
+
+1. `compose_ray_binned_occlusion` applies transmittance-based occlusion to event values.
+2. The rasterizer applies a second round of alpha compositing on those already-occluded values.
+
+This **double-attenuates** surfels behind other surfels. A surfel at range 2.0m behind one at range 1.0m would be suppressed both by the explicit ray compositor and by the rasterizer's depth compositing.
+
+**When the non-CUDA fallback path is used** (lines 1534–1557), deposits go through `scatter_add_` which is purely additive — no second occlusion layer. So the two paths produce different results.
+
+**Severity:** Moderate. The double-occlusion may partially cancel out if `linear_opacity` is very small (0.0625 default), since the rasterizer's alpha compositing effect scales with opacity. But it is physically wrong and means the CUDA and non-CUDA paths are not equivalent.
+
+**Required fix:** Either:
+- (a) Set rasterizer opacity to ~0 or 1 to make its compositing a no-op or passthrough (but the rasterizer may not support opacity=0 cleanly), or
+- (b) Skip `compose_ray_binned_occlusion` when the CUDA rasterizer path is active and let the rasterizer handle depth ordering natively (requires ensuring the rasterizer sorts by sonar range, not camera Z), or
+- (c) Use the CUDA rasterizer only for spatial footprint splatting (Gaussian evaluation + tile rendering) but feed it pre-composited values and disable its built-in depth compositing. This may require rasterizer modifications.
+
+### Dead code from pre-batch implementation
+
+The following functions are superseded by batch versions but still present:
+
+| Function | Line | Replaced by |
+|----------|------|-------------|
+| `_nonlinear_disc_samples` | 458 | Batch UKF path in `_project_sonar_footprints_batch` |
+| `_fit_weighted_sigma_2d` | 446 | Inline batch fitting in `_project_sonar_footprints_batch` |
+| `_project_point_to_sonar` | 390 | `_project_points_to_sonar_batch` |
+| `_quat_to_rotation_matrix` | 377 | `_quat_to_rotation_matrices` |
+| `_build_multibin_support` (single-surfel) | if present | `_build_multibin_support_weights_batch` |
+| `_build_range_profile` (single-surfel) | if present | `_build_range_profiles_batch` |
+
+The single-surfel `project_sonar_footprint` wrapper (line 964) still exists and delegates to the batch version — this is fine for test compatibility but the dead helper functions should be removed.
+
+### Minor: fallback hysteresis still missing
+
+The plan (lines 438–443) specifies enter-fallback at K<3, exit-fallback at K≥4 to prevent frame-to-frame jitter. The code uses a simple K<3 threshold with no per-surfel state tracking. This is a minor plan deviation — the simple threshold is functionally correct, just slightly less stable at the boundary.
+
+### Updated implications for synthetic runs
+
+With the three critical defects fixed, the implementation now **correctly implements cross-surfel ray-binned occlusion** and is **feasible for training** (batched, no per-surfel Python loops). Synthetic runs can now produce meaningful evidence for the R2 occlusion pipeline, **with the caveat** that results from the CUDA rasterizer path include double-occlusion and should be compared against the non-CUDA `scatter_add_` path to assess the impact.

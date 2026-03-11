@@ -460,18 +460,11 @@ def get_camera_to_sonar_transform(device="cuda"):
         [0.0,  sin_p,  cos_p]
     ], device=device, dtype=dtype)
     
-    # Also need to transform from camera convention to sonar convention
-    # Camera: +Z forward, +X right, +Y down
-    # Sonar:  +X forward, +Y right, +Z down
-    # This is a permutation: sonar_X = cam_Z, sonar_Y = cam_X, sonar_Z = cam_Y
-    R_convention = torch.tensor([
-        [0.0, 0.0, 1.0],  # sonar_X = cam_Z
-        [1.0, 0.0, 0.0],  # sonar_Y = cam_X
-        [0.0, 1.0, 0.0]   # sonar_Z = cam_Y
-    ], device=device, dtype=dtype)
-    
-    # Combined rotation: apply pitch in camera frame, then convert convention.
-    R_cam_to_sonar = R_convention @ R_pitch
+    # The renderer and back-projection helpers use the canonical camera-style
+    # frame throughout sonar code: +X right, +Y down, +Z forward.
+    # The camera-to-sonar extrinsic therefore only applies the physical mount
+    # pitch/translation and does not permute axes into an alternate basis.
+    R_cam_to_sonar = R_pitch
 
     # t = -R * p_mount_cam for camera->sonar point transform.
     t_cam_to_sonar = -R_cam_to_sonar @ translation_cam

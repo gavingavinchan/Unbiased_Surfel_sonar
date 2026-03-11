@@ -51,6 +51,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         sh_degree=pc.active_sh_degree,
         campos=viewpoint_camera.camera_center,
         prefiltered=False,
+        additive_mode=False,
         debug=False,
         # pipe.debug
     )
@@ -326,7 +327,7 @@ def resolve_sonar_render_contract():
     if render_mode not in {"2dgs", "2dgs_nonlinear"}:
         raise ValueError(f"Unsupported SONAR_RENDER_MODE '{render_mode}'.")
 
-    occlusion_mode = os.getenv("SONAR_OCCLUSION_MODE", "none").strip().lower()
+    occlusion_mode = os.getenv("SONAR_OCCLUSION_MODE", "ray_binned").strip().lower()
     if occlusion_mode not in {"none", "ray_binned"}:
         raise ValueError(f"Unsupported SONAR_OCCLUSION_MODE '{occlusion_mode}'.")
 
@@ -347,6 +348,714 @@ def resolve_sonar_render_contract():
         "occl_k_sigma": occl_k_sigma,
         "occl_weight_floor_rel": occl_weight_floor_rel,
         "occl_topk": occl_topk,
+    }
+
+
+def _sonar_config_values(sonar_config):
+    image_width = float(getattr(sonar_config, "image_width", 256))
+    image_height = float(getattr(sonar_config, "image_height", 200))
+
+    half_azimuth_rad = getattr(sonar_config, "half_azimuth_rad", None)
+    if half_azimuth_rad is None:
+        half_azimuth_rad = math.radians(float(getattr(sonar_config, "azimuth_fov", 120.0)) * 0.5)
+
+    half_elevation_rad = getattr(sonar_config, "half_elevation_rad", None)
+    if half_elevation_rad is None:
+        half_elevation_rad = math.radians(float(getattr(sonar_config, "elevation_fov", 20.0)) * 0.5)
+
+    range_min = float(getattr(sonar_config, "range_min", 0.2))
+    range_max = float(getattr(sonar_config, "range_max", 3.0))
+    return {
+        "image_width": image_width,
+        "image_height": image_height,
+        "half_azimuth_rad": float(half_azimuth_rad),
+        "half_elevation_rad": float(half_elevation_rad),
+        "range_min": range_min,
+        "range_max": range_max,
+    }
+
+
+def _condition_sigma_2d(sigma_2d, min_var=0.1, max_var=400.0, cond_cap=100.0):
+    sym = 0.5 * (sigma_2d + sigma_2d.transpose(-1, -2))
+    eigvals, eigvecs = torch.linalg.eigh(sym)
+    eigvals = torch.clamp(eigvals, min=min_var, max=max_var)
+    if cond_cap is not None and cond_cap > 0:
+        max_eval = eigvals.max(dim=-1, keepdim=True).values
+        min_allowed = torch.clamp(max_eval / float(cond_cap), min=min_var)
+        eigvals = torch.maximum(eigvals, min_allowed)
+        eigvals = torch.clamp(eigvals, max=max_var)
+    return eigvecs @ torch.diag_embed(eigvals) @ eigvecs.transpose(-1, -2)
+
+
+def _elevation_bin_weights(num_bins, mode, device, dtype):
+    if num_bins <= 1:
+        return torch.ones(1, device=device, dtype=dtype)
+    if mode == "beam_pattern":
+        coords = torch.linspace(-1.0, 1.0, steps=num_bins, device=device, dtype=dtype)
+        weights = torch.cos(coords * (math.pi * 0.5)).clamp_min(0.0)
+    else:
+        weights = torch.ones(num_bins, device=device, dtype=dtype)
+    return weights / weights.sum().clamp_min(1e-8)
+
+
+def sigma2d_to_transmat_precomp(mu_2d, sigma_2d):
+    sigma_conditioned = _condition_sigma_2d(sigma_2d)
+    try:
+        chol = torch.linalg.cholesky(sigma_conditioned)
+    except RuntimeError:
+        eigvals, eigvecs = torch.linalg.eigh(0.5 * (sigma_conditioned + sigma_conditioned.T))
+        chol = eigvecs @ torch.diag(torch.sqrt(torch.clamp(eigvals, min=1e-6)))
+
+    zero = sigma_2d.new_tensor(0.0)
+    one = sigma_2d.new_tensor(1.0)
+    row0 = torch.stack([chol[0, 0], chol[1, 0], mu_2d[0]])
+    row1 = torch.stack([zero, chol[1, 1], mu_2d[1]])
+    row2 = torch.stack([zero, zero, one])
+    return torch.stack([row0, row1, row2], dim=0)
+
+
+def transmat_precomp_to_sigma2d(transmat_precomp):
+    l = torch.stack(
+        [
+            torch.stack([transmat_precomp[0, 0], transmat_precomp[1, 0]]),
+            torch.stack([transmat_precomp[0, 1], transmat_precomp[1, 1]]),
+        ],
+        dim=0,
+    )
+    sigma_2d = l @ l.T
+    return 0.5 * (sigma_2d + sigma_2d.T)
+
+
+def _quat_to_rotation_matrices(quat_wxyz):
+    q = quat_wxyz / torch.linalg.norm(quat_wxyz, dim=-1, keepdim=True).clamp_min(1e-8)
+    w = q[..., 0]
+    x = q[..., 1]
+    y = q[..., 2]
+    z = q[..., 3]
+
+    row0 = torch.stack([1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)], dim=-1)
+    row1 = torch.stack([2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)], dim=-1)
+    row2 = torch.stack([2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)], dim=-1)
+    return torch.stack([row0, row1, row2], dim=-2)
+
+
+def _project_points_to_sonar_batch(points_3d, sonar_config):
+    cfg = _sonar_config_values(sonar_config)
+    x = points_3d[..., 0]
+    y = points_3d[..., 1]
+    z = points_3d[..., 2]
+
+    azimuth = -torch.atan2(x, z)
+    horiz_dist = torch.sqrt(x * x + z * z)
+    elevation = torch.atan2(y, horiz_dist.clamp_min(1e-8))
+    range_vals = torch.sqrt(x * x + y * y + z * z)
+
+    half_az = range_vals.new_tensor(cfg["half_azimuth_rad"])
+    half_el = range_vals.new_tensor(cfg["half_elevation_rad"])
+    width = range_vals.new_tensor(cfg["image_width"])
+    height = range_vals.new_tensor(cfg["image_height"])
+    range_min = range_vals.new_tensor(cfg["range_min"])
+    range_max = range_vals.new_tensor(cfg["range_max"])
+    range_span = (range_max - range_min).clamp_min(1e-8)
+
+    col = (-azimuth / half_az + 1.0) * (width * 0.5)
+    row = (range_vals - range_min) / range_span * height
+
+    in_front = z > 0
+    in_range = (range_vals >= range_min) & (range_vals <= range_max)
+    in_azimuth = torch.abs(azimuth) <= half_az
+    in_elevation = torch.abs(elevation) <= half_el
+    in_bounds = (col >= 0) & (col <= (width - 1.0)) & (row >= 0) & (row <= (height - 1.0))
+    valid = in_front & in_range & in_azimuth & in_elevation & in_bounds
+
+    return {
+        "col": col,
+        "row": row,
+        "azimuth": azimuth,
+        "elevation": elevation,
+        "range": range_vals,
+        "in_front": in_front,
+        "in_range": in_range,
+        "in_azimuth": in_azimuth,
+        "in_elevation": in_elevation,
+        "in_bounds": in_bounds,
+        "valid": valid,
+    }
+
+
+def _ukf_sigma_point_weights(alpha, beta, kappa, device, dtype):
+    n_dim = 2.0
+    lam = alpha * alpha * (n_dim + kappa) - n_dim
+    denom = max(n_dim + lam, 1e-8)
+    mean_weights = torch.tensor(
+        [lam / denom, 1.0 / (2.0 * denom), 1.0 / (2.0 * denom), 1.0 / (2.0 * denom), 1.0 / (2.0 * denom)],
+        device=device,
+        dtype=dtype,
+    )
+    cov_weights = mean_weights.clone()
+    cov_weights[0] = cov_weights[0] + (1.0 - alpha * alpha + beta)
+    return lam, mean_weights, cov_weights
+
+
+def _jacobian_sigma_footprint_batch(mean_3d, scale_xy, quat_wxyz, sonar_config):
+    cfg = _sonar_config_values(sonar_config)
+    x = mean_3d[:, 0]
+    y = mean_3d[:, 1]
+    z = mean_3d[:, 2]
+
+    width = mean_3d.new_tensor(cfg["image_width"])
+    height = mean_3d.new_tensor(cfg["image_height"])
+    half_az = mean_3d.new_tensor(cfg["half_azimuth_rad"])
+    range_min = mean_3d.new_tensor(cfg["range_min"])
+    range_max = mean_3d.new_tensor(cfg["range_max"])
+    range_span = (range_max - range_min).clamp_min(1e-8)
+
+    denom_az = (x * x + z * z).clamp_min(1e-8)
+    dcol_daz = -(width / (2.0 * half_az.clamp_min(1e-8)))
+    range_val = torch.sqrt(x * x + y * y + z * z).clamp_min(1e-8)
+    drow_scale = height / range_span
+
+    j = torch.zeros((mean_3d.shape[0], 2, 3), dtype=mean_3d.dtype, device=mean_3d.device)
+    j[:, 0, 0] = dcol_daz * (-z / denom_az)
+    j[:, 0, 2] = dcol_daz * (x / denom_az)
+    j[:, 1, 0] = drow_scale * (x / range_val)
+    j[:, 1, 1] = drow_scale * (y / range_val)
+    j[:, 1, 2] = drow_scale * (z / range_val)
+
+    rot = _quat_to_rotation_matrices(quat_wxyz)
+    t1 = rot[:, :, 0] * scale_xy[:, 0:1]
+    t2 = rot[:, :, 1] * scale_xy[:, 1:2]
+    sigma_3d = t1.unsqueeze(-1) * t1.unsqueeze(-2) + t2.unsqueeze(-1) * t2.unsqueeze(-2)
+    sigma_2d = j @ sigma_3d @ j.transpose(-1, -2)
+    return _condition_sigma_2d(sigma_2d)
+
+
+def _build_range_profiles_batch(row_centers, sigma_rows, num_rows, k_sigma=2.5):
+    if row_centers.numel() == 0:
+        return row_centers.new_zeros((0, int(num_rows)))
+
+    row_coords = torch.arange(int(num_rows), device=row_centers.device, dtype=row_centers.dtype).unsqueeze(0)
+    sigma_rows = sigma_rows.unsqueeze(1).clamp_min(0.5)
+    row_dist = row_coords - row_centers.unsqueeze(1)
+    support_mask = row_dist.abs() <= (float(k_sigma) * sigma_rows)
+    row_weights = torch.exp(-0.5 * (row_dist / sigma_rows) ** 2) * support_mask.to(row_centers.dtype)
+
+    empty_mask = row_weights.sum(dim=1) <= 0
+    if empty_mask.any():
+        row_weights[empty_mask] = 0.0
+        nearest = torch.clamp(torch.round(row_centers[empty_mask]).long(), min=0, max=int(num_rows) - 1)
+        row_weights[empty_mask, nearest] = 1.0
+
+    return row_weights / row_weights.sum(dim=1, keepdim=True).clamp_min(1e-8)
+
+
+def _cap_support_weights_batched(weights, topk=16, floor_rel=1e-3):
+    if weights.numel() == 0:
+        return {
+            "weights": weights,
+            "mass_lost": weights.new_zeros((weights.shape[0],)),
+        }
+
+    w = torch.clamp(weights, min=0.0)
+    peak = w.max(dim=1, keepdim=True).values.clamp_min(1e-12)
+    keep = w >= (peak * float(floor_rel))
+
+    if int(topk) > 0 and int(topk) < w.shape[1]:
+        topk_idx = torch.topk(w, k=int(topk), dim=1, largest=True, sorted=False).indices
+        topk_mask = torch.zeros_like(keep)
+        topk_mask.scatter_(1, topk_idx, True)
+        keep = keep & topk_mask
+
+    retained_raw = torch.where(keep, w, torch.zeros_like(w))
+    retained_sum = retained_raw.sum(dim=1, keepdim=True)
+    normalized = torch.where(retained_sum > 0, retained_raw / retained_sum.clamp_min(1e-12), torch.zeros_like(retained_raw))
+    mass_lost = (w.sum(dim=1) - retained_sum.squeeze(1)).clamp_min(0.0)
+    return {
+        "weights": normalized,
+        "mass_lost": mass_lost,
+    }
+
+
+def _build_multibin_support_weights_batch(
+    center_col,
+    center_elev,
+    sigma_2d,
+    sonar_config,
+    elev_bins,
+    topk,
+    floor_rel,
+    k_sigma,
+):
+    if center_col.numel() == 0:
+        empty = center_col.new_zeros((0, int(round(_sonar_config_values(sonar_config)["image_width"])) * max(int(elev_bins), 1)))
+        return {"weights": empty, "mass_lost": center_col.new_zeros((0,))}
+
+    cfg = _sonar_config_values(sonar_config)
+    width = int(round(cfg["image_width"]))
+    elev_bins = max(int(elev_bins), 1)
+
+    col_coords = torch.arange(width, device=center_col.device, dtype=center_col.dtype).unsqueeze(0)
+    col_sigma = torch.sqrt(torch.clamp(sigma_2d[:, 0, 0], min=0.25)).unsqueeze(1).clamp_min(0.5)
+    col_dist = col_coords - center_col.unsqueeze(1)
+    col_weights = torch.exp(-0.5 * (col_dist / col_sigma) ** 2)
+    col_weights = col_weights * (col_dist.abs() <= (float(k_sigma) * col_sigma)).to(center_col.dtype)
+
+    if elev_bins <= 1:
+        elev_weights = center_col.new_ones((center_col.shape[0], 1))
+    else:
+        half_el = center_col.new_tensor(cfg["half_elevation_rad"])
+        elev_sigma = center_col.new_full((center_col.shape[0], 1), max(float(cfg["half_elevation_rad"]) / max(elev_bins, 1), 1e-3))
+        elev_coords = torch.linspace(-float(half_el.item()), float(half_el.item()), steps=elev_bins, device=center_col.device, dtype=center_col.dtype).unsqueeze(0)
+        elev_dist = elev_coords - center_elev.unsqueeze(1)
+        elev_weights = torch.exp(-0.5 * (elev_dist / elev_sigma) ** 2)
+        elev_weights = elev_weights * (elev_dist.abs() <= (float(k_sigma) * elev_sigma)).to(center_col.dtype)
+
+    flat_weights = (col_weights.unsqueeze(-1) * elev_weights.unsqueeze(1)).reshape(center_col.shape[0], width * elev_bins)
+    return _cap_support_weights_batched(flat_weights, topk=topk, floor_rel=floor_rel)
+
+
+def _project_sonar_footprints_batch(
+    mean_3d,
+    scale_xy,
+    quat_wxyz,
+    mode="2dgs",
+    sigma_point_config=None,
+    sonar_config=None,
+    previous_fallback_used=None,
+):
+    if sonar_config is None:
+        raise ValueError("sonar_config is required")
+
+    mode_name = (mode or "2dgs").strip().lower()
+    if mode_name not in {"2dgs", "2dgs_nonlinear"}:
+        raise ValueError(f"Unsupported footprint mode '{mode_name}'")
+
+    center_proj = _project_points_to_sonar_batch(mean_3d, sonar_config)
+    center_hard_valid = center_proj["in_front"] & center_proj["in_range"]
+    center_in_bounds = center_proj["in_bounds"]
+
+    mu_2d = torch.stack([center_proj["col"], center_proj["row"]], dim=-1)
+    jac_sigma = _jacobian_sigma_footprint_batch(mean_3d, scale_xy, quat_wxyz, sonar_config)
+
+    skipped = ~center_hard_valid
+    fallback_used = torch.zeros_like(skipped)
+    sigma_valid_count = torch.zeros(mean_3d.shape[0], dtype=torch.long, device=mean_3d.device)
+    sigma_invalid_reason_counts = {
+        "azimuth": torch.zeros(mean_3d.shape[0], dtype=torch.long, device=mean_3d.device),
+        "range": torch.zeros(mean_3d.shape[0], dtype=torch.long, device=mean_3d.device),
+        "elevation": torch.zeros(mean_3d.shape[0], dtype=torch.long, device=mean_3d.device),
+        "in_front": torch.zeros(mean_3d.shape[0], dtype=torch.long, device=mean_3d.device),
+    }
+    edge_band_fraction = mean_3d.new_zeros((mean_3d.shape[0],))
+    effective_mode = ["skip" if bool(skip.item()) else mode_name for skip in skipped]
+    sigma_2d = jac_sigma.clone()
+
+    if mode_name == "2dgs_nonlinear" and mean_3d.shape[0] > 0:
+        sigma_cfg = sigma_point_config or {}
+        alpha = float(sigma_cfg.get("alpha", 1.0))
+        beta = float(sigma_cfg.get("beta", 2.0))
+        kappa = float(sigma_cfg.get("kappa", 0.0))
+        lam, mean_weights_base, cov_weights_base = _ukf_sigma_point_weights(alpha, beta, kappa, mean_3d.device, mean_3d.dtype)
+        spread = math.sqrt(max(2.0 + lam, 1e-8))
+
+        rot = _quat_to_rotation_matrices(quat_wxyz)
+        t1 = rot[:, :, 0] * scale_xy[:, 0:1]
+        t2 = rot[:, :, 1] * scale_xy[:, 1:2]
+        sigma_points = torch.stack(
+            [
+                mean_3d,
+                mean_3d + spread * t1,
+                mean_3d + spread * t2,
+                mean_3d - spread * t1,
+                mean_3d - spread * t2,
+            ],
+            dim=1,
+        )
+        sigma_proj = _project_points_to_sonar_batch(sigma_points, sonar_config)
+        hard_valid = (
+            sigma_proj["in_front"]
+            & sigma_proj["in_range"]
+            & sigma_proj["in_azimuth"]
+            & sigma_proj["in_elevation"]
+        )
+        sigma_valid_count = hard_valid.sum(dim=1)
+        sigma_invalid_reason_counts = {
+            "azimuth": (~sigma_proj["in_azimuth"]).sum(dim=1),
+            "range": (~sigma_proj["in_range"]).sum(dim=1),
+            "elevation": (~sigma_proj["in_elevation"]).sum(dim=1),
+            "in_front": (~sigma_proj["in_front"]).sum(dim=1),
+        }
+
+        cfg = _sonar_config_values(sonar_config)
+        edge_dist = torch.stack(
+            [
+                sigma_proj["col"],
+                sigma_proj["row"],
+                sigma_proj["col"].new_tensor(cfg["image_width"] - 1.0) - sigma_proj["col"],
+                sigma_proj["row"].new_tensor(cfg["image_height"] - 1.0) - sigma_proj["row"],
+            ],
+            dim=0,
+        ).min(dim=0).values
+        edge_band_fraction = torch.where(
+            hard_valid.any(dim=1),
+            (edge_dist.lt(4.0) & hard_valid).float().sum(dim=1) / hard_valid.float().sum(dim=1).clamp_min(1.0),
+            torch.zeros_like(edge_dist[:, 0]),
+        )
+
+        taper = torch.sigmoid((edge_dist - 4.0) / 2.0)
+        mean_weights = mean_weights_base.view(1, 5) * taper * hard_valid.to(mean_3d.dtype)
+        cov_weights = cov_weights_base.view(1, 5) * taper * hard_valid.to(mean_3d.dtype)
+        mean_sum = mean_weights.sum(dim=1, keepdim=True)
+        prev_fallback = previous_fallback_used
+        if prev_fallback is None:
+            prev_fallback = torch.zeros_like(skipped)
+        else:
+            prev_fallback = prev_fallback.to(device=mean_3d.device, dtype=torch.bool)
+            if prev_fallback.shape != skipped.shape:
+                raise ValueError(
+                    f"previous_fallback_used shape {tuple(prev_fallback.shape)} does not match {tuple(skipped.shape)}"
+                )
+
+        center_valid_for_fit = (~skipped) & center_in_bounds & (mean_sum.squeeze(1) > 0)
+        fallback_enter = (~skipped) & ((~center_in_bounds) | (sigma_valid_count < 3) | (mean_sum.squeeze(1) <= 0))
+        fallback_exit = center_valid_for_fit & (sigma_valid_count >= 4)
+        fallback_used = torch.where(prev_fallback, ~fallback_exit, fallback_enter)
+        
+        if (~fallback_used).any():
+            valid_idx = torch.where(~fallback_used)[0]
+            pts_2d = torch.stack([sigma_proj["col"], sigma_proj["row"]], dim=-1)[valid_idx]
+            cur_mean_weights = mean_weights[valid_idx]
+            cur_cov_weights = cov_weights[valid_idx]
+
+            cur_mean_weights = cur_mean_weights / cur_mean_weights.sum(dim=1, keepdim=True).clamp_min(1e-8)
+            mu_valid = torch.sum(cur_mean_weights.unsqueeze(-1) * pts_2d, dim=1)
+
+            cur_cov_weights = cur_cov_weights / cur_cov_weights.sum(dim=1, keepdim=True).clamp_min(1e-8)
+            centered = pts_2d - mu_valid.unsqueeze(1)
+            sigma_valid = torch.sum(
+                cur_cov_weights.unsqueeze(-1).unsqueeze(-1)
+                * (centered.unsqueeze(-1) * centered.unsqueeze(-2)),
+                dim=1,
+            )
+            sigma_2d[valid_idx] = _condition_sigma_2d(sigma_valid)
+            mu_2d[valid_idx] = mu_valid
+
+        effective_mode = []
+        for i in range(mean_3d.shape[0]):
+            if bool(skipped[i].item()):
+                effective_mode.append("skip")
+            elif bool(fallback_used[i].item()):
+                effective_mode.append("2dgs")
+            else:
+                effective_mode.append("2dgs_nonlinear")
+
+    radii = torch.sqrt(torch.linalg.eigvalsh(sigma_2d).max(dim=-1).values.clamp_min(1e-8))
+    zero_mu = torch.zeros_like(mu_2d)
+    zero_sigma = torch.eye(2, dtype=sigma_2d.dtype, device=sigma_2d.device).unsqueeze(0).expand_as(sigma_2d) * 0.1
+    mu_2d = torch.where(skipped.unsqueeze(-1), zero_mu, mu_2d)
+    sigma_2d = torch.where(skipped.unsqueeze(-1).unsqueeze(-1), zero_sigma, sigma_2d)
+
+    return {
+        "mu_2d": mu_2d,
+        "sigma_2d": sigma_2d,
+        "effective_mode": effective_mode,
+        "fallback_used": fallback_used,
+        "sigma_valid_count": sigma_valid_count,
+        "sigma_invalid_reason_counts": sigma_invalid_reason_counts,
+        "edge_band_fraction": edge_band_fraction,
+        "skipped": skipped,
+        "radii": radii,
+    }
+
+
+def project_sonar_footprint(
+    mean_3d,
+    scale_xy,
+    quat_wxyz,
+    mode="2dgs",
+    sigma_point_config=None,
+    sonar_config=None,
+    previous_fallback_used=None,
+):
+    batch = _project_sonar_footprints_batch(
+        mean_3d=mean_3d.unsqueeze(0),
+        scale_xy=scale_xy.unsqueeze(0),
+        quat_wxyz=quat_wxyz.unsqueeze(0),
+        mode=mode,
+        sigma_point_config=sigma_point_config,
+        sonar_config=sonar_config,
+        previous_fallback_used=None if previous_fallback_used is None else torch.tensor([bool(previous_fallback_used)]),
+    )
+    return {
+        "mu_2d": batch["mu_2d"][0],
+        "sigma_2d": batch["sigma_2d"][0],
+        "effective_mode": batch["effective_mode"][0],
+        "fallback_used": bool(batch["fallback_used"][0].item()),
+        "sigma_valid_count": int(batch["sigma_valid_count"][0].item()),
+        "sigma_invalid_reason_counts": {
+            "azimuth": int(batch["sigma_invalid_reason_counts"]["azimuth"][0].item()),
+            "range": int(batch["sigma_invalid_reason_counts"]["range"][0].item()),
+            "elevation": int(batch["sigma_invalid_reason_counts"]["elevation"][0].item()),
+            "in_front": int(batch["sigma_invalid_reason_counts"]["in_front"][0].item()),
+        },
+        "edge_band_fraction": float(batch["edge_band_fraction"][0].item()),
+        "skipped": bool(batch["skipped"][0].item()),
+    }
+
+
+def cap_support_weights(weights, topk=16, floor_rel=1e-3):
+    if weights.numel() == 0:
+        zero = torch.zeros_like(weights)
+        mass = weights.new_tensor(0.0)
+        return {
+            "weights": zero,
+            "mass_loss": {
+                "mass_lost": mass,
+                "mean": mass,
+                "median": mass,
+                "p95": mass,
+                "p99": mass,
+                "max": mass,
+            },
+        }
+
+    w = torch.clamp(weights, min=0.0)
+    peak = torch.max(w).clamp_min(1e-12)
+    keep = w >= (peak * float(floor_rel))
+
+    if int(topk) > 0 and int(topk) < w.numel():
+        topk_idx = torch.topk(w, k=int(topk), largest=True, sorted=False).indices
+        topk_mask = torch.zeros_like(keep)
+        topk_mask[topk_idx] = True
+        keep = keep & topk_mask
+
+    retained_raw = torch.where(keep, w, torch.zeros_like(w))
+    retained_sum = retained_raw.sum()
+    mass_lost = (w.sum() - retained_sum).clamp_min(0.0)
+    normalized = torch.where(retained_sum > 0, retained_raw / retained_sum.clamp_min(1e-12), torch.zeros_like(retained_raw))
+
+    mass_vec = mass_lost.reshape(1)
+    p95 = torch.quantile(mass_vec, 0.95)
+    p99 = torch.quantile(mass_vec, 0.99)
+
+    return {
+        "weights": normalized,
+        "mass_loss": {
+            "mass_lost": mass_lost,
+            "mean": mass_vec.mean(),
+            "median": mass_vec.median(),
+            "p95": p95,
+            "p99": p99,
+            "max": mass_vec.max(),
+        },
+    }
+
+
+def compose_ray_binned_occlusion(ray_ids, range_vals, alpha_vals, value_vals, num_rays, **kwargs):
+    del kwargs
+    if range_vals.numel() == 0:
+        empty = torch.zeros_like(value_vals)
+        return {
+            "event_returns": empty,
+            "ray_returns": value_vals.new_zeros(int(num_rays)),
+            "final_transmittance": value_vals.new_ones(int(num_rays)),
+        }
+
+    sort_stride = float(range_vals.detach().max().item()) + 1.0 if range_vals.numel() > 0 else 1.0
+    sort_key = ray_ids.to(dtype=torch.float64) * sort_stride + range_vals.to(dtype=torch.float64)
+    order = torch.argsort(sort_key)
+    ray_sorted = ray_ids[order]
+    alpha_sorted = torch.clamp(alpha_vals[order], min=0.0, max=1.0)
+    value_sorted = value_vals[order]
+    one_minus_alpha = (1.0 - alpha_sorted).clamp_min(1e-8)
+    log_one_minus_alpha = torch.log(one_minus_alpha)
+
+    new_ray = torch.ones_like(ray_sorted, dtype=torch.bool)
+    new_ray[1:] = ray_sorted[1:] != ray_sorted[:-1]
+    segment_ids = torch.cumsum(new_ray.to(torch.long), dim=0) - 1
+    segment_starts = torch.nonzero(new_ray, as_tuple=False).squeeze(-1)
+
+    inclusive_log = torch.cumsum(log_one_minus_alpha, dim=0)
+    segment_prefix_log = value_sorted.new_zeros(int(segment_ids[-1].item()) + 1)
+    if segment_starts.numel() > 1:
+        segment_prefix_log[1:] = inclusive_log[segment_starts[1:] - 1]
+    exclusive_log = (inclusive_log - log_one_minus_alpha) - segment_prefix_log[segment_ids]
+    trans_before = torch.exp(exclusive_log)
+    event_sorted = trans_before * value_sorted
+
+    event_returns = torch.zeros_like(value_vals).scatter(0, order, event_sorted)
+    ray_returns = value_vals.new_zeros(int(num_rays)).scatter_add(0, ray_sorted, event_sorted)
+
+    final_transmittance = value_vals.new_ones(int(num_rays))
+    segment_ends = torch.empty_like(segment_starts)
+    if segment_starts.numel() > 1:
+        segment_ends[:-1] = segment_starts[1:] - 1
+    segment_ends[-1] = ray_sorted.numel() - 1
+    final_log = inclusive_log[segment_ends] - segment_prefix_log
+    final_transmittance[ray_sorted[segment_starts]] = torch.exp(final_log)
+
+    return {
+        "event_returns": event_returns,
+        "ray_returns": ray_returns,
+        "final_transmittance": final_transmittance,
+    }
+
+
+def marginalize_elevation_bins(returns_aer, elev_weights=None):
+    if elev_weights is None:
+        num_elev = returns_aer.shape[1]
+        elev_weights = returns_aer.new_full((num_elev,), 1.0 / max(num_elev, 1))
+    return torch.einsum("aer,e->ar", returns_aer, elev_weights)
+
+
+def _sigma2d_to_transmat_precomp_batch(mu_2d, sigma_2d):
+    sigma_conditioned = _condition_sigma_2d(sigma_2d)
+    try:
+        chol = torch.linalg.cholesky(sigma_conditioned)
+    except RuntimeError:
+        eigvals, eigvecs = torch.linalg.eigh(0.5 * (sigma_conditioned + sigma_conditioned.transpose(-1, -2)))
+        chol = eigvecs @ torch.diag_embed(torch.sqrt(torch.clamp(eigvals, min=1e-6)))
+
+    zero = mu_2d.new_zeros(mu_2d.shape[0])
+    one = mu_2d.new_ones(mu_2d.shape[0])
+    row0 = torch.stack([chol[:, 0, 0], chol[:, 1, 0], mu_2d[:, 0]], dim=-1)
+    row1 = torch.stack([zero, chol[:, 1, 1], mu_2d[:, 1]], dim=-1)
+    row2 = torch.stack([zero, zero, one], dim=-1)
+    return torch.stack([row0, row1, row2], dim=1)
+
+
+def _can_use_sonar_cuda_rasterizer(device):
+    return (
+        device.type == "cuda"
+        and os.getenv("SONAR_USE_CUDA_RASTERIZER", "1").strip().lower() not in {"0", "false", "no"}
+        and "GaussianRasterizer" in globals()
+        and "GaussianRasterizationSettings" in globals()
+    )
+
+
+def _make_sonar_rasterizer_settings(image_height, image_width, device, dtype):
+    eye = torch.eye(4, device=device, dtype=dtype)
+    return GaussianRasterizationSettings(
+        image_height=int(image_height),
+        image_width=int(image_width),
+        tanfovx=1.0,
+        tanfovy=1.0,
+        bg=torch.zeros(3, device=device, dtype=dtype),
+        ndc2world=eye,
+        scale_modifier=1.0,
+        viewmatrix=eye,
+        projmatrix=eye,
+        sh_degree=0,
+        campos=torch.zeros(3, device=device, dtype=dtype),
+        prefiltered=False,
+        additive_mode=True,
+        debug=False,
+    )
+
+
+def _rasterize_sonar_event_volume(
+    vis_mu,
+    vis_sigma,
+    vis_range,
+    event_surfel_idx,
+    event_ray_ids,
+    event_returns,
+    event_share,
+    image_width,
+    image_height,
+    elev_bins,
+):
+    device = vis_mu.device
+    dtype = vis_mu.dtype
+    returns_aer = torch.zeros(image_width, elev_bins, image_height, device=device, dtype=dtype)
+    range_aer = torch.zeros_like(returns_aer)
+    support_aer = torch.zeros_like(returns_aer)
+    surfel_radii = torch.zeros(vis_mu.shape[0], device=device, dtype=dtype)
+
+    linear_opacity = float(os.getenv("SONAR_RASTER_LINEAR_OPACITY", "0.0625"))
+    linear_opacity = min(max(linear_opacity, 1.0 / 255.0), 0.99)
+    raster_settings = _make_sonar_rasterizer_settings(image_height, image_width, device, dtype)
+    rasterizer = GaussianRasterizer(raster_settings=raster_settings)
+    zero_plane = torch.zeros(image_width, image_height, device=device, dtype=dtype)
+    returns_bins = []
+    range_bins = []
+    support_bins = []
+
+    for elev_idx in range(int(elev_bins)):
+        cur_mask = torch.remainder(event_ray_ids, int(elev_bins)) == elev_idx
+        if not bool(cur_mask.any().item()):
+            returns_bins.append(zero_plane)
+            range_bins.append(zero_plane)
+            support_bins.append(zero_plane)
+            continue
+
+        cur_surfel_idx = event_surfel_idx[cur_mask]
+        cur_range = vis_range[cur_surfel_idx].clamp_min(0.21)
+        cur_mu = vis_mu[cur_surfel_idx]
+        cur_sigma = vis_sigma[cur_surfel_idx]
+        cur_transmat = _sigma2d_to_transmat_precomp_batch(cur_mu, cur_sigma).reshape(-1, 9).contiguous()
+        cur_means3d = torch.stack([
+            torch.zeros_like(cur_range),
+            torch.zeros_like(cur_range),
+            cur_range,
+        ], dim=-1).contiguous()
+        cur_means2d = torch.zeros_like(cur_means3d)
+        cur_opacity = torch.full((cur_surfel_idx.shape[0], 1), linear_opacity, device=device, dtype=dtype)
+        cur_color = torch.stack(
+            [
+                event_returns[cur_mask],
+                event_returns[cur_mask] * cur_range,
+                event_share[cur_mask],
+            ],
+            dim=-1,
+        ) / linear_opacity
+
+        color, event_radii, _, _ = rasterizer(
+            means3D=cur_means3d,
+            means2D=cur_means2d,
+            opacities=cur_opacity,
+            colors_precomp=cur_color,
+            cov3D_precomp=cur_transmat,
+        )
+        returns_bins.append(torch.nan_to_num(color[0].transpose(0, 1), nan=0.0, posinf=0.0, neginf=0.0))
+        range_bins.append(torch.nan_to_num(color[1].transpose(0, 1), nan=0.0, posinf=0.0, neginf=0.0))
+        support_bins.append(torch.nan_to_num(color[2].transpose(0, 1), nan=0.0, posinf=0.0, neginf=0.0))
+
+        if hasattr(surfel_radii, "scatter_reduce_"):
+            local_radii = torch.zeros_like(surfel_radii)
+            local_radii.scatter_reduce_(0, cur_surfel_idx, event_radii.to(dtype), reduce="amax", include_self=True)
+            surfel_radii = torch.maximum(surfel_radii, local_radii)
+
+    if returns_bins:
+        returns_aer = torch.stack(returns_bins, dim=1)
+        range_aer = torch.stack(range_bins, dim=1)
+        support_aer = torch.stack(support_bins, dim=1)
+
+    return returns_aer, range_aer, support_aer, surfel_radii
+
+
+def _summary_stats(values):
+    if values.numel() == 0:
+        return {
+            "mean": 0.0,
+            "median": 0.0,
+            "p01": 0.0,
+            "p05": 0.0,
+            "p95": 0.0,
+            "p99": 0.0,
+            "min": 0.0,
+            "max": 0.0,
+        }
+    vals = values.detach().reshape(-1).float()
+    return {
+        "mean": float(vals.mean().item()),
+        "median": float(vals.median().item()),
+        "p01": float(torch.quantile(vals, 0.01).item()),
+        "p05": float(torch.quantile(vals, 0.05).item()),
+        "p95": float(torch.quantile(vals, 0.95).item()),
+        "p99": float(torch.quantile(vals, 0.99).item()),
+        "min": float(vals.min().item()),
+        "max": float(vals.max().item()),
     }
 
 def compute_fov_margin(range_vals, azimuth, elevation, sonar_config):
@@ -431,41 +1140,38 @@ def render_sonar(
     device = pc.get_xyz.device
     runtime_contract = resolve_sonar_render_contract()
 
-    # Get surfel positions and transform to sonar frame under row-major contract.
-    means3D = pc.get_xyz  # [N, 3]
+    means3D = pc.get_xyz
+    viewspace_points = means3D + 0.0
+    try:
+        viewspace_points.retain_grad()
+    except Exception:
+        pass
+
     points_sonar, w2v = _transform_world_points_to_sonar_frame(
-        means3D,
+        viewspace_points,
         viewpoint_camera,
         scale_factor=scale_factor,
         sonar_extrinsic=sonar_extrinsic,
     )
 
     if scale_factor is not None:
-        means3D_scaled = scale_factor.scale * means3D
+        means3D_scaled = scale_factor.scale * viewspace_points
     else:
-        means3D_scaled = means3D
+        means3D_scaled = viewspace_points
 
     R_w2v = w2v[:3, :3]
     t_w2v_scaled = w2v[3, :3]
     R_v2w = R_w2v.T
     sonar_origin_scaled = -R_v2w @ t_w2v_scaled
 
-    N = means3D.shape[0]
-    
-    # Create screenspace points tensor for gradient tracking
-    screenspace_points = torch.zeros_like(means3D, requires_grad=True, device=device)
-    try:
-        screenspace_points.retain_grad()
-    except:
-        pass
-    
-    # Compute polar coordinates in camera/view frame.
-    right = points_sonar[:, 0]   # +X in camera frame
-    down = points_sonar[:, 1]    # +Y in camera frame  
-    forward = points_sonar[:, 2] # +Z in camera frame
+    N = viewspace_points.shape[0]
+
+    right = points_sonar[:, 0]
+    down = points_sonar[:, 1]
+    forward = points_sonar[:, 2]
 
     projection = sonar_project_points(
-        means3D,
+        viewspace_points,
         viewpoint_camera,
         sonar_config,
         scale_factor=scale_factor,
@@ -473,38 +1179,40 @@ def render_sonar(
     )
     azimuth = projection.azimuth
     range_vals = projection.range_vals
-    horiz_dist = torch.sqrt(right**2 + forward**2)
+    horiz_dist = torch.sqrt(right * right + forward * forward)
     elevation = torch.atan2(down, horiz_dist.clamp_min(1e-8))
-    # Rendering uses center-based visibility. Size-aware full-extent FOV constraints
-    # are handled by debug-side pruning to avoid suppressing boundary bins in images.
     in_fov = projection.valid
-    
-    # Convert polar to pixel coordinates for valid surfels
-    # Column: maps azimuth to [0, width] with flipped direction
-    # Convention: positive azimuth → left (low col), negative azimuth → right (high col)
-    # Row: maps range [range_min, range_max] to [0, height]
-    # Use actual image dimensions from viewpoint (may be downscaled)
+
     H = viewpoint_camera.image_height
     W = viewpoint_camera.image_width
     col = torch.clamp(projection.col, 0, W - 1)
     row = torch.clamp(projection.row, 0, H - 1)
-    
-    # Get surfel normals in world space (from rotation quaternions)
-    rotations = pc.get_rotation  # [N, 4] quaternions
-    normals_world = quaternion_to_normal(rotations)  # [N, 3]
-    
-    # Compute direction from surfel to sonar origin (for Lambertian intensity)
-    # Add eps to avoid nan from normalizing zero vectors when surfel is at sonar origin
-    diff_to_sonar = sonar_origin_scaled.unsqueeze(0) - means3D_scaled  # [N, 3]
-    dist_to_sonar = torch.norm(diff_to_sonar, dim=-1, keepdim=True) + 1e-8  # [N, 1]
-    dir_to_sonar = diff_to_sonar / dist_to_sonar  # [N, 3]
-    
+
+    footprint_config = type(
+        "SonarRuntimeConfig",
+        (),
+        {
+            "image_width": W,
+            "image_height": H,
+            "half_azimuth_rad": getattr(sonar_config, "half_azimuth_rad"),
+            "half_elevation_rad": getattr(sonar_config, "half_elevation_rad"),
+            "range_min": getattr(sonar_config, "range_min"),
+            "range_max": getattr(sonar_config, "range_max"),
+        },
+    )()
+
+    rotations = pc.get_rotation
+    normals_world = quaternion_to_normal(rotations)
+
+    diff_to_sonar = sonar_origin_scaled.unsqueeze(0) - means3D_scaled
+    dist_to_sonar = torch.norm(diff_to_sonar, dim=-1, keepdim=True) + 1e-8
+    dir_to_sonar = diff_to_sonar / dist_to_sonar
+
     dot_val = torch.sum(normals_world * dir_to_sonar, dim=-1)
     lambertian, lambertian_mode = compute_sonar_lambertian(dot_val)
-    
-    # Base intensity from surfel opacity and Lambertian response.
-    opacity = pc.get_opacity.squeeze(-1)  # [N]
-    base_intensity = opacity * lambertian  # [N]
+
+    opacity = pc.get_opacity.squeeze(-1)
+    base_intensity = opacity * lambertian
 
     attenuation, attenuation_diag = compute_sonar_range_attenuation(
         range_vals,
@@ -516,113 +1224,232 @@ def render_sonar(
         range_atten_auto_gain=range_atten_auto_gain,
     )
     intensity = base_intensity * attenuation
-    
-    # Initialize output images (use actual viewpoint dimensions)
-    out_H = viewpoint_camera.image_height
-    out_W = viewpoint_camera.image_width
-    rendered_image = torch.zeros(1, out_H, out_W, device=device)
-    range_image = torch.zeros(1, out_H, out_W, device=device)
-    weight_sum = torch.zeros(out_H, out_W, device=device)
-    
-    # Splat each surfel to its pixel bin using differentiable scatter operations
-    # This uses vectorized scatter_add for gradient flow
-    
-    if in_fov.any():
-        valid_idx = torch.where(in_fov)[0]
-        
-        valid_col = col[valid_idx]
-        valid_row = row[valid_idx]
-        valid_intensity = intensity[valid_idx]
-        valid_range = range_vals[valid_idx]
-        
-        # Bilinear splatting coordinates
-        col_floor = valid_col.floor().long()
-        col_ceil = (col_floor + 1).clamp(max=out_W-1)
-        row_floor = valid_row.floor().long()
-        row_ceil = (row_floor + 1).clamp(max=out_H-1)
-        
-        col_frac = valid_col - col_floor.float()
-        row_frac = valid_row - row_floor.float()
-        
-        # Compute weights for 4 neighbors (differentiable)
-        w00 = (1 - col_frac) * (1 - row_frac)  # top-left
-        w01 = (1 - col_frac) * row_frac        # bottom-left
-        w10 = col_frac * (1 - row_frac)        # top-right
-        w11 = col_frac * row_frac              # bottom-right
-        
-        # Convert 2D indices to 1D for scatter_add
-        # index = row * width + col
-        idx_00 = row_floor * out_W + col_floor
-        idx_01 = row_ceil * out_W + col_floor
-        idx_10 = row_floor * out_W + col_ceil
-        idx_11 = row_ceil * out_W + col_ceil
-        
-        # Flatten output tensors for scatter_add
-        rendered_flat = rendered_image.view(-1)
-        range_flat = range_image.view(-1)
-        weight_flat = weight_sum.view(-1)
-        
-        # Weighted intensity contributions (differentiable through weights and intensity)
-        contrib_00 = w00 * valid_intensity
-        contrib_01 = w01 * valid_intensity
-        contrib_10 = w10 * valid_intensity
-        contrib_11 = w11 * valid_intensity
-        
-        # Use scatter_add for differentiable accumulation
-        rendered_flat.scatter_add_(0, idx_00, contrib_00)
-        rendered_flat.scatter_add_(0, idx_01, contrib_01)
-        rendered_flat.scatter_add_(0, idx_10, contrib_10)
-        rendered_flat.scatter_add_(0, idx_11, contrib_11)
-        
-        # Weighted range contributions
-        range_contrib_00 = w00 * valid_intensity * valid_range
-        range_contrib_01 = w01 * valid_intensity * valid_range
-        range_contrib_10 = w10 * valid_intensity * valid_range
-        range_contrib_11 = w11 * valid_intensity * valid_range
-        
-        range_flat.scatter_add_(0, idx_00, range_contrib_00)
-        range_flat.scatter_add_(0, idx_01, range_contrib_01)
-        range_flat.scatter_add_(0, idx_10, range_contrib_10)
-        range_flat.scatter_add_(0, idx_11, range_contrib_11)
-        
-        # Weight accumulation for normalization
-        weight_flat.scatter_add_(0, idx_00, contrib_00.detach())
-        weight_flat.scatter_add_(0, idx_01, contrib_01.detach())
-        weight_flat.scatter_add_(0, idx_10, contrib_10.detach())
-        weight_flat.scatter_add_(0, idx_11, contrib_11.detach())
-        
-        # Reshape back
-        rendered_image = rendered_flat.view(1, out_H, out_W)
-        range_image = range_flat.view(1, out_H, out_W)
-        weight_sum = weight_flat.view(out_H, out_W)
-    
-    # Normalize range by intensity weight
+
+    returns_aer = torch.zeros(W, int(runtime_contract["elev_bins"]), H, device=device, dtype=viewspace_points.dtype)
+    range_aer = torch.zeros_like(returns_aer)
+    support_aer = torch.zeros_like(returns_aer)
+
+    if hasattr(pc, "get_scaling"):
+        scaling_xy = pc.get_scaling * float(scaling_modifier)
+    else:
+        scaling_xy = torch.ones((N, 2), dtype=viewspace_points.dtype, device=device)
+
+    sigma_point_config = {
+        "kappa": float(os.getenv("SONAR_SIGMA_KAPPA", "0.0")),
+        "alpha": float(os.getenv("SONAR_SIGMA_ALPHA", "1.0")),
+        "beta": float(os.getenv("SONAR_SIGMA_BETA", "2.0")),
+    }
+
+    previous_fallback_used = getattr(viewpoint_camera, "_sonar_sigma_fallback_state", None)
+    if previous_fallback_used is not None:
+        if not isinstance(previous_fallback_used, torch.Tensor) or previous_fallback_used.shape != (N,):
+            previous_fallback_used = None
+
+    footprints = _project_sonar_footprints_batch(
+        mean_3d=points_sonar,
+        scale_xy=scaling_xy,
+        quat_wxyz=rotations,
+        mode=runtime_contract["render_mode"],
+        sigma_point_config=sigma_point_config,
+        sonar_config=footprint_config,
+        previous_fallback_used=previous_fallback_used,
+    )
+    setattr(viewpoint_camera, "_sonar_sigma_fallback_state", footprints["fallback_used"].detach())
+    radii = footprints["radii"]
+    sigma_fallback_count = int(footprints["fallback_used"].sum().item())
+    sigma_invalid_az = int(footprints["sigma_invalid_reason_counts"]["azimuth"].sum().item())
+    sigma_invalid_range = int(footprints["sigma_invalid_reason_counts"]["range"].sum().item())
+    sigma_invalid_elev = int(footprints["sigma_invalid_reason_counts"]["elevation"].sum().item())
+    sigma_invalid_front = int(footprints["sigma_invalid_reason_counts"]["in_front"].sum().item())
+
+    visible_mask = in_fov & (~footprints["skipped"])
+    visible_idx = torch.where(visible_mask)[0]
+    mass_loss_tensor = viewspace_points.new_zeros((0,))
+
+    if visible_idx.numel() > 0:
+        vis_mu = footprints["mu_2d"][visible_idx]
+        vis_sigma = footprints["sigma_2d"][visible_idx]
+        vis_elev = elevation[visible_idx]
+        vis_range = range_vals[visible_idx]
+        vis_intensity = intensity[visible_idx]
+        vis_opacity = opacity[visible_idx]
+
+        surfel_batch_size = 2048
+        num_ray_bins = W * int(runtime_contract["elev_bins"])
+        event_surfel_parts = []
+        event_ray_parts = []
+        event_alpha_parts = []
+        event_value_parts = []
+        event_range_parts = []
+        event_share_parts = []
+        mass_loss_parts = []
+
+        for start in range(0, int(visible_idx.shape[0]), surfel_batch_size):
+            end = min(start + surfel_batch_size, int(visible_idx.shape[0]))
+            cur_mu = vis_mu[start:end]
+            cur_sigma = vis_sigma[start:end]
+            cur_elev = vis_elev[start:end]
+            cur_range = vis_range[start:end]
+            cur_intensity = vis_intensity[start:end]
+            cur_opacity = vis_opacity[start:end]
+
+            support = _build_multibin_support_weights_batch(
+                center_col=cur_mu[:, 0],
+                center_elev=cur_elev,
+                sigma_2d=cur_sigma,
+                sonar_config=footprint_config,
+                elev_bins=int(runtime_contract["elev_bins"]),
+                topk=int(runtime_contract["occl_topk"]),
+                floor_rel=float(runtime_contract["occl_weight_floor_rel"]),
+                k_sigma=float(runtime_contract["occl_k_sigma"]),
+            )
+            mass_loss_parts.append(support["mass_lost"])
+
+            nz = torch.nonzero(support["weights"] > 0, as_tuple=False)
+            if nz.numel() == 0:
+                continue
+
+            local_surfel = nz[:, 0]
+            flat_bin = nz[:, 1].long()
+            share = support["weights"][local_surfel, flat_bin]
+            event_surfel_parts.append(local_surfel + start)
+            event_ray_parts.append(flat_bin)
+            event_alpha_parts.append(torch.clamp(cur_opacity[local_surfel] * share, min=0.0, max=1.0))
+            event_value_parts.append(cur_intensity[local_surfel] * share)
+            event_range_parts.append(cur_range[local_surfel])
+            event_share_parts.append(share)
+
+        if mass_loss_parts:
+            mass_loss_tensor = torch.cat(mass_loss_parts, dim=0)
+
+        if event_ray_parts:
+            event_surfel_idx = torch.cat(event_surfel_parts, dim=0)
+            event_ray_ids = torch.cat(event_ray_parts, dim=0)
+            event_alpha = torch.cat(event_alpha_parts, dim=0)
+            event_value = torch.cat(event_value_parts, dim=0)
+            event_range = torch.cat(event_range_parts, dim=0)
+            event_share = torch.cat(event_share_parts, dim=0)
+
+            if runtime_contract["occlusion_mode"] == "ray_binned":
+                composed = compose_ray_binned_occlusion(
+                    ray_ids=event_ray_ids,
+                    range_vals=event_range,
+                    alpha_vals=event_alpha,
+                    value_vals=event_value,
+                    num_rays=num_ray_bins,
+                )
+                event_returns = composed["event_returns"]
+            else:
+                event_returns = event_value
+            event_returns = torch.nan_to_num(event_returns, nan=0.0, posinf=0.0, neginf=0.0)
+
+            if _can_use_sonar_cuda_rasterizer(device):
+                raster_returns, raster_range, raster_support, raster_radii = _rasterize_sonar_event_volume(
+                    vis_mu=vis_mu,
+                    vis_sigma=vis_sigma,
+                    vis_range=vis_range,
+                    event_surfel_idx=event_surfel_idx,
+                    event_ray_ids=event_ray_ids,
+                    event_returns=event_returns,
+                    event_share=event_share,
+                    image_width=W,
+                    image_height=H,
+                    elev_bins=int(runtime_contract["elev_bins"]),
+                )
+                returns_aer = raster_returns
+                range_aer = raster_range
+                support_aer = raster_support
+                if bool((raster_radii > 0).any().item()):
+                    radii[visible_idx] = torch.maximum(radii[visible_idx], raster_radii)
+            else:
+                row_profiles = _build_range_profiles_batch(
+                    row_centers=vis_mu[:, 1],
+                    sigma_rows=torch.sqrt(torch.clamp(vis_sigma[:, 1, 1], min=0.25)),
+                    num_rows=H,
+                    k_sigma=float(runtime_contract["occl_k_sigma"]),
+                )
+                returns_flat = torch.zeros(W * int(runtime_contract["elev_bins"]) * H, device=device, dtype=viewspace_points.dtype)
+                range_flat = torch.zeros_like(returns_flat)
+                support_flat = torch.zeros_like(returns_flat)
+                row_coords = torch.arange(H, device=device, dtype=torch.long).unsqueeze(0)
+                event_batch_size = 32768
+
+                for start in range(0, int(event_ray_ids.shape[0]), event_batch_size):
+                    end = min(start + event_batch_size, int(event_ray_ids.shape[0]))
+                    cur_surfel = event_surfel_idx[start:end]
+                    cur_row_profiles = row_profiles[cur_surfel]
+                    cur_flat_idx = event_ray_ids[start:end].unsqueeze(1) * H + row_coords
+                    cur_returns = event_returns[start:end].unsqueeze(1) * cur_row_profiles
+                    cur_range = cur_returns * event_range[start:end].unsqueeze(1)
+                    cur_support = event_share[start:end].unsqueeze(1) * cur_row_profiles
+
+                    returns_flat = returns_flat.scatter_add(0, cur_flat_idx.reshape(-1), cur_returns.reshape(-1))
+                    range_flat = range_flat.scatter_add(0, cur_flat_idx.reshape(-1), cur_range.reshape(-1))
+                    support_flat = support_flat.scatter_add(0, cur_flat_idx.reshape(-1), cur_support.reshape(-1))
+
+                returns_aer = returns_flat.view(W, int(runtime_contract["elev_bins"]), H)
+                range_aer = range_flat.view(W, int(runtime_contract["elev_bins"]), H)
+                support_aer = support_flat.view(W, int(runtime_contract["elev_bins"]), H)
+
+    returns_aer = torch.nan_to_num(returns_aer, nan=0.0, posinf=0.0, neginf=0.0)
+    range_aer = torch.nan_to_num(range_aer, nan=0.0, posinf=0.0, neginf=0.0)
+    support_aer = torch.nan_to_num(support_aer, nan=0.0, posinf=0.0, neginf=0.0)
+
+    elev_weights = _elevation_bin_weights(
+        int(runtime_contract["elev_bins"]),
+        runtime_contract["elev_weight_mode"],
+        device=device,
+        dtype=viewspace_points.dtype,
+    )
+    rendered_ar = marginalize_elevation_bins(returns_aer, elev_weights=elev_weights)
+    range_num_ar = marginalize_elevation_bins(range_aer, elev_weights=elev_weights)
+    support_ar = marginalize_elevation_bins(support_aer, elev_weights=elev_weights)
+
+    rendered_image = rendered_ar.transpose(0, 1).unsqueeze(0)
+    range_image = range_num_ar.transpose(0, 1).unsqueeze(0)
+    weight_sum = support_ar.transpose(0, 1)
+
     range_image = torch.where(
         weight_sum.unsqueeze(0) > 1e-6,
         range_image / weight_sum.unsqueeze(0),
-        torch.zeros_like(range_image)
+        torch.zeros_like(range_image),
     )
-    
-    # Clamp intensity to [0, 1]
-    rendered_image = torch.clamp(rendered_image, 0, 1)
-    
-    # Mask out top rows (closest range bins often have artifacts)
-    # Use differentiable masking instead of in-place assignment to preserve gradients
+    rendered_image = torch.nan_to_num(rendered_image, nan=0.0, posinf=0.0, neginf=0.0)
+    range_image = torch.nan_to_num(range_image, nan=0.0, posinf=0.0, neginf=0.0)
+
+    rendered_image = torch.clamp(
+        rendered_image + 1e-6 * (weight_sum.unsqueeze(0) - weight_sum.detach().unsqueeze(0)),
+        0,
+        1,
+    )
     mask_top_rows = 10
     if mask_top_rows > 0:
         mask = torch.ones_like(rendered_image)
         mask[:, :mask_top_rows, :] = 0
         rendered_image = rendered_image * mask
         range_image = range_image * mask
-    
-    # Expand to 3 channels for compatibility with RGB loss functions
-    rendered_image = rendered_image.expand(3, -1, -1)  # [3, H, W]
-    
-    # Compute surface normals from range image
+
+    rendered_image = rendered_image.expand(3, -1, -1)
+
     surf_normal = sonar_points_to_normals(
         sonar_ranges_to_points(viewpoint_camera, range_image, sonar_config, scale_factor),
-        range_image
-    ).permute(2, 0, 1)  # [3, H, W]
+        range_image,
+    ).permute(2, 0, 1)
+
+    if mass_loss_tensor.numel() > 0:
+        mass_loss_mean = float(mass_loss_tensor.mean().detach().item())
+        mass_loss_median = float(mass_loss_tensor.median().detach().item())
+        mass_loss_p95 = float(torch.quantile(mass_loss_tensor, 0.95).detach().item())
+        mass_loss_p99 = float(torch.quantile(mass_loss_tensor, 0.99).detach().item())
+        mass_loss_max = float(mass_loss_tensor.max().detach().item())
+        mass_loss_total = float(mass_loss_tensor.sum().detach().item())
+    else:
+        mass_loss_mean = 0.0
+        mass_loss_median = 0.0
+        mass_loss_p95 = 0.0
+        mass_loss_p99 = 0.0
+        mass_loss_max = 0.0
+        mass_loss_total = 0.0
 
     range_span = max(float(sonar_config.range_max - sonar_config.range_min), 1e-6)
     near_thresh = float(sonar_config.range_min + 0.2 * range_span)
@@ -633,6 +1460,23 @@ def render_sonar(
     far_mean = float(intensity[far_mask].detach().mean().item()) if far_mask.any() else 0.0
     saturation_rate = float((rendered_image > 0.95).float().mean().item())
     nan_inf_count = int((~torch.isfinite(rendered_image)).sum().item() + (~torch.isfinite(range_image)).sum().item())
+
+    world_s1 = scaling_xy[:, 0]
+    world_s2 = scaling_xy[:, 1]
+    world_req = torch.sqrt((world_s1 * world_s2).clamp_min(1e-12))
+    if in_fov.any():
+        in_fov_s1 = world_s1[in_fov]
+        in_fov_s2 = world_s2[in_fov]
+        in_fov_req = world_req[in_fov]
+        in_fov_radii = radii[in_fov]
+    else:
+        in_fov_s1 = world_s1[:0]
+        in_fov_s2 = world_s2[:0]
+        in_fov_req = world_req[:0]
+        in_fov_radii = radii[:0]
+
+    surfel_stats_every = max(int(os.getenv("SONAR_SURFEL_STATS_EVERY", "50")), 1)
+
     sonar_diagnostics = {
         "attenuation_enabled": bool(attenuation_diag["enabled"]),
         "attenuation_gain_mode": attenuation_diag["gain_mode"],
@@ -652,27 +1496,54 @@ def render_sonar(
         "sonar_occlusion_mode": runtime_contract["occlusion_mode"],
         "elevation_bin_count": int(runtime_contract["elev_bins"]),
         "elevation_weight_mode": runtime_contract["elev_weight_mode"],
+        "surfel_size_stats_schema_version": "v1",
+        "surfel_size_stats_world": {
+            "s1": _summary_stats(world_s1),
+            "s2": _summary_stats(world_s2),
+            "r_eq": _summary_stats(world_req),
+        },
+        "surfel_size_stats_image": {
+            "radii_px": _summary_stats(radii),
+        },
+        "surfel_size_stats_in_fov": {
+            "world": {
+                "s1": _summary_stats(in_fov_s1),
+                "s2": _summary_stats(in_fov_s2),
+                "r_eq": _summary_stats(in_fov_req),
+            },
+            "image": {
+                "radii_px": _summary_stats(in_fov_radii),
+            },
+        },
+        "surfel_size_stats_every": surfel_stats_every,
+        "sigma_point_fallback_fraction": float(sigma_fallback_count / max(N, 1)),
+        "sigma_point_invalid_reason_counts": {
+            "azimuth": int(sigma_invalid_az),
+            "range": int(sigma_invalid_range),
+            "elevation": int(sigma_invalid_elev),
+            "in_front": int(sigma_invalid_front),
+        },
         "occlusion_support_cap_config": {
             "k_sigma": float(runtime_contract["occl_k_sigma"]),
             "weight_floor_rel": float(runtime_contract["occl_weight_floor_rel"]),
             "topk": int(runtime_contract["occl_topk"]),
         },
         "occlusion_support_cap_mass_loss": {
-            "mean": 0.0,
-            "median": 0.0,
-            "p95": 0.0,
-            "p99": 0.0,
-            "max": 0.0,
-            "mass_lost": 0.0,
+            "mean": mass_loss_mean,
+            "median": mass_loss_median,
+            "p95": mass_loss_p95,
+            "p99": mass_loss_p99,
+            "max": mass_loss_max,
+            "mass_lost": mass_loss_total,
         },
     }
-    
+
     return {
         "render": rendered_image,
-        "viewspace_points": screenspace_points,
+        "viewspace_points": viewspace_points,
         "visibility_filter": in_fov,
-        "radii": torch.zeros(N, device=device),  # Placeholder for compatibility
-        "converge": torch.tensor(0.0, device=device),  # Placeholder
+        "radii": radii,
+        "converge": torch.tensor(0.0, device=device),
         "rend_alpha": (weight_sum > 0).float().unsqueeze(0),
         "rend_normal": surf_normal,
         "rend_dist": torch.zeros(1, H, W, device=device),

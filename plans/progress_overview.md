@@ -1,5 +1,12 @@
 # Progress Overview (Post-Fork, Multi-Branch)
 
+## 2026-03-10 Renderer WIP Update
+- Replayed the renderer-fix synthetic sphere gate and confirmed the active v2 path was still broken before the latest patch: `C4-S1` failed with NaN diagnostics and a no-grad backward crash.
+- Patched `gaussian_renderer/__init__.py` to keep sonar event accumulation differentiable, switch ray-binned transmittance compositing to log-space, and clamp NaN/Inf event-volume outputs before loss computation.
+- Focused renderer contracts now pass again (`RB-T05`, `RB-T08`, `RB-T16`, `RB-T20`, `RB-T21`) and the runtime smoke contracts (`RB-T11`, `RB-T12`) pass under `SONAR_RENDER_MODE=2dgs`, `SONAR_OCCLUSION_MODE=ray_binned`, `SONAR_LAMBERTIAN_MODE=leaky`.
+- Synthetic smoke reruns now complete for both `synthetic_sphere_A_clean` and `synthetic_cube_C_clean` at `50` frames / `100` stage-2 iterations, with finite final-eval losses and produced surfel outputs.
+- Visual quality is still not materially improved relative to the last manual review, so this commit should be treated as renderer-stability WIP rather than a completed renderer-baseline closure.
+
 ## Current Architecture (Sonar Extensions)
 ```mermaid
 flowchart TB

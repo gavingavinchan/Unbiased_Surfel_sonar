@@ -104,6 +104,44 @@ def test_rb_t15_nonlinear_boundary_k_lt3_falls_back_to_jacobian_when_center_vali
     assert out.get("effective_mode") == "2dgs", "RB-T15: fallback path should switch effective mode to Jacobian"
 
 
+def test_rb_t15_nonlinear_boundary_hysteresis_keeps_fallback_active_at_k_eq3_contract():
+    project = _require_renderer_fn("project_sonar_footprint", "RB-T15")
+    sonar_cfg = _make_sonar_cfg()
+
+    out = project(
+        mean_3d=torch.tensor([1.0, 0.0, 1.0], dtype=torch.float32),
+        scale_xy=torch.tensor([0.42, 0.22], dtype=torch.float32),
+        quat_wxyz=torch.tensor([1.0, 0.0, 0.0, 0.0], dtype=torch.float32),
+        mode="2dgs_nonlinear",
+        sigma_point_config={"kappa": 0.0, "alpha": 1.0, "beta": 2.0},
+        sonar_config=sonar_cfg,
+        previous_fallback_used=True,
+    )
+
+    assert out.get("sigma_valid_count") == 3, "RB-T15 setup: fixture must land on hysteresis boundary K=3"
+    assert out.get("fallback_used", False), "RB-T15: prior fallback state must persist until K>=4"
+    assert out.get("effective_mode") == "2dgs", "RB-T15: hysteresis hold should stay on Jacobian fallback"
+
+
+def test_rb_t15_nonlinear_boundary_hysteresis_exits_fallback_at_k_ge4_contract():
+    project = _require_renderer_fn("project_sonar_footprint", "RB-T15")
+    sonar_cfg = _make_sonar_cfg()
+
+    out = project(
+        mean_3d=torch.tensor([0.95, 0.12, 1.0], dtype=torch.float32),
+        scale_xy=torch.tensor([0.28, 0.18], dtype=torch.float32),
+        quat_wxyz=torch.tensor([1.0, 0.0, 0.0, 0.0], dtype=torch.float32),
+        mode="2dgs_nonlinear",
+        sigma_point_config={"kappa": 0.0, "alpha": 1.0, "beta": 2.0},
+        sonar_config=sonar_cfg,
+        previous_fallback_used=True,
+    )
+
+    assert out.get("sigma_valid_count") >= 4, "RB-T15 setup: fixture must satisfy hysteresis exit threshold"
+    assert not out.get("fallback_used", True), "RB-T15: fallback should exit once K>=4 with valid center"
+    assert out.get("effective_mode") == "2dgs_nonlinear", "RB-T15: hysteresis exit should restore nonlinear mode"
+
+
 def test_rb_t15_nonlinear_center_invalid_skips_rendering_contract():
     project = _require_renderer_fn("project_sonar_footprint", "RB-T15")
     sonar_cfg = _make_sonar_cfg()

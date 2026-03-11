@@ -1809,6 +1809,23 @@ def print_sonar_diagnostics(diag, prefix=""):
         f"far/near={ratio:.6f}, near_sat={sat:.6f}, nan_inf={nan_inf}"
     )
 
+    render_mode = diag.get("sonar_render_mode", "unknown")
+    occlusion_mode = diag.get("sonar_occlusion_mode", "unknown")
+    lambertian_mode = diag.get("lambertian_mode", "unknown")
+    visible_ratio = float(diag.get("visible_surfel_ratio", 0.0))
+    print(
+        f"{prefix}render_mode={render_mode}, occlusion_mode={occlusion_mode}, "
+        f"lambertian={lambertian_mode}, visible={visible_ratio:.6f}"
+    )
+
+    surfel_stats = diag.get("surfel_size_stats_world")
+    if surfel_stats is not None:
+        print(f"{prefix}surfel_size_stats_world={surfel_stats}")
+
+    mass_loss = diag.get("occlusion_support_cap_mass_loss")
+    if mass_loss is not None:
+        print(f"{prefix}mass_loss={mass_loss}")
+
 
 def render_sonar_for_mesh(sonar_config, scale_factor, sonar_extrinsic=None):
     def _render(viewpoint_cam, gaussians, pipe, bg_color):
@@ -2822,6 +2839,7 @@ SONAR_RANGE_ATTEN_AUTO_GAIN = env_bool("SONAR_RANGE_ATTEN_AUTO_GAIN", False)
 ELEV_INIT_MODE = env_choice("ELEV_INIT_MODE", "random", {"random", "zero"})
 SONAR_FIXED_OPACITY = env_bool("SONAR_FIXED_OPACITY", True)
 SONAR_OPACITY_WARMUP_ITERS = max(0, env_int("SONAR_OPACITY_WARMUP_ITERS", 200))
+SONAR_SURFEL_STATS_EVERY = max(1, env_int("SONAR_SURFEL_STATS_EVERY", 50))
 SONAR_LOAD_CHECKPOINT = os.environ.get("SONAR_LOAD_CHECKPOINT", "").strip()
 SONAR_SAVE_CHECKPOINT = os.environ.get("SONAR_SAVE_CHECKPOINT", "").strip()
 
@@ -4778,6 +4796,20 @@ def main():
         )
 
     if SONAR_SAVE_CHECKPOINT:
+        final_sonar_diag = {}
+        if training_frames:
+            with torch.no_grad():
+                final_render_pkg = render_sonar(
+                    training_frames[0],
+                    gaussians,
+                    background,
+                    sonar_config=sonar_config,
+                    scale_factor=sonar_scale_factor,
+                    sonar_extrinsic=None,
+                    **SONAR_RENDER_KWARGS,
+                )
+            final_sonar_diag = final_render_pkg.get("sonar_diagnostics") or {}
+
         save_training_checkpoint(
             SONAR_SAVE_CHECKPOINT,
             gaussians,
@@ -4786,6 +4818,43 @@ def main():
             iteration=training_iter_offset + total_iters,
             stage_name="final",
             metadata={
+                "renderer_semantics_version": "v2",
+                "normal_init_mode": "pcd_normals",
+                "lambertian_transfer": os.environ.get("SONAR_LAMBERTIAN_MODE", "leaky").strip().lower(),
+                "occlusion_model": "ray_binned",
+                "render_sonar_contract_hash": os.environ.get("RENDER_SONAR_CONTRACT_HASH", "working_tree"),
+                "sonar_render_mode": os.environ.get("SONAR_RENDER_MODE", "2dgs").strip().lower(),
+                "sonar_occlusion_mode": os.environ.get("SONAR_OCCLUSION_MODE", "ray_binned").strip().lower(),
+                "occlusion_space": "ray_binned",
+                "occlusion_footprint_policy": "multi_bin_participation",
+                "occlusion_support_cap_config": {
+                    "k_sigma": float(os.environ.get("SONAR_OCCL_KSIGMA", "2.5")),
+                    "weight_floor_rel": float(os.environ.get("SONAR_OCCL_WEIGHT_FLOOR_REL", "1e-3")),
+                    "topk": int(os.environ.get("SONAR_OCCL_TOPK", "16")),
+                },
+                "occlusion_support_cap_mass_loss": {
+                    "mean": float(final_sonar_diag.get("occlusion_support_cap_mass_loss", {}).get("mean", 0.0)),
+                    "median": float(final_sonar_diag.get("occlusion_support_cap_mass_loss", {}).get("median", 0.0)),
+                    "p95": float(final_sonar_diag.get("occlusion_support_cap_mass_loss", {}).get("p95", 0.0)),
+                    "p99": float(final_sonar_diag.get("occlusion_support_cap_mass_loss", {}).get("p99", 0.0)),
+                    "max": float(final_sonar_diag.get("occlusion_support_cap_mass_loss", {}).get("max", 0.0)),
+                },
+                "compat_reference_id": os.environ.get("SONAR_COMPAT_REFERENCE_ID", "v2_compat_default"),
+                "elevation_bin_count": int(os.environ.get("SONAR_ELEV_BINS", "1")),
+                "elevation_weight_mode": os.environ.get("SONAR_ELEV_WEIGHT_MODE", "uniform").strip().lower(),
+                "surfel_size_stats_schema_version": "v1",
+                "surfel_size_stats_final": final_sonar_diag.get("surfel_size_stats_world", {}),
+                "surfel_size_stats_image_final": final_sonar_diag.get("surfel_size_stats_image", {}),
+                "sigma_point_config": {
+                    "kappa": float(os.environ.get("SONAR_SIGMA_KAPPA", "0.0")),
+                    "alpha": float(os.environ.get("SONAR_SIGMA_ALPHA", "1.0")),
+                    "beta": float(os.environ.get("SONAR_SIGMA_BETA", "2.0")),
+                },
+                "sigma_point_boundary_policy_version": os.environ.get(
+                    "SONAR_SIGMA_BOUNDARY_POLICY_VERSION",
+                    "v1",
+                ),
+                "sigma_point_fallback_fraction": float(final_sonar_diag.get("sigma_point_fallback_fraction", 0.0)),
                 "dataset_key": DATASET_KEY,
                 "dataset_path": DATASET_PATH,
                 "seed": SEED,
