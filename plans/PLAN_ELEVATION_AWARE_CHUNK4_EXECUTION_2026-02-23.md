@@ -872,6 +872,23 @@ Chunk-4 code integration is largely complete, but gate failure persists because 
 
 ---
 
+## 2026-03-11 Visualizer Sanity Check (gpt-5.4)
+
+Using the new per-frame visualizer export on the synthetic cube dataset, a first comprehensible qualitative result was obtained from a tightly constrained run:
+
+- Run directory: `output/debug_multiframe_synth_c_first6/`
+- Frame policy: first 6 frames only (`sonar_000000`..`sonar_000005`)
+- Observation: these six views all look at the same cube face, and the exported surfels form a readable straight-line band exactly where that cube face should be.
+- Orientation observation: surfel orientations are still randomized/noisy, but they more often face toward the observing sonar poses than away from them, which matches the intended initialization bias much better than the previously unreadable exports.
+- Visualizer verdict: this is the first cube-dataset result that looks remotely comprehensible in Blender and is the first export that clearly shows a face-aligned surfel structure instead of an uninterpretable cloud.
+
+Interpretation note:
+
+- This does **not** close the Chunk-4 quantitative gate and does **not** by itself resolve the cube failure documented above.
+- It **does** establish that the new visualizer is finally good enough to support meaningful manual diagnosis of cube-face structure, surfel footprint placement, and front/back orientation tendencies on a controlled subset.
+
+---
+
 ## 2026-02-27 Baseline Renderer Diagnosis (claude-opus-4-6)
 
 Historical provenance note:

@@ -3,6 +3,21 @@
 ## Abstract
 We extended 2D Gaussian Splatting to forward-looking multibeam sonar by introducing polar rendering, backward projection, metric scale alignment, and sonar-specific training constraints. The work adds sonar mode data flow, pose interpolation from camera trajectories, a learnable global scale factor, camera-to-sonar extrinsics, differentiable polar rendering with intensity modeling, size-aware field-of-view (FOV) constraints, and loss shaping for bright sonar returns. We also introduced mesh tuning workflows and dataset preparation guidelines to support real-world sonar reconstructions.
 
+## 2026-03-11 Visualizer Addendum
+The debugging workflow now includes an explicit offline visualizer contract for surfel-state inspection in Blender. Instead of relying on latent Gaussian PLYs and a single merged pose wireframe, the run exports per-stage surfel states, per-frame wireframes, per-frame FOV surfel glyphs, and per-frame rendered sonar images under a shared `visualizer/` root.
+
+Two practical geometry clarifications were required for this contract to become scientifically useful:
+
+1. Near-range and full-range FOV wireframes must share the same angular boundary construction. If one artifact is built as a forward-depth rectangle while the other is built from constant-range beam corners, their apparent elevation envelope disagrees even when they encode the same nominal FOV. The corrected construction uses the same sonar-angle corner parameterization for both, differing only in radius.
+
+2. Per-frame surfel inspection must distinguish between strict center-in-FOV membership and size-aware overlap membership. The current export keeps the size-aware overlap rule for diagnostic completeness,
+$$
+\operatorname{export}(i) = \mathbb{1}\left[m_i + r_i > 0 \right],
+$$
+where $m_i$ is the signed margin to the nearest FOV boundary and $r_i = \max(s_{u,i}, s_{v,i})$ is the activated in-plane surfel radius proxy, but the sampled subset is now prioritized by center-in-FOV first so the exported glyphs better reflect the frame's visually dominant supporting geometry.
+
+Empirically, this new visualizer produced the first cube-dataset result that was qualitatively interpretable: in `output/debug_multiframe_synth_c_first6/`, six contiguous frames viewing the same cube face yielded a readable straight surfel band aligned with that face. The orientation field remains noisy, but the artifact is now good enough to reveal that many surfels face toward the observing sonar poses rather than away, which was previously impossible to assess reliably from the old exports.
+
 ## 2026-03-10 Renderer Stability Addendum
 The active renderer-baseline remediation now includes a stability patch to the sonar accumulation path. The practical issue was not just incorrect visibility semantics but broken optimization plumbing: intermediate event volumes in `render_sonar` were being materialized through non-differentiable write patterns, so the photometric objective could become disconnected from surfel parameters during synthetic gate replays.
 

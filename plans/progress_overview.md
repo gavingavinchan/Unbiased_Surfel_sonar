@@ -1,5 +1,13 @@
 # Progress Overview (Post-Fork, Multi-Branch)
 
+## 2026-03-11 Sonar Visualizer Checkpoint
+- Added Blender-first offline visualizer exports for `debug_multiframe.py`: stage-aligned surfel-state PLYs, deterministic sampled surfel glyphs, per-frame near/full-range wireframes, per-frame rendered sonar PNGs, and a narrow `visualizer/manifest.json` index.
+- Fixed an important geometry bug in the initial visualizer pass: near and full-range wireframes now share the same sonar-angle envelope instead of mixing a rectangular forward-depth pyramid with a constant-range FOV shell.
+- Tightened per-frame surfel selection so exported frame glyphs prefer surfels centered inside the current frame FOV before falling back to size-aware overlap candidates.
+- Added `SONAR_FRAME_SELECTION=first` so controlled manual reviews can use contiguous early frames instead of evenly spaced views.
+- First meaningful cube sanity check landed in `output/debug_multiframe_synth_c_first6/`: frames `sonar_000000`..`sonar_000005` all observe the same cube face, and the visualizer shows a readable straight surfel band at that face instead of an incoherent cloud.
+- Qualitative status: surfel orientations are still noisy/randomized, but the visualizer now makes it obvious that many surfels face toward the observing sonar poses rather than away; this is the first cube-dataset visualization that is remotely interpretable for manual diagnosis.
+
 ## 2026-03-10 Renderer WIP Update
 - Replayed the renderer-fix synthetic sphere gate and confirmed the active v2 path was still broken before the latest patch: `C4-S1` failed with NaN diagnostics and a no-grad backward crash.
 - Patched `gaussian_renderer/__init__.py` to keep sonar event accumulation differentiable, switch ray-binned transmittance compositing to log-space, and clamp NaN/Inf event-volume outputs before loss computation.

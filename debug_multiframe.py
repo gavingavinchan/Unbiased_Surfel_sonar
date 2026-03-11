@@ -27,6 +27,7 @@ import os
 import sys
 import atexit
 import csv
+import subprocess
 from dataclasses import dataclass
 import torch
 import random
@@ -87,6 +88,21 @@ from utils.elevation_chunk4_helpers import (
     apply_new_surfel_grace,
     build_chunk4_checkpoint_payload,
     resolve_chunk4_resume_action,
+)
+from utils.visualization_utils import (
+    build_frame_stem,
+    build_surfel_glyph_mesh,
+    compute_frame_surfel_membership,
+    create_pose_wireframe,
+    deterministic_glyph_indices,
+    diagnostic_colors_from_metrics,
+    ensure_visualizer_dirs,
+    prepare_surfel_visualization_state,
+    select_frame_surfel_indices,
+    write_line_set,
+    write_point_cloud,
+    write_triangle_mesh,
+    write_visualizer_manifest,
 )
 import open3d as o3d
 from PIL import Image
@@ -350,34 +366,17 @@ def prune_outside_fov(
 
 
 def create_pose_pyramid_wireframe(position, rotation_matrix, depth=0.5,
-                                   azimuth_fov=120.0, elevation_fov=20.0, color=[1.0, 0.0, 0.0]):
+                                   azimuth_fov=120.0, elevation_fov=20.0, color=[1.0, 0.0, 0.0], mode="near"):
     """Create a wireframe pyramid for a single pose."""
-    half_az = math.radians(azimuth_fov / 2)
-    half_el = math.radians(elevation_fov / 2)
-    width = 2 * depth * math.tan(half_az)
-    height = 2 * depth * math.tan(half_el)
-
-    vertices_local = np.array([
-        [0, 0, 0],
-        [depth, -width/2, -height/2],
-        [depth,  width/2, -height/2],
-        [depth,  width/2,  height/2],
-        [depth, -width/2,  height/2],
-    ])
-
-    cam_z_world = rotation_matrix[:, 2]
-    cam_x_world = rotation_matrix[:, 0]
-    cam_y_world = rotation_matrix[:, 1]
-    R_local_to_world = np.column_stack([cam_z_world, cam_x_world, cam_y_world])
-    vertices_world = (R_local_to_world @ vertices_local.T).T + position
-
-    edges = [[0, 1], [0, 2], [0, 3], [0, 4], [1, 2], [2, 3], [3, 4], [4, 1]]
-
-    wireframe = o3d.geometry.LineSet()
-    wireframe.points = o3d.utility.Vector3dVector(vertices_world)
-    wireframe.lines = o3d.utility.Vector2iVector(np.array(edges))
-    wireframe.paint_uniform_color(color)
-    return wireframe
+    return create_pose_wireframe(
+        position,
+        rotation_matrix,
+        depth=depth,
+        azimuth_fov=azimuth_fov,
+        elevation_fov=elevation_fov,
+        color=color,
+        mode=mode,
+    )
 
 
 def brighten_image(img_np, percentile=99, gamma=0.5):
@@ -1932,6 +1931,14 @@ def select_diverse_frames(cameras, num_frames, seed=42):
     return indices
 
 
+def select_frame_indices(cameras, num_frames, seed=42, mode="diverse"):
+    if mode == "first":
+        return list(range(min(num_frames, len(cameras))))
+    if mode == "diverse":
+        return select_diverse_frames(cameras, num_frames, seed=seed)
+    raise ValueError(f"Unsupported frame selection mode: {mode}")
+
+
 def save_comparison_images(training_frames, gaussians, background, sonar_config,
                            scale_factor, output_dir, stage_name):
     """Save GT vs rendered comparison images for all training frames at a given stage."""
@@ -2009,6 +2016,300 @@ def save_raw_comparison_images(training_frames, gaussians, background, sonar_con
         Image.fromarray(comparison_raw, mode="L").save(os.path.join(output_dir, filename))
 
     print(f"  Saved raw-frame comparisons for {stage_name}")
+
+
+def get_repo_commit_sha():
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+            cwd=os.path.dirname(os.path.abspath(__file__)),
+        )
+        return result.stdout.strip()
+    except Exception:
+        return "unknown"
+
+
+def relative_visualizer_path(path, visualizer_dir):
+    return os.path.relpath(path, visualizer_dir).replace(os.sep, "/")
+
+
+def build_visualizer_metadata_refs(output_dir, visualizer_dir, dataset_path):
+    refs = {}
+    candidate_paths = {
+        "run_log": os.path.join(output_dir, "run.log"),
+        "loss_log_csv": os.path.join(output_dir, "loss_log.csv"),
+        "cfg_args": os.path.join(output_dir, "cfg_args"),
+        "cameras_json": os.path.join(output_dir, "cameras.json"),
+        "dataset_manifest": os.path.join(dataset_path, "manifest.json"),
+        "dataset_settings": os.path.join(dataset_path, "DATASET_SETTINGS.md"),
+        "dataset_consistency_gate": os.path.join(dataset_path, "consistency_gate.json"),
+    }
+    for key, candidate in candidate_paths.items():
+        if os.path.exists(candidate):
+            refs[key] = relative_visualizer_path(candidate, visualizer_dir)
+    return refs
+
+
+def get_gaussian_visualization_state(gaussians):
+    return prepare_surfel_visualization_state(
+        centers=gaussians.get_xyz.detach(),
+        scales=gaussians._scaling.detach(),
+        rotations=gaussians._rotation.detach(),
+        opacity=gaussians.get_opacity.detach().squeeze(-1),
+        scales_are_latent=True,
+        rotations_are_normalized=False,
+    )
+
+
+def build_stage_glyph_colors(opacity, eq_radius):
+    opacity = np.asarray(opacity, dtype=np.float64).reshape(-1)
+    eq_radius = np.asarray(eq_radius, dtype=np.float64).reshape(-1)
+    if opacity.size == 0:
+        return np.zeros((0, 3), dtype=np.float64)
+
+    opacity_span = max(opacity.max() - opacity.min(), 1e-8)
+    radius_span = max(eq_radius.max() - eq_radius.min(), 1e-8)
+    opacity_norm = np.clip((opacity - opacity.min()) / opacity_span, 0.0, 1.0)
+    radius_norm = np.clip((eq_radius - eq_radius.min()) / radius_span, 0.0, 1.0)
+
+    warm = np.array([0.93, 0.45, 0.18], dtype=np.float64)
+    cool = np.array([0.20, 0.66, 0.95], dtype=np.float64)
+    pale = np.array([0.96, 0.90, 0.72], dtype=np.float64)
+    color = warm[None, :] * opacity_norm[:, None] + cool[None, :] * (1.0 - radius_norm[:, None])
+    color += pale[None, :] * (0.5 * radius_norm[:, None])
+    return np.clip(color / 1.5, 0.0, 1.0)
+
+
+def export_sampled_glyph_artifacts(
+    gaussians,
+    visualizer_dir,
+    glyph_prefix,
+    *,
+    include_centers_full=False,
+):
+    surfel_state = get_gaussian_visualization_state(gaussians)
+    opacity = surfel_state["opacity"]
+    eq_radius = surfel_state["equivalent_radius"]
+    selected_idx = deterministic_glyph_indices(
+        opacity,
+        eq_radius,
+        max_count=VISUALIZER_MAX_GLYPHS,
+        opacity_percentile=VISUALIZER_OPACITY_PERCENTILE,
+        eq_radius_percentile=VISUALIZER_EQ_RADIUS_PERCENTILE,
+    )
+    selected_colors = build_stage_glyph_colors(opacity[selected_idx], eq_radius[selected_idx])
+
+    artifact = {
+        "total_surfels": int(surfel_state["centers"].shape[0]),
+        "sampled_surfels": int(selected_idx.shape[0]),
+    }
+
+    if include_centers_full:
+        center_colors = np.repeat(np.clip(opacity[:, None], 0.0, 1.0), 3, axis=1)
+        centers_path = os.path.join(visualizer_dir, f"glyphs_{glyph_prefix}_centers_full.ply")
+        write_point_cloud(centers_path, surfel_state["centers"], center_colors)
+        artifact["centers_full"] = relative_visualizer_path(centers_path, visualizer_dir)
+
+    combined_path = os.path.join(visualizer_dir, f"glyphs_{glyph_prefix}_sampled.ply")
+    front_path = os.path.join(visualizer_dir, f"glyphs_{glyph_prefix}_front_faces.ply")
+    back_path = os.path.join(visualizer_dir, f"glyphs_{glyph_prefix}_back_faces.ply")
+
+    if selected_idx.size == 0:
+        write_point_cloud(combined_path, np.zeros((0, 3), dtype=np.float64))
+        write_point_cloud(front_path, np.zeros((0, 3), dtype=np.float64))
+        write_point_cloud(back_path, np.zeros((0, 3), dtype=np.float64))
+    else:
+        write_triangle_mesh(
+            combined_path,
+            build_surfel_glyph_mesh(
+                surfel_state,
+                indices=selected_idx,
+                face_mode="double",
+                base_colors=selected_colors,
+                ellipse_segments=VISUALIZER_GLYPH_SEGMENTS,
+                face_offset_scale=VISUALIZER_FACE_OFFSET_SCALE,
+                normal_stem_scale=VISUALIZER_NORMAL_STEM_SCALE,
+            ),
+        )
+        write_triangle_mesh(
+            front_path,
+            build_surfel_glyph_mesh(
+                surfel_state,
+                indices=selected_idx,
+                face_mode="front",
+                base_colors=selected_colors,
+                ellipse_segments=VISUALIZER_GLYPH_SEGMENTS,
+                face_offset_scale=VISUALIZER_FACE_OFFSET_SCALE,
+                normal_stem_scale=VISUALIZER_NORMAL_STEM_SCALE,
+            ),
+        )
+        write_triangle_mesh(
+            back_path,
+            build_surfel_glyph_mesh(
+                surfel_state,
+                indices=selected_idx,
+                face_mode="back",
+                base_colors=selected_colors,
+                ellipse_segments=VISUALIZER_GLYPH_SEGMENTS,
+                face_offset_scale=VISUALIZER_FACE_OFFSET_SCALE,
+                normal_stem_scale=VISUALIZER_NORMAL_STEM_SCALE,
+            ),
+        )
+
+    artifact["sampled_double_sided"] = relative_visualizer_path(combined_path, visualizer_dir)
+    artifact["front_faces"] = relative_visualizer_path(front_path, visualizer_dir)
+    artifact["back_faces"] = relative_visualizer_path(back_path, visualizer_dir)
+    return artifact
+
+
+def export_stage_visualizer_state(
+    gaussians,
+    visualizer_dir,
+    *,
+    stage_filename,
+    stage_status,
+    glyph_prefix=None,
+    include_centers_full=False,
+):
+    state_path = os.path.join(visualizer_dir, stage_filename)
+    gaussians.save_ply(state_path)
+    artifact = {
+        "status": stage_status,
+        "state_ply": relative_visualizer_path(state_path, visualizer_dir),
+    }
+    if glyph_prefix is not None:
+        artifact["glyphs"] = export_sampled_glyph_artifacts(
+            gaussians,
+            visualizer_dir,
+            glyph_prefix,
+            include_centers_full=include_centers_full,
+        )
+    return artifact
+
+
+def export_frame_visualizer_artifacts(
+    training_frames,
+    gaussians,
+    background,
+    sonar_config,
+    scale_factor,
+    visualizer_dir,
+    rendered_dir,
+):
+    frame_entries = []
+    surfel_state = get_gaussian_visualization_state(gaussians)
+    frame_width = max(3, len(str(max(len(training_frames) - 1, 0))))
+    colors = [[1, 0, 0], [0, 1, 0], [0, 0, 1], [1, 1, 0], [1, 0, 1]]
+
+    for frame_idx, cam in enumerate(training_frames):
+        stem = build_frame_stem(frame_idx, cam.image_name, width=frame_width)
+        color = colors[frame_idx % len(colors)]
+        r_c2w = cam.R.T
+        position = -r_c2w @ cam.T
+
+        wireframe_near_path = os.path.join(visualizer_dir, f"{stem}_wireframe_near.ply")
+        wireframe_full_path = os.path.join(visualizer_dir, f"{stem}_wireframe_full_range.ply")
+        write_line_set(
+            wireframe_near_path,
+            create_pose_wireframe(
+                position,
+                r_c2w,
+                depth=PYRAMID_DEPTH,
+                azimuth_fov=sonar_config.azimuth_fov,
+                elevation_fov=sonar_config.elevation_fov,
+                color=color,
+                mode="near",
+            ),
+        )
+        write_line_set(
+            wireframe_full_path,
+            create_pose_wireframe(
+                position,
+                r_c2w,
+                depth=sonar_config.range_max,
+                azimuth_fov=sonar_config.azimuth_fov,
+                elevation_fov=sonar_config.elevation_fov,
+                color=color,
+                mode="full_range",
+            ),
+        )
+
+        frame_diag = compute_frame_surfel_membership(
+            surfel_state["centers"],
+            surfel_state["scales"],
+            surfel_state["rotations"],
+            cam,
+            sonar_config,
+            scale_factor=scale_factor,
+        )
+        overlap_idx = np.flatnonzero(frame_diag["overlap_mask"])
+        export_idx = select_frame_surfel_indices(
+            frame_diag["center_in_fov"],
+            frame_diag["overlap_mask"],
+            frame_diag["fov_margin"],
+            frame_diag["facing_score"],
+            surfel_state["opacity"],
+            surfel_state["equivalent_radius"],
+            max_count=VISUALIZER_MAX_FRAME_GLYPHS,
+        )
+        surfels_path = os.path.join(visualizer_dir, f"{stem}_surfels_in_fov.ply")
+
+        if export_idx.size == 0:
+            write_point_cloud(surfels_path, np.zeros((0, 3), dtype=np.float64))
+        else:
+            base_colors = diagnostic_colors_from_metrics(
+                frame_diag["facing_score"][export_idx],
+                frame_diag["range_vals"][export_idx],
+                sonar_config.range_min,
+                sonar_config.range_max,
+            )
+            write_triangle_mesh(
+                surfels_path,
+                build_surfel_glyph_mesh(
+                    surfel_state,
+                    indices=export_idx,
+                    face_mode="double",
+                    base_colors=base_colors,
+                    ellipse_segments=VISUALIZER_GLYPH_SEGMENTS,
+                    face_offset_scale=VISUALIZER_FACE_OFFSET_SCALE,
+                    normal_stem_scale=VISUALIZER_NORMAL_STEM_SCALE,
+                ),
+            )
+
+        with torch.no_grad():
+            render_pkg = render_sonar(
+                cam,
+                gaussians,
+                background,
+                sonar_config=sonar_config,
+                scale_factor=scale_factor,
+                sonar_extrinsic=None,
+                **SONAR_RENDER_KWARGS,
+            )
+            rendered = render_pkg["render"]
+        rendered_np = (np.clip(rendered[0].detach().cpu().numpy(), 0.0, 1.0) * 255.0).astype(np.uint8)
+        rendered_path = os.path.join(rendered_dir, f"{stem}.png")
+        Image.fromarray(rendered_np, mode="L").save(rendered_path)
+
+        frame_entries.append(
+            {
+                "frame_index": frame_idx,
+                "image_name": cam.image_name,
+                "stem": stem,
+                "wireframe_near": relative_visualizer_path(wireframe_near_path, visualizer_dir),
+                "wireframe_full_range": relative_visualizer_path(wireframe_full_path, visualizer_dir),
+                "surfels_in_fov": relative_visualizer_path(surfels_path, visualizer_dir),
+                "rendered_image": relative_visualizer_path(rendered_path, visualizer_dir),
+                "surfel_center_in_fov_count": int(np.count_nonzero(frame_diag["center_in_fov"])),
+                "surfel_overlap_count": int(overlap_idx.shape[0]),
+                "surfel_export_count": int(export_idx.shape[0]),
+            }
+        )
+
+    return frame_entries
 
 
 def write_csv_rows(csv_path, fieldnames, rows):
@@ -2842,6 +3143,14 @@ SONAR_OPACITY_WARMUP_ITERS = max(0, env_int("SONAR_OPACITY_WARMUP_ITERS", 200))
 SONAR_SURFEL_STATS_EVERY = max(1, env_int("SONAR_SURFEL_STATS_EVERY", 50))
 SONAR_LOAD_CHECKPOINT = os.environ.get("SONAR_LOAD_CHECKPOINT", "").strip()
 SONAR_SAVE_CHECKPOINT = os.environ.get("SONAR_SAVE_CHECKPOINT", "").strip()
+VISUALIZER_MAX_GLYPHS = max(1, env_int("SONAR_VIS_MAX_GLYPHS", 2000))
+VISUALIZER_MAX_FRAME_GLYPHS = max(1, env_int("SONAR_VIS_FRAME_MAX_GLYPHS", 1500))
+VISUALIZER_GLYPH_SEGMENTS = max(6, env_int("SONAR_VIS_GLYPH_SEGMENTS", 12))
+VISUALIZER_OPACITY_PERCENTILE = min(100.0, max(0.0, env_float("SONAR_VIS_OPACITY_PERCENTILE", 0.0)))
+VISUALIZER_EQ_RADIUS_PERCENTILE = min(100.0, max(0.0, env_float("SONAR_VIS_EQ_RADIUS_PERCENTILE", 100.0)))
+VISUALIZER_FACE_OFFSET_SCALE = max(1e-4, env_float("SONAR_VIS_FACE_OFFSET_SCALE", 0.04))
+VISUALIZER_NORMAL_STEM_SCALE = max(1e-4, env_float("SONAR_VIS_NORMAL_STEM_SCALE", 0.35))
+SONAR_FRAME_SELECTION = env_choice("SONAR_FRAME_SELECTION", "diverse", {"diverse", "first"})
 
 # In learnable-opacity mode, default to auto attenuation gain unless explicitly overridden.
 if (
@@ -2890,6 +3199,9 @@ def main():
         OUTPUT_DIR = get_next_output_dir(OUTPUT_DIR_BASE)
 
     os.makedirs(OUTPUT_DIR, exist_ok=True)
+    visualizer_dir, visualizer_rendered_dir = ensure_visualizer_dirs(OUTPUT_DIR)
+    visualizer_stage_artifacts = {}
+    visualizer_frame_artifacts = []
 
     setup_logging(OUTPUT_DIR)
     init_loss_log(OUTPUT_DIR)
@@ -2900,12 +3212,14 @@ def main():
     print("=" * 60)
     print(f"Seed: {SEED}")
     print(f"Dataset: {DATASET_KEY} ({DATASET_PATH})")
+    print(f"Visualizer output: {visualizer_dir}")
     if DATASET_PATH_OVERRIDE:
         print(f"Dataset path override: {DATASET_PATH_OVERRIDE}")
     print(f"Synthetic dataset mode: {IS_SYNTHETIC_DATASET}")
     print(f"Init scale: {INIT_SCALE_FACTOR}")
     print(f"Scale frozen: {SONAR_FREEZE_SCALE}")
     print(f"Num training frames: {NUM_TRAINING_FRAMES}")
+    print(f"Frame selection: {SONAR_FRAME_SELECTION}")
     print(f"Holdout frames: {SONAR_HOLDOUT_FRAMES}")
     print(f"Curriculum: Stage1={STAGE1_ITERATIONS} (scale), Stage2={STAGE2_ITERATIONS} (surfels), Stage3={STAGE3_ITERATIONS} (joint)")
     if NUM_TRAINING_FRAMES > 1 and (STAGE2_ITERATIONS + STAGE3_ITERATIONS) < NUM_TRAINING_FRAMES:
@@ -3064,7 +3378,12 @@ def main():
     print(f"Total cameras available: {len(train_cameras)}")
 
     # Select diverse frames for training
-    frame_indices = select_diverse_frames(train_cameras, NUM_TRAINING_FRAMES, seed=SEED)
+    frame_indices = select_frame_indices(
+        train_cameras,
+        NUM_TRAINING_FRAMES,
+        seed=SEED,
+        mode=SONAR_FRAME_SELECTION,
+    )
     training_frames = [train_cameras[i] for i in frame_indices]
 
     holdout_frames = []
@@ -3081,7 +3400,12 @@ def main():
                 )
             holdout_count = min(SONAR_HOLDOUT_FRAMES, len(remaining_indices))
             holdout_pool = [train_cameras[idx] for idx in remaining_indices]
-            holdout_rel_indices = select_diverse_frames(holdout_pool, holdout_count, seed=SEED + 1000)
+            holdout_rel_indices = select_frame_indices(
+                holdout_pool,
+                holdout_count,
+                seed=SEED + 1000,
+                mode=SONAR_FRAME_SELECTION,
+            )
             holdout_indices = [remaining_indices[idx] for idx in holdout_rel_indices]
             holdout_frames = [train_cameras[idx] for idx in holdout_indices]
 
@@ -3367,6 +3691,14 @@ def main():
     gaussians = GaussianModel(dataset_args.sh_degree)
     gaussians.create_from_pcd(basic_pcd, cameras_extent)
     print(f"Gaussian count: {len(gaussians.get_xyz)}")
+    visualizer_stage_artifacts["initial"] = export_stage_visualizer_state(
+        gaussians,
+        visualizer_dir,
+        stage_filename="surfels_initial_state.ply",
+        stage_status="executed",
+        glyph_prefix="initial",
+        include_centers_full=True,
+    )
 
     # Diagnostic: Check initial FOV visibility with temporary scale factor
     # ============================================================================
@@ -3918,6 +4250,20 @@ def main():
         save_comparison_images(training_frames, gaussians, background, sonar_config,
                                sonar_scale_factor, OUTPUT_DIR, "after_stage1")
 
+        visualizer_stage_artifacts["stage1"] = export_stage_visualizer_state(
+            gaussians,
+            visualizer_dir,
+            stage_filename="surfels_after_stage1.ply",
+            stage_status="executed",
+        )
+    else:
+        visualizer_stage_artifacts["stage1"] = export_stage_visualizer_state(
+            gaussians,
+            visualizer_dir,
+            stage_filename="surfels_after_stage1.ply",
+            stage_status="skipped_alias_to_initial",
+        )
+
     elev_angle_bins = torch.linspace(
         -sonar_config.half_elevation_rad,
         sonar_config.half_elevation_rad,
@@ -4287,6 +4633,21 @@ def main():
         # Save comparison images after Stage 2
         save_comparison_images(training_frames, gaussians, background, sonar_config,
                                sonar_scale_factor, OUTPUT_DIR, "after_stage2")
+        visualizer_stage_artifacts["stage2"] = export_stage_visualizer_state(
+            gaussians,
+            visualizer_dir,
+            stage_filename="surfels_after_stage2.ply",
+            stage_status="executed",
+            glyph_prefix="stage2",
+        )
+    else:
+        visualizer_stage_artifacts["stage2"] = export_stage_visualizer_state(
+            gaussians,
+            visualizer_dir,
+            stage_filename="surfels_after_stage2.ply",
+            stage_status="skipped_alias_to_stage1",
+            glyph_prefix="stage2",
+        )
 
     # =============================================================================
     # Stage 3: Joint Fine-tuning
@@ -4690,6 +5051,23 @@ def main():
             sonar_extrinsic=None
         )
 
+    visualizer_stage_artifacts["stage3"] = export_stage_visualizer_state(
+        gaussians,
+        visualizer_dir,
+        stage_filename="surfels_after_stage3.ply",
+        stage_status="executed" if STAGE3_ITERATIONS > 0 else "skipped_alias_to_stage2",
+        glyph_prefix="stage3",
+    )
+    visualizer_frame_artifacts = export_frame_visualizer_artifacts(
+        training_frames,
+        gaussians,
+        background,
+        sonar_config,
+        sonar_scale_factor,
+        visualizer_dir,
+        visualizer_rendered_dir,
+    )
+
     print("\n" + "=" * 60)
     print("FINAL EVALUATION")
     print("=" * 60)
@@ -4882,6 +5260,52 @@ def main():
             chunk4_runtime_state=elevation_chunk4_runtime_state,
         )
 
+    visualizer_manifest = {
+        "visualizer_root": ".",
+        "rendered_root": "rendered",
+        "git_commit_sha": get_repo_commit_sha(),
+        "frame_artifacts": visualizer_frame_artifacts,
+        "stage_artifacts": visualizer_stage_artifacts,
+        "glyph_export_policy": {
+            "max_sampled_glyphs": VISUALIZER_MAX_GLYPHS,
+            "max_per_frame_glyphs": VISUALIZER_MAX_FRAME_GLYPHS,
+            "opacity_percentile": VISUALIZER_OPACITY_PERCENTILE,
+            "eq_radius_percentile": VISUALIZER_EQ_RADIUS_PERCENTILE,
+            "ellipse_segments": VISUALIZER_GLYPH_SEGMENTS,
+            "face_offset_scale": VISUALIZER_FACE_OFFSET_SCALE,
+            "normal_stem_scale": VISUALIZER_NORMAL_STEM_SCALE,
+            "per_frame_selection_priority": [
+                "center_in_fov",
+                "fov_margin_desc",
+                "facing_score_desc",
+                "opacity_desc",
+                "eq_radius_asc",
+            ],
+        },
+        "parameter_spaces": {
+            "surfel_state_ply": {
+                "scales": "latent_log",
+                "rotations": "latent_quaternion",
+            },
+            "glyph_exports": {
+                "scales": "activated_exp",
+                "rotations": "normalized_quaternion",
+            },
+        },
+        "wireframe_geometry": {
+            "near": "legacy rectangular pose pyramid at forward depth",
+            "full_range": "constant-range sonar FOV corners at sonar_config.range_max",
+        },
+        "frame_fov_membership_rule": {
+            "description": "size-aware overlap export",
+            "formula": "forward > 0 and compute_fov_margin(range, azimuth, elevation) + max(scale_u, scale_v) > 0",
+            "surfel_radius": "max(activated_scale_u, activated_scale_v)",
+        },
+        "metadata_refs": build_visualizer_metadata_refs(OUTPUT_DIR, visualizer_dir, DATASET_PATH),
+    }
+    visualizer_manifest_path = os.path.join(visualizer_dir, "manifest.json")
+    write_visualizer_manifest(visualizer_manifest_path, visualizer_manifest)
+
     print("\n" + "=" * 60)
     print("COMPLETE")
     print("=" * 60)
@@ -4890,6 +5314,9 @@ def main():
     print(f"\nGenerated files:")
     print(f"  - sonar_init_points.ply       (Combined points from {NUM_TRAINING_FRAMES} frames)")
     print(f"  - pose_pyramids_wireframe.ply (Wireframes for training frames)")
+    print(f"  - visualizer/manifest.json    (Visualizer artifact index)")
+    print(f"  - visualizer/*.ply            (Stage glyphs + per-frame wireframes/FOV surfels)")
+    print(f"  - visualizer/rendered/*.png   (Per-frame rendered sonar images)")
     print(f"  - mesh_before_training.ply    (Mesh before any training)")
     print(f"  - mesh_after_iter1.ply        (Mesh after 1st iteration)")
     print(f"  - mesh_after_stage1.ply       (Mesh after Stage 1: scale learning)")
