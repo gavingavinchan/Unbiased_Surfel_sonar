@@ -3,6 +3,8 @@
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 It is loaded at the start of every session; keep it concise to avoid bloating context length.
 
+- For submodule commit/push workflow, branch/fork policy, and parent-pointer updates, follow `docs/SUBMODULE_WORKFLOW.md`.
+
 ## Project Overview
 
 This is **Unbiased Surfel** extended with **sonar imaging support** for underwater 3D reconstruction. The base project implements 2D Gaussian Splatting (surfels) with unbiased depth estimation for high-accuracy mesh extraction. The sonar extension adapts this to polar coordinate geometry for BlueROV underwater platforms.

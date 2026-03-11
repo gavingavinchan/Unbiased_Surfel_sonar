@@ -6,6 +6,7 @@ It is loaded at the start of every session; keep it concise to avoid bloating co
 ## Environment Notes
 - Running in OpenCode on Ubuntu 22.04.
 - Copy/paste is unreliable; when user input is required, place text in `scratchpad.md`.
+- For submodule commit/push workflow, branch/fork policy, and parent-pointer updates, follow `docs/SUBMODULE_WORKFLOW.md`.
 
 ## Project Overview
 
