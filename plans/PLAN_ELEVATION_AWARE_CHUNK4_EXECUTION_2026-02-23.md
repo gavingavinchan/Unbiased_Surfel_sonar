@@ -887,6 +887,13 @@ Interpretation note:
 - This does **not** close the Chunk-4 quantitative gate and does **not** by itself resolve the cube failure documented above.
 - It **does** establish that the new visualizer is finally good enough to support meaningful manual diagnosis of cube-face structure, surfel footprint placement, and front/back orientation tendencies on a controlled subset.
 
+Follow-up observer note from the next temporary visualizer probe:
+
+- A 10-frame run spanning about 90 degrees of the 500-frame synthetic cube orbit (`output/debug_multiframe_synth_c_10frames_90deg/`) reverts to the familiar torus-like structure.
+- This is consistent with prior behavior and is not surprising: the recent work changed visualization/export only, not the surfel-learning or rendering logic that drives the torus failure mode.
+- The temporary frame-selection experiments (`first 6 frames`, `10 frames over ~90 degrees`) should therefore be interpreted as diagnostic probes only, not as algorithmic fixes.
+- As frame count and azimuth coverage move back toward the full-orbit regime, the qualitative reconstruction predictably trends back toward the historical torus symptom seen in the broader 360-degree runs.
+
 ---
 
 ## 2026-02-27 Baseline Renderer Diagnosis (claude-opus-4-6)

@@ -1931,7 +1931,22 @@ def select_diverse_frames(cameras, num_frames, seed=42):
     return indices
 
 
-def select_frame_indices(cameras, num_frames, seed=42, mode="diverse"):
+def select_frame_indices(cameras, num_frames, seed=42, mode="diverse", explicit_indices=None):
+    if explicit_indices is not None:
+        n = len(cameras)
+        validated = []
+        seen = set()
+        for idx in explicit_indices:
+            idx_int = int(idx)
+            if idx_int < 0 or idx_int >= n:
+                raise ValueError(f"Frame index {idx_int} out of range for {n} cameras")
+            if idx_int in seen:
+                continue
+            validated.append(idx_int)
+            seen.add(idx_int)
+        if not validated:
+            raise ValueError("SONAR_FRAME_INDICES must include at least one valid frame index")
+        return validated
     if mode == "first":
         return list(range(min(num_frames, len(cameras))))
     if mode == "diverse":
@@ -2712,6 +2727,19 @@ def env_choice(name, default, choices):
     return normalized
 
 
+def env_int_list(name):
+    value = os.environ.get(name)
+    if value in (None, ""):
+        return None
+    items = []
+    for chunk in value.split(","):
+        token = chunk.strip()
+        if not token:
+            continue
+        items.append(int(token))
+    return items
+
+
 @dataclass(frozen=True)
 class ElevationStage1Config:
     elevation_aware: bool
@@ -3151,6 +3179,7 @@ VISUALIZER_EQ_RADIUS_PERCENTILE = min(100.0, max(0.0, env_float("SONAR_VIS_EQ_RA
 VISUALIZER_FACE_OFFSET_SCALE = max(1e-4, env_float("SONAR_VIS_FACE_OFFSET_SCALE", 0.04))
 VISUALIZER_NORMAL_STEM_SCALE = max(1e-4, env_float("SONAR_VIS_NORMAL_STEM_SCALE", 0.35))
 SONAR_FRAME_SELECTION = env_choice("SONAR_FRAME_SELECTION", "diverse", {"diverse", "first"})
+SONAR_FRAME_INDICES = env_int_list("SONAR_FRAME_INDICES")
 
 # In learnable-opacity mode, default to auto attenuation gain unless explicitly overridden.
 if (
@@ -3220,6 +3249,8 @@ def main():
     print(f"Scale frozen: {SONAR_FREEZE_SCALE}")
     print(f"Num training frames: {NUM_TRAINING_FRAMES}")
     print(f"Frame selection: {SONAR_FRAME_SELECTION}")
+    if SONAR_FRAME_INDICES is not None:
+        print(f"Explicit frame indices: {SONAR_FRAME_INDICES}")
     print(f"Holdout frames: {SONAR_HOLDOUT_FRAMES}")
     print(f"Curriculum: Stage1={STAGE1_ITERATIONS} (scale), Stage2={STAGE2_ITERATIONS} (surfels), Stage3={STAGE3_ITERATIONS} (joint)")
     if NUM_TRAINING_FRAMES > 1 and (STAGE2_ITERATIONS + STAGE3_ITERATIONS) < NUM_TRAINING_FRAMES:
@@ -3383,6 +3414,7 @@ def main():
         NUM_TRAINING_FRAMES,
         seed=SEED,
         mode=SONAR_FRAME_SELECTION,
+        explicit_indices=SONAR_FRAME_INDICES,
     )
     training_frames = [train_cameras[i] for i in frame_indices]
 
@@ -3405,6 +3437,7 @@ def main():
                 holdout_count,
                 seed=SEED + 1000,
                 mode=SONAR_FRAME_SELECTION,
+                explicit_indices=None,
             )
             holdout_indices = [remaining_indices[idx] for idx in holdout_rel_indices]
             holdout_frames = [train_cameras[idx] for idx in holdout_indices]
