@@ -18,6 +18,16 @@ where $m_i$ is the signed margin to the nearest FOV boundary and $r_i = \max(s_{
 
 Empirically, this new visualizer produced the first cube-dataset result that was qualitatively interpretable: in `output/debug_multiframe_synth_c_first6/`, six contiguous frames viewing the same cube face yielded a readable straight surfel band aligned with that face. The orientation field remains noisy, but the artifact is now good enough to reveal that many surfels face toward the observing sonar poses rather than away, which was previously impossible to assess reliably from the old exports.
 
+Separately, the rasterizer backend now needs its additive accumulation path to be treated as part of the scientific contract rather than as an untracked local patch. The active sonar renderer already invokes the rasterizer with `additive_mode=True`, so preserving that backend source change in submodule history is necessary for reproducible behavior. In that mode, color accumulation uses
+$$
+w_i = \alpha_i
+$$
+instead of
+$$
+w_i = \alpha_i T_i,
+$$
+which intentionally removes front-to-back transmittance attenuation for the sonar-specific accumulation path.
+
 ## 2026-03-10 Renderer Stability Addendum
 The active renderer-baseline remediation now includes a stability patch to the sonar accumulation path. The practical issue was not just incorrect visibility semantics but broken optimization plumbing: intermediate event volumes in `render_sonar` were being materialized through non-differentiable write patterns, so the photometric objective could become disconnected from surfel parameters during synthetic gate replays.
 

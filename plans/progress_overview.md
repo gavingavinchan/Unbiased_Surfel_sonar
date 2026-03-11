@@ -8,6 +8,7 @@
 - First meaningful cube sanity check landed in `output/debug_multiframe_synth_c_first6/`: frames `sonar_000000`..`sonar_000005` all observe the same cube face, and the visualizer shows a readable straight surfel band at that face instead of an incoherent cloud.
 - Qualitative status: surfel orientations are still noisy/randomized, but the visualizer now makes it obvious that many surfels face toward the observing sonar poses rather than away; this is the first cube-dataset visualization that is remotely interpretable for manual diagnosis.
 - Follow-up temporary probe `output/debug_multiframe_synth_c_10frames_90deg/` (10 frames spanning about 90 degrees of the 500-frame orbit) falls back to the familiar torus symptom, which matches expectations because only visualization/export and temporary frame selection changed; no surfel-learning logic was altered.
+- Formalized the previously dirty `diff-surfel-rasterization` backend patch by preserving its `additive_mode` source changes in submodule history; this matters because the active sonar renderer path in `gaussian_renderer/__init__.py` already depends on additive accumulation semantics.
 
 ## 2026-03-10 Renderer WIP Update
 - Replayed the renderer-fix synthetic sphere gate and confirmed the active v2 path was still broken before the latest patch: `C4-S1` failed with NaN diagnostics and a no-grad backward crash.
