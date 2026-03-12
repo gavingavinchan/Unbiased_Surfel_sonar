@@ -1148,3 +1148,61 @@ This section records the diagnosis and proposed approach in the Chunk-4 plan for
 3. **Re-baseline checklist required before post-fix gate claims**
    - Define a minimal rerun checklist for Chunk-4 synthetic evidence (`C4-S1`..`C4-S4`) plus baseline deltas and artifact verdict panel updates.
    - Keep this as planning-only for now; do not regenerate datasets or rerun synthetic gates in this step.
+
+## 2026-03-11 Manual Cube Orbit Probes Addendum
+
+Focused qualitative probes were run on `synthetic_cube_C_clean` using explicit orbit-index subsets rather than the default evenly spaced frame picker.
+
+### Probe C: 2 frames, 90 degrees apart
+
+- Run directory: `output/cube_2frames_90deg/`
+- Index math: `500 * 90 / 360 = 125`, so the explicit pair was `0,125`
+- Selected frames: `sonar_000000`, `sonar_000125`
+- Manual visual verdict:
+  - reconstruction forms two distinct surfel lines
+  - the two lines are visually 90 degrees apart, matching the two selected viewpoints
+
+### Probe D: 4 cardinal frames
+
+- Run directory: `output/cube_4frames_cardinal/`
+- Explicit indices: `0,125,250,375` for `0/90/180/270` degrees
+- Selected frames: `sonar_000000`, `sonar_000125`, `sonar_000250`, `sonar_000375`
+- Manual visual verdict:
+  - reconstruction forms four surfel lines
+  - the four lines line up with the four cube faces
+  - nothing catastrophically bad is visible in this probe
+
+### Probe E: 8 frames, cardinals plus corners
+
+- Run directory: `output/cube_8frames_cardinal_corners/`
+- Index math: `500 * 45 / 360 = 62.5`, so the nearest-integer corner offsets were paired with the cardinals as `0,62,125,188,250,312,375,438`
+- Selected frames: `sonar_000000`, `sonar_000062`, `sonar_000125`, `sonar_000188`, `sonar_000250`, `sonar_000312`, `sonar_000375`, `sonar_000438`
+- Runtime status:
+  - completed successfully
+  - final train metrics from `run.log`: `loss_mean=0.001996`, `ssim_mean=0.9898`
+  - support summary: `mean=6.849`, `median=7.000`
+  - usable mesh artifact: `output/cube_8frames_cardinal_corners/mesh_poisson_after_stage3.ply`
+  - TSDF-style `mesh_after_stage3.ply` remained empty, consistent with the smaller-view-count probes
+- Manual visual verdict:
+  - surfel positions surprisingly organize into four line structures that trace the square silhouette implied by the cube faces rather than obviously failing
+  - this was better than expected from the 8-view setup
+  - surfel orientations remain messy; the only stable qualitative read is that some outer surfaces still point somewhat toward the scene while inner surfaces tend to point away, but the normals are too noisy to claim more than that
+  - `scale_and_loss.png` still appears to be descending at the end of the run rather than clearly flattening, so a longer follow-up run is warranted
+
+### Probe F: 8 frames, longer rerun
+
+- Run directory: `output/cube_8frames_cardinal_corners_longer/`
+- Same explicit indices as Probe E: `0,62,125,188,250,312,375,438`
+- Training budget change: `SONAR_STAGE2_ITERS=3000` (from `1000`), with checkpoint save enabled
+- Runtime status:
+  - completed successfully
+  - final train metrics from `run.log`: `loss_mean=0.001095`, `ssim_mean=0.9945`
+  - support summary: `mean=6.790`, `median=7.000`
+  - final surfel count: `1584`
+  - usable mesh artifact: `output/cube_8frames_cardinal_corners_longer/mesh_poisson_after_stage3.ply`
+  - saved continuation checkpoint: `output/cube_8frames_cardinal_corners_longer/final_ckpt.pth`
+  - TSDF-style `mesh_after_stage3.ply` remained empty again
+- Manual visual verdict:
+  - rendered sonar images are clearly improved over the shorter 8-frame run; several views look nearly perfect, while others still show localized artifacts
+  - surfel orientations remain poor overall and are still not visually trustworthy
+  - surfel positions are slightly skewed: the footprint reads more like a rhombus than a square, but the geometry is still not catastrophically wrong

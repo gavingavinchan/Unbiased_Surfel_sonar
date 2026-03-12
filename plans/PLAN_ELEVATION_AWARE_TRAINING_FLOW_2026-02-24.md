@@ -6,6 +6,7 @@
 - Base decision ledger: `plans/PLAN_ELEVATION_AWARE_TRAINING_2026-01-28.md`
 - Contract-level source of truth: `plans/PLAN_ELEVATION_AWARE_TRAINING_detailed_2026-02-01.md`
 - Chunk execution/governance: `plans/PLAN_ELEVATION_AWARE_IMPLEMENTATION_EXECUTION_2026-02-10.md`
+- Renderer remediation tranche: `plans/PLAN_MISSING_OCCLUSION_AND_RENDERER_FIX_2026-03-02.md`
 
 ---
 
@@ -78,8 +79,9 @@ Stage intent:
 1. Stage 0: elevation-aware initialization.
 2. Stage 1: GT-anchored bin likelihood + entropy/temperature shaping.
 3. Stage 1 coupling/support: force posterior belief to move surfel geometry and enforce multi-view support retention.
-4. Stage 2 (optional): densify along arc peaks for persistent high-error areas.
-5. Late refinements: normals path ramp once posterior confidence is sufficient.
+4. Renderer-baseline remediation and post-v2 re-baselining before late refinements are interpreted.
+5. Stage 2 (optional): densify along arc peaks for persistent high-error areas.
+6. Late refinements: normals path ramp once posterior confidence is sufficient.
 
 ```mermaid
 flowchart TD
@@ -87,10 +89,11 @@ flowchart TD
     S1[Stage 1\nBin likelihood + posterior]
     C[Mandatory coupling\nExpected points -> surfels]
     R[Support retention\nID-keyed multi-view policy]
+    V2[Renderer remediation\nBaseline correction + rebaseline]
     S2[Stage 2 optional\nArc-guided densification]
     N[Late normals refinement\nExpected-elevation normals path]
 
-    S0 --> S1 --> C --> R --> S2 --> N
+    S0 --> S1 --> C --> R --> V2 --> S2 --> N
 ```
 
 ---
@@ -183,6 +186,23 @@ Reference: `plans/PLAN_ELEVATION_AWARE_CHUNK4_EXECUTION_2026-02-23.md`
 
 ---
 
+## Renderer remediation / rebaseline (post-Chunk-4, pre-Chunk-5)
+
+**Focus**
+- Normal-init ingestion, gradient-safe Lambertian transfer, ray-binned occlusion, renderer-v2 footprint modes, densification-signal wiring, and post-v2 synthetic re-baselining.
+
+**Why this sits here**
+- Chunk-4 investigation showed renderer-level defects were upstream of both Stage-1 evidence quality and Chunk-4 coupling/support behavior.
+- Therefore this tranche is a prerequisite gate before late Chunk-5 normals work is interpreted.
+
+**Current posture**
+- Implemented in code, but active-path validation / synthetic re-baseline posture is still open.
+- Pre-v2 Chunk-4 evidence is historical when compared against renderer-v2 runs.
+
+Reference: `plans/PLAN_MISSING_OCCLUSION_AND_RENDERER_FIX_2026-03-02.md`
+
+---
+
 ## Chunk 5: Late-stage refinements
 
 **Focus (planned)**
@@ -190,7 +210,7 @@ Reference: `plans/PLAN_ELEVATION_AWARE_CHUNK4_EXECUTION_2026-02-23.md`
 - Optional densification hooks (off by default until stable).
 
 **Readiness dependency**
-- Should start only after Chunk-3 parity gap and Chunk-4 blocker posture are resolved or explicitly waived.
+- Should start only after Chunk-3 parity gap, renderer-remediation gate, and post-v2 Chunk-4 blocker posture are resolved or explicitly waived.
 
 **Status**
 - Pending.
@@ -383,11 +403,14 @@ timeline
                : Pin coordinate/sign/transform contract
     2026-02-09 : Move frame filtering to dataset-prep scope
     2026-02-10 : Lock v1 overlap score/gating/invalid mode/sigma/stage boundaries/default groups
-               : Lock frame_stats lifecycle and new-surfel grace
-               : Keep ID tensor compaction disabled in v1
-               : Add testruns experiment ledger policy
-               : Publish option-status map
+                : Lock frame_stats lifecycle and new-surfel grace
+                : Keep ID tensor compaction disabled in v1
+                : Add testruns experiment ledger policy
+                : Publish option-status map
     2026-02-16 : Add synthetic Dataset-C validation track
+    2026-03-02 : Insert renderer-baseline remediation between Chunk 4 and Chunk 5
+               : Define v2 renderer contracts for normal init, transfer, occlusion, and footprint modes
+    2026-03-10 : Record active-path v2 validation failure and require post-v2 re-baseline before Chunk 5
 ```
 
 ### 2026-02-06 updates
@@ -482,6 +505,7 @@ Status carried from execution/chunk records:
 - Chunk 2: implemented and validated.
 - Chunk 3: partially implemented (infrastructure landed; full Stage-1 evidence-path parity open).
 - Chunk 4: implemented and closeout-tested, but currently NO-GO due to blockers.
+- Renderer remediation: implemented in code after Chunk-4 investigation, but active-path validation and synthetic re-baselining remain open.
 - Chunk 5: pending.
 
 ```mermaid
@@ -490,20 +514,22 @@ flowchart TD
     C2[Chunk 2: PASS]
     C3[Chunk 3: OPEN parity gap]
     C4[Chunk 4: NO-GO blockers]
+    RV2[Renderer v2: OPEN rebaseline]
     C5[Chunk 5: PENDING]
 
-    C1 --> C2 --> C3 --> C4 --> C5
+    C1 --> C2 --> C3 --> C4 --> RV2 --> C5
 ```
 
 ---
 
 ## Immediate next actions (flow-ordered)
 
-1. Close Chunk-3 Stage-1 likelihood parity gap to detailed contract path.
-2. Re-run Chunk-4 gates against corrected Stage-1 evidence assembly.
-3. Re-assess Dataset-C blocker with consistent comparator hygiene.
-4. Record explicit GO/NO-GO decision with blocker resolution or approved waiver rationale.
-5. Start Chunk 5 only after core evidence-to-geometry path is validated.
+1. Close or explicitly bracket the Chunk-3 Stage-1 likelihood parity gap against the detailed contract path.
+2. Complete renderer-v2 active-path validation and post-v2 synthetic re-baseline.
+3. Re-run Chunk-4 gates against the corrected Stage-1 path under matching renderer-v2 fingerprints.
+4. Re-assess Dataset-C blocker with consistent comparator hygiene.
+5. Record explicit GO/NO-GO decision with blocker resolution or approved waiver rationale.
+6. Start Chunk 5 only after core evidence-to-geometry and renderer-baseline posture are validated.
 
 ---
 
@@ -543,6 +569,7 @@ Chunk evidence records:
 - `plans/PLAN_ELEVATION_AWARE_CHUNK2_EXECUTION_2026-02-11.md`
 - `plans/PLAN_ELEVATION_AWARE_CHUNK3_EXECUTION_2026-02-16.md`
 - `plans/PLAN_ELEVATION_AWARE_CHUNK4_EXECUTION_2026-02-23.md`
+- `plans/PLAN_MISSING_OCCLUSION_AND_RENDERER_FIX_2026-03-02.md`
 
 ---
 

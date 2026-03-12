@@ -49,6 +49,27 @@ for rendered return, range numerator, and support accumulators, so NaN/Inf value
 
 Empirically, this restores finite training losses and successful smoke-scale synthetic runs for both sphere and cube datasets. However, the visual reconstruction quality has not yet shown a corresponding qualitative jump, so the renderer work remains scientifically incomplete despite the improved stability.
 
+## 2026-03-12 Renderer-Semantics Interpretation Addendum
+
+The scientific interpretation of recent synthetic runs now depends on an explicit renderer-semantic fingerprint. A post-v2 result is comparable to another run only when transfer mode, occlusion semantics, and footprint mode all match.
+
+For active renderer-v2 runs, the forward model should be interpreted as:
+
+1. Normal-based return strength with explicit transfer mode,
+$$
+q_i = \rho_i \cdot \tau(\mathbf{n}_i, \mathbf{d}_i) \cdot a(r_i),
+$$
+where $\rho_i$ is fixed-opacity return strength, $\tau$ is the configured Lambertian transfer law, and $a(r_i)$ is range attenuation.
+
+2. Ray-binned acoustic occlusion resolved before elevation marginalization,
+$$
+R[a,e,r] = \sum_{i \in \mathcal{E}(a,e)} T_i \, q_i \, \delta(r-r_i),
+\qquad
+I[a,r] = \sum_e w_e \, R[a,e,r].
+$$
+
+This means pre-v2 additive no-occlusion results and post-v2 ray-binned results are not part of the same metric-comparison family. They may still be discussed historically, but they should not be used as direct quantitative comparators once the renderer fingerprint changes.
+
 ## 1. Problem Setting
 The base system renders surfels via a pinhole camera model. Sonar imaging instead measures intensity as a function of azimuth and range with a narrow elevation beam. This introduces two core challenges: the geometry is polar rather than pinhole, and COLMAP camera poses are up-to-scale while sonar ranges are metric.
 

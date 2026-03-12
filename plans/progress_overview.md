@@ -1,5 +1,10 @@
 # Progress Overview (Post-Fork, Multi-Branch)
 
+## 2026-03-12 Evidence Split Note
+- Renderer remediation now sits between Chunk 4 and Chunk 5 in the planning hierarchy.
+- Treat pre-v2 Chunk-4 evidence as historical when comparing against runs that use renderer-v2 semantics.
+- Current posture is mixed: renderer remediation is implemented in code, but post-v2 active-path validation and synthetic re-baselining are still open, so Chunk 5 is not yet on a clean baseline.
+
 ## 2026-03-11 Sonar Visualizer Checkpoint
 - Added Blender-first offline visualizer exports for `debug_multiframe.py`: stage-aligned surfel-state PLYs, deterministic sampled surfel glyphs, per-frame near/full-range wireframes, per-frame rendered sonar PNGs, and a narrow `visualizer/manifest.json` index.
 - Fixed an important geometry bug in the initial visualizer pass: near and full-range wireframes now share the same sonar-angle envelope instead of mixing a rectangular forward-depth pyramid with a constant-range FOV shell.
@@ -16,6 +21,7 @@
 - Focused renderer contracts now pass again (`RB-T05`, `RB-T08`, `RB-T16`, `RB-T20`, `RB-T21`) and the runtime smoke contracts (`RB-T11`, `RB-T12`) pass under `SONAR_RENDER_MODE=2dgs`, `SONAR_OCCLUSION_MODE=ray_binned`, `SONAR_LAMBERTIAN_MODE=leaky`.
 - Synthetic smoke reruns now complete for both `synthetic_sphere_A_clean` and `synthetic_cube_C_clean` at `50` frames / `100` stage-2 iterations, with finite final-eval losses and produced surfel outputs.
 - Visual quality is still not materially improved relative to the last manual review, so this commit should be treated as renderer-stability WIP rather than a completed renderer-baseline closure.
+- Planning consequence: the current branch evidence should be read as post-v2-stability WIP, not as a completed post-v2 Chunk-4 re-gate.
 
 ## Current Architecture (Sonar Extensions)
 ```mermaid

@@ -17,11 +17,13 @@ To keep future sessions consistent and avoid plan drift:
 
 ---
 
-## Implementation Conformance Note (2026-02-23)
+## Implementation Conformance Note (2026-02-23; updated 2026-03-12)
 
 - This document remains the contract-level source of truth for Stage 0/1/2 behavior and acceptance criteria.
 - Current codebase status: Chunk 1 and Chunk 2 work is implemented; Chunk 3 runtime infrastructure and tests are implemented.
 - Known parity gap: the current Stage-1 training-loop likelihood path is still an interim per-frame surrogate and does not yet fully match this document's overlap-neighbor `back_project_bins` multi-view evidence contract.
+- Renderer-baseline remediation was introduced after Chunk-4 investigation and before Chunk 5. Its contracts now sit inside this document because Chunk-5 normals/densification work is not meaningful unless the renderer baseline is corrected and re-gated.
+- Treat pre-v2 renderer evidence as historical-only when comparing against runs that use the renderer-v2 semantics contract.
 - This is a status-only note; intended algorithmic scope and validation intent are unchanged.
 
 ---
@@ -40,9 +42,11 @@ Implement elevation-aware sonar training in `debug_multiframe.py` with concrete 
 ## Scope (Files to Change)
 
 - `debug_multiframe.py` (primary integration, staged losses, schedule, logging)
+- `scene/gaussian_model.py` (normal-based quaternion initialization contract)
 - `utils/sonar_utils.py` (elevation-aware back-projection utilities)
 - `utils/point_utils.py` (optional elevation path for range->points used by normals)
 - `gaussian_renderer/__init__.py` (point projection helper, distance attenuation in sonar intensity)
+- `submodules/diff-surfel-rasterization/*` (renderer-v2 footprint path when rasterizer changes are needed)
 - `arguments/__init__.py` (optional defaults for new elevation/physics flags)
 
 ---
@@ -107,18 +111,23 @@ Output contract:
    - Start implicit (Option D): do not build a global pixel-pixel correspondence structure.
    - If needed, add surfel-anchored explicit correspondence as a fallback.
 4. **Sonar physics for current implementation**
-   - Fixed opacity by default for sonar (`opacity=1.0`, learnable toggle optional).
-   - Add stabilized distance attenuation in `render_sonar`:
-     `intensity *= gain / (max(range, r0)^p + eps)`.
-   - Default for raw sonar data: attenuation enabled, `p=2.0`, near-range floor `r0=0.35`.
-5. **Dataset assumption (recorded)**
-   - Sonar images used for this work are raw amplitudes (no onboard range/gain compensation in the saved data).
-   - Therefore range attenuation remains enabled by default; ablation can disable it only for diagnostics.
-6. **ROV mount extrinsic constants (recorded)**
+    - Fixed opacity by default for sonar (`opacity=1.0`, learnable toggle optional).
+    - Add stabilized distance attenuation in `render_sonar`:
+      `intensity *= gain / (max(range, r0)^p + eps)`.
+    - Default for raw sonar data: attenuation enabled, `p=2.0`, near-range floor `r0=0.35`.
+5. **Renderer baseline v2 prerequisite**
+   - Renderer remediation is interposed between Chunk 4 and Chunk 5. Chunk 5 is a late refinement stage, not a substitute for renderer correction.
+   - Normal initialization must consume provided `pcd.normals` when available; random quaternion initialization is no longer the active baseline contract.
+   - Active renderer semantics use explicit transfer/occlusion/render-mode contracts rather than legacy bilinear additive scatter semantics.
+   - Synthetic comparisons across runs are valid only when renderer semantic fingerprints match.
+6. **Dataset assumption (recorded)**
+    - Sonar images used for this work are raw amplitudes (no onboard range/gain compensation in the saved data).
+    - Therefore range attenuation remains enabled by default; ablation can disable it only for diagnostics.
+7. **ROV mount extrinsic constants (recorded)**
    - Sonar is mounted `8 cm` behind camera, `10 cm` above camera, with `5 deg` downward pitch.
    - Canonical camera-frame translation for implementation: `[0.0, -0.10, -0.08]` (meters), with `+5 deg` pitch about camera X.
    - These constants are treated as fixed defaults for elevation-aware training and must be consistent across docs + code paths.
-7. **Coordinate convention contract (resolved)**
+8. **Coordinate convention contract (resolved)**
    - Camera/view frame used for core projection math: `+X right, +Y down, +Z forward`.
    - Sonar image convention: columns encode azimuth (`left=+`, `right=-`), rows encode range (`top=near`, `bottom=far`).
    - If sonar-frame symbols are used (`+X forward, +Y right, +Z down`), conversion to camera/view frame must be explicit and isolated.
@@ -162,6 +171,54 @@ Output contract:
   - late normals regime: `iter > ELEV_NORMAL_RAMP_END_ITER` with `w_normal=ELEV_NORMAL_WEIGHT_LATE`.
 - Expected-elevation normals path activates at `iter >= ELEV_NORMAL_ELEV_START_ITER` (default aligns with ramp start).
 - v1 transition policy is fixed-iteration only; hybrid metric+iteration gates are deferred to a later revision.
+- Chunk-5 late normals and optional densification remain gated on a post-v2 renderer remediation pass and post-v2 Chunk-4 re-gating.
+
+---
+
+## Renderer Baseline Contract v2 (2026-03-12)
+
+This addendum records the renderer contracts introduced after the Chunk-4 investigation. It does not renumber the elevation chunks; it inserts a prerequisite renderer-remediation gate before Chunk 5 is treated as actionable.
+
+### 1) Normal initialization contract
+
+- `GaussianModel.create_from_pcd` must consume `pcd.normals` when valid normals are provided.
+- The active initialization contract is normal-derived quaternion initialization with deterministic fallback for missing/invalid normals.
+- Random quaternion initialization is historical only and must not be treated as the active baseline for post-v2 runs.
+
+### 2) Lambertian transfer contract
+
+- Transfer mode is explicit and fingerprinted via `SONAR_LAMBERTIAN_MODE=leaky|clamp0|elu|ste`.
+- Active runs default to `leaky` unless a documented ablation overrides it.
+- `leaky` is an optimization-safety mechanism, not a standalone physics model; active deployment of leaky transfer requires acoustic occlusion to be enabled under the renderer-v2 contract.
+
+### 3) Acoustic occlusion contract
+
+- Occlusion is evaluated per `(azimuth_bin, elevation_bin)` ray in increasing sonar range order.
+- Only events on the same `(azimuth_bin, elevation_bin)` ray may occlude each other.
+- Elevation is marginalized only after per-ray occlusion is resolved.
+- Multi-bin footprint participation is required; center-bin-only ownership is rejected for active v2 semantics.
+
+### 4) Footprint / render-mode contract
+
+- Supported sonar render modes are `SONAR_RENDER_MODE=2dgs|2dgs_nonlinear`.
+- `2dgs` is the Jacobian-based 2D Gaussian footprint path.
+- `2dgs_nonlinear` is the sigma-point footprint path used to test projection-curvature fidelity.
+- `SONAR_RENDER_MODE=legacy` is historical-only and not part of the active contract.
+
+### 5) Compatibility / comparator policy
+
+- Compatibility parity no longer means matching pre-v2 bilinear scatter outputs.
+- The frozen compatibility reference is the v2 off-mode tuple:
+  - `SONAR_RENDER_MODE=2dgs`
+  - `SONAR_OCCLUSION_MODE=none`
+  - `SONAR_LAMBERTIAN_MODE=clamp0`
+- Cross-run metric deltas are valid only when renderer semantic fingerprints match.
+- Required renderer fingerprint fields for gate summaries are carried by the synthetic guide and include renderer semantics version, contract hash or commit, render mode, occlusion mode, transfer mode, and related support-cap / sigma-point metadata where applicable.
+
+### 6) Chunk dependency note
+
+- Chunk 3 parity closure and post-v2 Chunk-4 re-gating remain prerequisites to meaningful Chunk-5 evaluation.
+- Chunk 5 is expected to improve already-plausible normals via late expected-elevation supervision; it is not expected to rescue a broken renderer baseline.
 
 ---
 
@@ -810,6 +867,18 @@ e_exp = (probs * elev_bins[None, :]).sum(dim=-1)  # [P]
 - `ELEV_SURFEL_ID_ASSERTS=1`
 - `ELEV_DENSIFY=0`, `ELEV_DENSIFY_INTERVAL=1500`
 - `SONAR_FIXED_OPACITY=1`
+- `SONAR_RENDER_MODE=2dgs|2dgs_nonlinear`
+- `SONAR_OCCLUSION_MODE=ray_binned|none`
+- `SONAR_LAMBERTIAN_MODE=leaky|clamp0|elu|ste`
+- `SONAR_ELEV_BINS`
+- `SONAR_ELEV_WEIGHT_MODE=uniform|beam_pattern`
+- `SONAR_OCCL_KSIGMA=2.5`
+- `SONAR_OCCL_WEIGHT_FLOOR_REL=1e-3`
+- `SONAR_OCCL_TOPK=16`
+- `SONAR_SIGMA_KAPPA=0`
+- `SONAR_SIGMA_ALPHA=1.0`
+- `SONAR_SIGMA_BETA=2.0`
+- `SONAR_SURFEL_STATS_EVERY=50`
 - `SONAR_USE_RANGE_ATTEN=1`
 - `SONAR_RANGE_ATTEN_EXP=2.0`
 - `SONAR_RANGE_ATTEN_GAIN=1.0`  # effective manual gain; initialization seed in auto-gain mode
@@ -824,8 +893,13 @@ e_exp = (probs * elev_bins[None, :]).sum(dim=-1)  # [P]
 
  - `loss_lik`, `loss_entropy`, `loss_couple`, temperature
  - contributing-frame counts (`n_lik_frames`, `n_ent_frames`, `n_couple_frames`) and normalized-vs-raw term values
- - per-frame likelihood normalization stats (`p10`, `p99`, reliability)
- - invalid-projection rate in likelihood accumulation
+  - per-frame likelihood normalization stats (`p10`, `p99`, reliability)
+  - invalid-projection rate in likelihood accumulation
+  - renderer semantic fingerprint (`SONAR_RENDER_MODE`, `SONAR_OCCLUSION_MODE`, `SONAR_LAMBERTIAN_MODE`)
+  - dead-zone / leaky-transfer occupancy diagnostics for wrong-facing surfels
+  - surfel size/support telemetry in world space and image space
+  - occlusion support-cap mass-loss summary when `ray_binned` occlusion is active
+  - sigma-point fallback fraction and boundary diagnostics when `2dgs_nonlinear` is active
  - elevation-bin entropy stats and argmax histogram
  - expected-point to surfel residual stats (mean/p95)
 - per-surfel support count stats (raw + EMA) and prune counts
@@ -916,6 +990,8 @@ v1 policy:
 - **Likelihood collapse:** clamp intensities, add entropy term, use temperature schedule.
 - **Cross-frame gain drift:** use percentile normalization and frame reliability weighting.
 - **Near/far imbalance from attenuation:** use near-range floor `r0`, tune `p`/gain via controlled ablation, monitor saturation diagnostics.
+- **Renderer autograd breakage / numeric instability:** require renderer-v2 smoke tests and finite-output guards before treating post-v2 synthetic evidence as current.
+- **Renderer semantic drift across runs:** compare only when renderer fingerprints match; otherwise record results as separate baseline groups.
 - **Bad associations in coupling:** use projection/depth gates, robust loss, and delayed weight ramp.
 - **Over-pruning true geometry:** warmup first, enforce viewpoint diversity, use EMA+hysteresis before pruning.
 - **Support-state misalignment after topology edits:** use persistent surfel IDs with post-mutation `id_to_row` rebuild + ID integrity asserts.
@@ -933,8 +1009,9 @@ v1 policy:
 4. Integrate Stage 1 likelihood bins + annealing.
 5. Integrate belief-to-geometry coupling loss (expected-point to surfel).
 6. Add multi-view support tracking and retention/pruning schedule.
-7. Add staged normals update path.
-8. Enable optional Stage 2 densification.
+7. Remediate renderer baseline v2 and re-baseline synthetic gates before late refinements are interpreted.
+8. Add staged normals update path.
+9. Enable optional Stage 2 densification.
 
 ---
 

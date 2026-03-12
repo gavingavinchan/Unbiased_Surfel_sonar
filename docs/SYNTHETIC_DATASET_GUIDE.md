@@ -194,6 +194,39 @@ Dataset C default pass thresholds:
 - p95 surface error <= 0.10 m
 - center error <= 0.03 m
 
+## Renderer Semantic Fingerprint Policy (v2)
+
+Once renderer-v2 semantics are introduced for a run, pre-v2 synthetic gate claims become historical-only for cross-run comparison.
+
+For every synthetic gate summary used in Chunk 4 / renderer-remediation / Chunk 5 decisions, record at minimum:
+
+- `renderer_semantics_version`
+- `render_sonar_contract_hash` (or equivalent commit SHA)
+- `normal_init_mode`
+- `lambertian_transfer`
+- `sonar_render_mode`
+- `sonar_occlusion_mode`
+- `occlusion_space` (active runs must report `ray_binned`)
+- `occlusion_footprint_policy`
+- `occlusion_support_cap_config`
+- `occlusion_support_cap_mass_loss`
+- `compat_reference_id` for frozen v2 off-mode comparisons
+- `surfel_size_stats_schema_version`
+- `elevation_bin_count`, `elevation_bin_policy`, `elevation_weight_mode`
+- `sigma_point_config` and `sigma_point_fallback_fraction` when `sonar_render_mode=2dgs_nonlinear`
+
+Comparator rule:
+
+- Cross-run deltas are valid only when renderer semantic fingerprints match.
+- The frozen v2 compatibility reference uses:
+  - `SONAR_RENDER_MODE=2dgs`
+  - `SONAR_OCCLUSION_MODE=none`
+  - `SONAR_LAMBERTIAN_MODE=clamp0`
+
+Current governance note:
+
+- Renderer remediation was implemented after Chunk-4 investigation, but post-v2 active-path validation / synthetic re-baselining remains a separate gate before Chunk 5 is interpreted as current.
+
 ## Implementation Notes
 
 - **Sonar image channel contract**: synthetic sonar PNGs are saved as 3-channel grayscale RGB. This avoids SSIM channel mismatch in the existing training path that expects 3 channels.

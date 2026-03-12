@@ -1,7 +1,7 @@
 # Plan: Elevation-Aware Training Implementation Execution
 
 **Date:** 2026-02-10  
-**Status:** Chunk 1/2 implemented; Chunk 3 partially implemented (infrastructure complete, core likelihood contract parity pending); Chunk 4/5 pending with synthetic-gated validation updates  
+**Status:** Chunk 1/2 implemented; Chunk 3 partially implemented (infrastructure complete, core likelihood contract parity pending); Chunk 4 implemented but blocked; renderer remediation interposed before Chunk 5; Chunk 5 pending on post-v2 re-gating  
 **Owner:** OpenCode (gpt-5.3-codex)
 
 ---
@@ -31,13 +31,16 @@ Terminology/intent lock across subsidiary plans:
 
 Do **not** implement everything in one pass. Implement in risk-ordered chunks with validation gates between chunks.
 
-### Current implementation state (2026-02-23)
+### Current implementation state (2026-03-12)
 
 - Chunk 1 is implemented and validated.
 - Chunk 2 is implemented and validated.
 - Chunk 3 is partially implemented: Stage-1 infrastructure (mode gating, frame-keyed pixel-logit state, checkpoint schema/fingerprint handling, refresh/remap plumbing, helper tests) is in code.
 - Chunk 3 core contract parity remains open: overlap-neighbor multi-view likelihood assembly via `back_project_bins` + projection-validity evidence in the training loop is not fully integrated yet.
-- Chunk 4 and Chunk 5 remain pending.
+- Chunk 4 was implemented and extensively probed, but its gate posture remained blocked on synthetic cube behavior and unresolved closeout issues.
+- After Chunk-4 investigation, renderer remediation was introduced as an explicit prerequisite tranche before Chunk 5.
+- Renderer remediation is implemented in code, but post-v2 active-path validation and synthetic re-baselining are still open; treat pre-v2 Chunk-4 metrics as historical when renderer semantics differ.
+- Chunk 5 remains pending and should be evaluated only against post-v2 post-Chunk-4 evidence.
 - Dataset-C synthetic results indicate a likely Chunk-2 quality ceiling for cube-like shape recovery, so future chunks must include explicit synthetic dataset validation in their gates.
 - Recorded qualitative baseline artifact (exp3): `output/debug_multiframe_synth_c_exp3/input.ply` is cube-like, while `output/debug_multiframe_synth_c_exp3/surfels_after_training.ply` shows FOV-bounded torus-like streaking aligned with the revolution axis.
 
@@ -116,6 +119,18 @@ Goal:
 - Ensure improved elevation belief actually moves geometry and improves surfel retention quality.
 - Specifically target geometry-smearing failure modes seen in synthetic cube-style reconstructions.
 
+### Renderer remediation gate: baseline correction + re-baseline (post-Chunk-4, pre-Chunk-5)
+
+Scope:
+
+- Renderer-baseline fixes introduced after Chunk-4 investigation: normal-init ingestion, Lambertian transfer safety, ray-binned acoustic occlusion, v2 footprint modes, densification-signal wiring, and related consistency cleanup.
+- Synthetic re-baseline and comparator reset under renderer-v2 semantic fingerprints.
+
+Goal:
+
+- Re-establish a trustworthy renderer baseline before interpreting late normals refinement or optional densification behavior.
+- Prevent Chunk-5 evaluation from inheriting pre-v2 renderer defects or incomparable synthetic baselines.
+
 ### Chunk 5: Late-stage refinements
 
 Scope:
@@ -136,13 +151,15 @@ Each chunk must pass its gate before moving to the next chunk.
 
 ### Synthetic validation policy for remaining chunks
 
-- For Chunk 3/4/5 gates, synthetic dataset validation is mandatory in addition to legacy real-data checks.
+- For Chunk 3/4/5 gates and the interposed renderer-remediation gate, synthetic dataset validation is mandatory in addition to legacy real-data checks.
 - Do not hardcode synthetic dataset names in this plan; use the active inventory and commands documented in `docs/SYNTHETIC_DATASET_GUIDE.md`.
+- Once renderer-v2 semantics are introduced, pre-v2 synthetic gate claims become historical-only for cross-run comparison purposes.
+- Cross-run metric deltas are valid only when renderer semantic fingerprints match.
 - For every synthetic run used in a gate, record:
   - command/config,
   - output artifact paths,
   - evaluator metrics,
-  - delta versus the most recent known baseline.
+  - delta versus the most recent matching baseline (including renderer-semantic match).
 - Default material-regression rule for Chunk 3/4/5 synthetic gates:
   - any relative degradation greater than `10%` versus the active baseline in key evaluator error metrics (`mean_*_error_m`, `p95_*_error_m`, `center_error_m`) is treated as material.
   - material regression blocks progression unless an explicit written waiver (with rationale) is approved for the chunk.
@@ -182,13 +199,22 @@ Each chunk must pass its gate before moving to the next chunk.
 - Synthetic geometry artifacts associated with Chunk-2 limitations (streaking/toroidal smearing under in-FOV ambiguity) are explicitly reviewed and reported as improved/unchanged/regressed.
 - Quantitative synthetic metrics show directional improvement from Chunk-2 baselines for at least the known-problem shape class, or a documented blocker is recorded before proceeding.
 
+### Renderer remediation gate (mandatory before Chunk 5)
+
+- Renderer contract tests and smoke tests associated with the renderer-v2 tranche pass under the active path.
+- Active renderer path is gradient-connected end-to-end (no `grad_fn` disconnects on synthetic guard runs).
+- Active renderer path produces finite rendered outputs and finite evaluator metrics on the required synthetic smoke/gate reruns.
+- Renderer semantic fingerprints are recorded for all post-v2 comparison runs.
+- Post-v2 synthetic reruns for the required guard/gate set are completed and separated from pre-v2 historical evidence.
+- Chunk-4 blocker posture is re-evaluated under post-v2 evidence before Chunk 5 begins.
+
 ### Gate after Chunk 5
 
 - Normals ramp activates on configured iterations.
 - Expected-elevation normals path does not destabilize training.
 - Optional Stage 2 hook can be toggled on/off safely (off by default).
 - Full synthetic gate rerun(s) from `docs/SYNTHETIC_DATASET_GUIDE.md` pass stability/reproducibility checks used for the synthetic program.
-- Synthetic metric deltas versus post-Chunk-4 baseline are recorded; late refinements must not reintroduce previously mitigated geometric artifacts.
+- Synthetic metric deltas versus the post-v2 post-Chunk-4 baseline are recorded; late refinements must not reintroduce previously mitigated geometric artifacts.
 
 ### Resume gate after every chunk
 
@@ -224,7 +250,8 @@ A chunk is commit-ready only if:
 2. elevation-aware init + fixed-opacity toggle
 3. Stage 1 likelihood/annealing core
 4. coupling + persistent surfel IDs + support/pruning
-5. normals ramp + optional Stage 2 hook
+5. renderer baseline remediation + synthetic re-baseline
+6. normals ramp + optional Stage 2 hook
 
 ### Commit-message format
 
@@ -259,7 +286,7 @@ These tactics define engineering style and rollout behavior for this plan. They 
 - Precompute run-static structures in no-grad mode (`overlap_table`, `frame_stats`) once per run for v1; do not recompute in hot loops unless frame set changes.
 - Make detach boundaries explicit: detached evidence target vs learnable logits prediction; avoid in-place tensor edits on values participating in autograd.
 - Aggregate loss terms exactly once in one block at the end of Stage-1 assembly to prevent accidental double-counting.
-- Add baseline parity checks for off-mode: when elevation-aware features are disabled, outputs should match legacy behavior within tolerance.
+- Add compatibility checks for off-mode against the frozen v2 compatibility reference rather than pre-v2 legacy bilinear outputs.
 - Version checkpoint schema for new state payloads so resume mismatch causes deterministic, explicit failures.
 - Instrument before optimizing runtime: verify correctness/consistency metrics first, then optimize vectorization/caching/memory.
 

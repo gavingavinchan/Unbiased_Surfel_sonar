@@ -1,8 +1,8 @@
 # Plan: Elevation-Aware Training with Back Projection in Loop
 
-**Date/Time:** 2026-01-28 (updated 2026-02-10)
+**Date/Time:** 2026-01-28 (updated 2026-03-12)
 **Git Commit:** 88b210c
-**Status:** Design exploration with decision addenda (implementation in progress via chunk plans; not fully complete)
+**Status:** Design exploration with decision addenda (implementation in progress via chunk plans; renderer remediation interposed after Chunk 4 and before Chunk 5)
 
 ---
 
@@ -17,14 +17,32 @@ To keep future sessions consistent and avoid decision/implementation drift:
 
 ---
 
-## Implementation Status Note (2026-02-23)
+## Implementation Status Note (2026-02-23, updated 2026-03-12)
 
-- Execution is active under chunked delivery plans:
-  - Chunk 1: implemented and validated.
-  - Chunk 2: implemented and validated.
-  - Chunk 3: partially implemented (runtime infrastructure landed; full Stage-1 likelihood contract parity still open).
-  - Chunk 4/5: pending.
-- This base plan remains a decision ledger; implementation contracts and gate details continue to live in the detailed plan and chunk execution plans.
+Execution is active under chunked delivery plans:
+
+| Chunk | Status |
+|-------|--------|
+| Chunk 1 | Implemented and validated |
+| Chunk 2 | Implemented and validated |
+| Chunk 3 | Partially implemented — runtime infrastructure landed; full Stage-1 likelihood contract parity still open |
+| Chunk 4 | Implemented, then blocked — synthetic cube failures traced to renderer defects, not elevation-aware design |
+| Renderer remediation | Interposed between Chunk 4 and Chunk 5; code changes landed, but post-v2 active-path validation and synthetic re-baselining remain open |
+| Chunk 5 | Pending — must be evaluated against the post-v2 renderer baseline, not pre-v2 Chunk-4 results |
+
+This base plan remains a decision ledger; implementation contracts and gate details live in the detailed plan and chunk execution plans.
+
+---
+
+## Renderer Remediation Addendum (2026-03-12)
+
+Chunk-4 investigation revealed that the sonar renderer had fundamental defects that predated all elevation-aware work. These defects contaminated Stage-1 posterior evidence, Chunk-4 coupling outcomes, and all synthetic gate results. See `plans/PLAN_MISSING_OCCLUSION_AND_RENDERER_FIX_2026-03-02.md` for full diagnosis and fix plan.
+
+**Decision**: Renderer remediation is an interposed prerequisite between Chunk 4 and Chunk 5 — not part of Chunk 5 scope. Chunk 5 (late normals refinement, optional densification) proceeds only after the renderer is fixed and synthetic gates are re-baselined.
+
+**Active renderer contract (v2)**: Normal-derived quaternion initialization, leaky Lambertian transfer (gradient-safe), ray-binned acoustic occlusion, and `2dgs`/`2dgs_nonlinear` footprint modes. Legacy bilinear scatter is removed.
+
+**Evidence comparability**: Pre-v2 synthetic gate results are historical only. Cross-run metric comparisons require matching renderer semantic fingerprints.
 
 ---
 
@@ -1326,3 +1344,44 @@ Implementation contract remains the detailed plan file:
   - A validates baseline geometric consistency on smooth curved geometry,
   - C validates non-spherical shape handling and edge/corner behavior.
 - If A passes but C fails, prioritize edge/corner and coupling diagnostics before expanding to background-mixed synthetic datasets.
+
+---
+
+## Decision Update (2026-03-12): Renderer Remediation Gate Before Chunk 5
+
+### Problem
+
+Chunk-4 synthetic cube runs consistently failed — surfels formed a torus instead of a cube, and escalating coupling/support pressure either had no effect or collapsed geometry entirely. Investigation traced the failure to six renderer defects that predated all elevation-aware work:
+
+- **Discarded normals**: `create_from_pcd` ignored provided normals and initialized quaternions randomly, making ~50% of surfels face away from any given view.
+- **Lambertian dead zone**: `clamp(min=0)` on the normal-view dot product killed gradients for wrong-facing surfels (dead-neuron problem).
+- **No acoustic occlusion**: Additive `scatter_add_` accumulation with no depth ordering — back-face surfels produced ghost returns.
+- **Point splatting**: Fixed 4-pixel bilinear splat instead of proper 2D Gaussian footprints — surfel scale parameters received no gradient.
+- **Densification disabled**: Placeholder zeros for `viewspace_points`/`radii` made densification structurally impossible.
+- **Coordinate divergence / FOV prune bug**: Inconsistent frame conventions between forward and backward projection; `require_all` branch was broken.
+
+These defects meant the photometric loss taught surfels the wrong geometry, Stage-1 posteriors were contaminated, and Chunk-4 coupling reinforced incorrect positions.
+
+### Decision
+
+Insert renderer remediation as a prerequisite tranche between Chunk 4 and Chunk 5. Full fix plan: `plans/PLAN_MISSING_OCCLUSION_AND_RENDERER_FIX_2026-03-02.md`.
+
+### Post-v2 active renderer contract
+
+| Component | v2 active default |
+|-----------|-------------------|
+| Normal init | Camera-facing normals → quaternions (not random) |
+| Lambertian transfer | Leaky (`alpha=0.01`, configurable via `SONAR_LAMBERTIAN_MODE`) |
+| Occlusion | Ray-binned per `(azimuth_bin, elevation_bin)`, front-to-back range compositing, then elevation marginalization (`SONAR_OCCLUSION_MODE=ray_binned`) |
+| Footprint rendering | `2dgs` (Jacobian) or `2dgs_nonlinear` (sigma-point); legacy bilinear removed |
+| Compatibility reference | Frozen v2 off-mode: `2dgs` + `occlusion=none` + `lambertian=clamp0` |
+
+### Evidence comparability
+
+- Pre-v2 Chunk-4 evidence is historical only once renderer semantics change.
+- Cross-run metric deltas require matching renderer semantic fingerprints in gate metadata.
+- Chunk-4 synthetic gates must be re-baselined against the v2 renderer before Chunk-5 work begins.
+
+### Chunk-5 scope (unchanged)
+
+Late normals refinement and optional densification — after renderer remediation and post-v2 re-gating. Chunk 5 is not a substitute for baseline renderer correction.
