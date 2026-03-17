@@ -1,8 +1,9 @@
-# Plan: Sonar Renderer Fixes — Occlusion, Normals, and Baseline Correctness
+# Plan: Sonar Renderer Fixes — Occlusion, Normals, and Baseline Correctness (Chunk 4.5)
 
 **Date:** 2026-03-02 (revised 2026-03-04)
 **Status:** Draft for execution
 **Scope:** Sonar renderer correctness fixes, acoustic occlusion, and synthetic re-baseline policy
+**Chunk ID:** 4.5 (in the execution sequence defined by `plans/PLAN_ELEVATION_AWARE_IMPLEMENTATION_EXECUTION_2026-02-10.md`)
 
 ## Verification Note — 2026-03-10
 

@@ -1,7 +1,7 @@
 # Plan: Elevation-Aware Training Implementation Execution
 
 **Date:** 2026-02-10  
-**Status:** Chunk 1/2 implemented; Chunk 3 partially implemented (infrastructure complete, core likelihood contract parity pending); Chunk 4 implemented but blocked; renderer remediation interposed before Chunk 5; Chunk 5 pending on post-v2 re-gating  
+**Status:** Chunk 1/2 implemented; Chunk 3 partially implemented (infrastructure complete, core likelihood contract parity pending); Chunk 4 implemented but blocked; Chunk 4.5 (renderer remediation) interposed before Chunk 5; Chunk 5 pending on post-v2 re-gating  
 **Owner:** OpenCode (gpt-5.3-codex)
 
 ---
@@ -38,8 +38,8 @@ Do **not** implement everything in one pass. Implement in risk-ordered chunks wi
 - Chunk 3 is partially implemented: Stage-1 infrastructure (mode gating, frame-keyed pixel-logit state, checkpoint schema/fingerprint handling, refresh/remap plumbing, helper tests) is in code.
 - Chunk 3 core contract parity remains open: overlap-neighbor multi-view likelihood assembly via `back_project_bins` + projection-validity evidence in the training loop is not fully integrated yet.
 - Chunk 4 was implemented and extensively probed, but its gate posture remained blocked on synthetic cube behavior and unresolved closeout issues.
-- After Chunk-4 investigation, renderer remediation was introduced as an explicit prerequisite tranche before Chunk 5.
-- Renderer remediation is implemented in code, but post-v2 active-path validation and synthetic re-baselining are still open; treat pre-v2 Chunk-4 metrics as historical when renderer semantics differ.
+- After Chunk-4 investigation, Chunk 4.5 (renderer remediation) was introduced as an explicit prerequisite tranche before Chunk 5.
+- Chunk 4.5 (renderer remediation) is implemented in code, but post-v2 active-path validation and synthetic re-baselining are still open; treat pre-v2 Chunk-4 metrics as historical when renderer semantics differ.
 - Chunk 5 remains pending and should be evaluated only against post-v2 post-Chunk-4 evidence.
 - Dataset-C synthetic results indicate a likely Chunk-2 quality ceiling for cube-like shape recovery, so future chunks must include explicit synthetic dataset validation in their gates.
 - Recorded qualitative baseline artifact (exp3): `output/debug_multiframe_synth_c_exp3/input.ply` is cube-like, while `output/debug_multiframe_synth_c_exp3/surfels_after_training.ply` shows FOV-bounded torus-like streaking aligned with the revolution axis.
@@ -60,7 +60,7 @@ Do **not** implement everything in one pass. Implement in risk-ordered chunks wi
 
 ### Development methodology (TDD requirement)
 
-- Use test-driven development for Chunk 3/4/5 work: define or update executable tests first, then implement code to satisfy those tests.
+- Use test-driven development for Chunk 3/4/4.5/5 work: define or update executable tests first, then implement code to satisfy those tests.
 - Each implementation task must map to at least one pre-declared verification item (unit/contract test, smoke test, synthetic gate check, or resume check).
 - Do not mark a chunk item complete until its mapped tests pass and artifacts are recorded.
 - When behavior changes, update tests and acceptance criteria in the same chunk plan before merging.
@@ -119,17 +119,29 @@ Goal:
 - Ensure improved elevation belief actually moves geometry and improves surfel retention quality.
 - Specifically target geometry-smearing failure modes seen in synthetic cube-style reconstructions.
 
-### Renderer remediation gate: baseline correction + re-baseline (post-Chunk-4, pre-Chunk-5)
+### Chunk 4.5: Renderer remediation (post-Chunk-4, pre-Chunk-5)
 
-Scope:
+Implemented per `plans/PLAN_MISSING_OCCLUSION_AND_RENDERER_FIX_2026-03-02.md`. Execution steps R0–R6 in that plan define the full scope, test catalog, and exit criteria.
 
-- Renderer-baseline fixes introduced after Chunk-4 investigation: normal-init ingestion, Lambertian transfer safety, ray-binned acoustic occlusion, v2 footprint modes, densification-signal wiring, and related consistency cleanup.
-- Synthetic re-baseline and comparator reset under renderer-v2 semantic fingerprints.
+**Naming note (2026-03-16):** This tranche was originally referred to as "renderer remediation gate" or "renderer remediation tranche" in earlier plan revisions and in the renderer fix plan itself. It is now canonically **Chunk 4.5** across the codebase.
+
+Scope (six confirmed defects + re-baseline):
+
+- **R1 — Normal init + Lambertian gradient safety.** `create_from_pcd` now consumes `pcd.normals` into quaternions (camera-facing at init). Leaky Lambertian (`SONAR_LAMBERTIAN_MODE=leaky`, default `alpha=0.01`) replaces hard `clamp(min=0)` to eliminate the dead-neuron gradient trap. Ablation modes gated behind `SONAR_LAMBERTIAN_MODE`. Surfel size telemetry and dead-zone diagnostics added.
+- **R2a — Ray-binned acoustic occlusion.** Per-`(azimuth_bin, elevation_bin)` front-to-back range-ordered compositing with multi-bin participation and support capping (`SONAR_OCCLUSION_MODE=ray_binned`). Elevation marginalization produces the final sonar image: `I[a,r] = sum_e w_e * R[a,e,r]`. Controls: `SONAR_ELEV_BINS`, `SONAR_ELEV_WEIGHT_MODE`, `SONAR_OCCL_KSIGMA`, `SONAR_OCCL_WEIGHT_FLOOR_REL`, `SONAR_OCCL_TOPK`. Mass-loss telemetry required per gate.
+- **R2b — 2DGS Jacobian footprint rendering.** Replaces the legacy 4-pixel bilinear `scatter_add_` path with proper 2D Gaussian splatting via `transMat_precomp` into the existing CUDA rasterizer. Polar-projection Jacobian computes `Sigma_2D = J * Sigma_3D * J^T`. Mode: `SONAR_RENDER_MODE=2dgs`.
+- **R2-alt — Sigma-point (nonlinear) footprint mode.** 5-point UKF-style projection captures second-order curvature the Jacobian misses for large/oblique surfels. Boundary-aware fitting (K-based fallback, soft border weighting, hysteresis, covariance conditioning). Mode: `SONAR_RENDER_MODE=2dgs_nonlinear`. Both footprint modes are required.
+- **R3 — Densification signal wiring.** `viewspace_points`/`radii` carry meaningful rasterizer-produced values under both footprint modes with `ray_binned` occlusion. Densification itself remains Chunk-5 scope (default disabled).
+- **R4 — Consistency fixes.** FOV prune `require_all` logic corrected. Coordinate convention divergence between `sonar_utils.py` and `point_utils.py` resolved. Legacy bilinear render path removed (`SONAR_RENDER_MODE=legacy` no longer callable).
+- **R5 — Plan hierarchy patches.** Upstream plans annotated with v2 renderer contracts and pre/post-v2 evidence separation.
+- **R6 — Synthetic re-baseline.** All pre-v2 synthetic gate claims become historical-only. Post-v2 reruns (C4-S1 through C4-S4, C4-T11, C4-T17) with renderer semantic fingerprint metadata. Comparator rule: cross-run deltas valid only when fingerprints match.
 
 Goal:
 
-- Re-establish a trustworthy renderer baseline before interpreting late normals refinement or optional densification behavior.
-- Prevent Chunk-5 evaluation from inheriting pre-v2 renderer defects or incomparable synthetic baselines.
+- Eliminate six renderer-level defects (random normals, Lambertian dead zone, missing occlusion, point splatting, broken densification signals, consistency bugs) that contaminated all prior photometric training and synthetic gates.
+- Replace the legacy bilinear accumulation path with physically motivated ray-space occlusion + proper 2DGS footprint rendering.
+- Re-establish a trustworthy renderer baseline with explicit semantic versioning before Chunk-5 evaluation.
+- Prevent Chunk-5 from inheriting pre-v2 renderer defects or incomparable synthetic baselines.
 
 ### Chunk 5: Late-stage refinements
 
@@ -151,7 +163,7 @@ Each chunk must pass its gate before moving to the next chunk.
 
 ### Synthetic validation policy for remaining chunks
 
-- For Chunk 3/4/5 gates and the interposed renderer-remediation gate, synthetic dataset validation is mandatory in addition to legacy real-data checks.
+- For Chunk 3/4/4.5/5 gates, synthetic dataset validation is mandatory in addition to legacy real-data checks.
 - Do not hardcode synthetic dataset names in this plan; use the active inventory and commands documented in `docs/SYNTHETIC_DATASET_GUIDE.md`.
 - Once renderer-v2 semantics are introduced, pre-v2 synthetic gate claims become historical-only for cross-run comparison purposes.
 - Cross-run metric deltas are valid only when renderer semantic fingerprints match.
@@ -160,7 +172,7 @@ Each chunk must pass its gate before moving to the next chunk.
   - output artifact paths,
   - evaluator metrics,
   - delta versus the most recent matching baseline (including renderer-semantic match).
-- Default material-regression rule for Chunk 3/4/5 synthetic gates:
+- Default material-regression rule for Chunk 3/4/4.5/5 synthetic gates:
   - any relative degradation greater than `10%` versus the active baseline in key evaluator error metrics (`mean_*_error_m`, `p95_*_error_m`, `center_error_m`) is treated as material.
   - material regression blocks progression unless an explicit written waiver (with rationale) is approved for the chunk.
 
@@ -199,14 +211,20 @@ Each chunk must pass its gate before moving to the next chunk.
 - Synthetic geometry artifacts associated with Chunk-2 limitations (streaking/toroidal smearing under in-FOV ambiguity) are explicitly reviewed and reported as improved/unchanged/regressed.
 - Quantitative synthetic metrics show directional improvement from Chunk-2 baselines for at least the known-problem shape class, or a documented blocker is recorded before proceeding.
 
-### Renderer remediation gate (mandatory before Chunk 5)
+### Gate after Chunk 4.5 (mandatory before Chunk 5)
 
-- Renderer contract tests and smoke tests associated with the renderer-v2 tranche pass under the active path.
-- Active renderer path is gradient-connected end-to-end (no `grad_fn` disconnects on synthetic guard runs).
-- Active renderer path produces finite rendered outputs and finite evaluator metrics on the required synthetic smoke/gate reruns.
-- Renderer semantic fingerprints are recorded for all post-v2 comparison runs.
-- Post-v2 synthetic reruns for the required guard/gate set are completed and separated from pre-v2 historical evidence.
-- Chunk-4 blocker posture is re-evaluated under post-v2 evidence before Chunk 5 begins.
+Full test catalog and exit criteria defined in `plans/PLAN_MISSING_OCCLUSION_AND_RENDERER_FIX_2026-03-02.md`. Summary gate checklist:
+
+- **Contract tests pass** (`RB-T01`..`RB-T10`, `RB-T15`, `RB-T16`, `RB-T18`..`RB-T22`): normal init ingestion, Lambertian gradient safety, ray-binned occlusion core, no cross-ray occlusion, Gaussian footprint from scale, densification signals, FOV prune semantics, convention roundtrip, nonlinear footprint fidelity, range-order semantics, elevation marginalization, `Sigma_2D->T` conversion, multi-bin participation, support-cap mass accounting, legacy mode removal.
+- **Smoke/integration tests pass** (`RB-T11`..`RB-T14`, `RB-T17`): shadow-mode debug run, active-mode debug run, off-mode v2 compatibility, checkpoint continuity, surfel-size telemetry.
+- **Both footprint modes validated:** `SONAR_RENDER_MODE=2dgs` (Jacobian) and `2dgs_nonlinear` (sigma-point) pass their respective tests.
+- **Active renderer path is gradient-connected end-to-end** (no `grad_fn` disconnects on synthetic guard runs).
+- **Active renderer path produces finite rendered outputs** and finite evaluator metrics on synthetic smoke/gate reruns.
+- **`SONAR_OCCLUSION_MODE=ray_binned`** is validated and used for all active/gating runs.
+- **Renderer semantic fingerprints recorded** for all post-v2 comparison runs, including: `renderer_semantics_version`, `normal_init_mode`, `lambertian_transfer`, `occlusion_model`, `sonar_render_mode`, `sonar_occlusion_mode`, `render_sonar_contract_hash`, `sigma_point_config` (when applicable).
+- **Post-v2 synthetic reruns completed** (C4-S1, C4-S2, C4-S3, C4-S4, C4-T11, C4-T17) and separated from pre-v2 historical evidence.
+- **Chunk-4 blocker posture re-evaluated** under post-v2 evidence before Chunk 5 begins.
+- **Upstream plan documents patched** and cross-linked (R5 deliverable).
 
 ### Gate after Chunk 5
 
@@ -222,7 +240,7 @@ Each chunk must pass its gate before moving to the next chunk.
 - Reload checkpoint.
 - Continue training for a short continuation window.
 - Confirm no state-contract breakage (`pixel_logits`, `optim_elev`, support buffers, surfel IDs).
-- Include at least one synthetic continuation check (resume on a synthetic-config run) for Chunk 3/4/5.
+- Include at least one synthetic continuation check (resume on a synthetic-config run) for Chunk 3/4/4.5/5.
 
 ### Manual visual test policy
 
@@ -250,7 +268,7 @@ A chunk is commit-ready only if:
 2. elevation-aware init + fixed-opacity toggle
 3. Stage 1 likelihood/annealing core
 4. coupling + persistent surfel IDs + support/pruning
-5. renderer baseline remediation + synthetic re-baseline
+5. Chunk 4.5: renderer remediation (R1–R4: normal init, leaky Lambertian, ray-binned occlusion, 2DGS footprints, densification signals, consistency fixes) + synthetic re-baseline (R5–R6)
 6. normals ramp + optional Stage 2 hook
 
 ### Commit-message format

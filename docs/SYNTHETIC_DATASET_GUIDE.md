@@ -198,7 +198,7 @@ Dataset C default pass thresholds:
 
 Once renderer-v2 semantics are introduced for a run, pre-v2 synthetic gate claims become historical-only for cross-run comparison.
 
-For every synthetic gate summary used in Chunk 4 / renderer-remediation / Chunk 5 decisions, record at minimum:
+For every synthetic gate summary used in Chunk 4 / Chunk 4.5 / Chunk 5 decisions, record at minimum:
 
 - `renderer_semantics_version`
 - `render_sonar_contract_hash` (or equivalent commit SHA)
@@ -225,7 +225,7 @@ Comparator rule:
 
 Current governance note:
 
-- Renderer remediation was implemented after Chunk-4 investigation, but post-v2 active-path validation / synthetic re-baselining remains a separate gate before Chunk 5 is interpreted as current.
+- Chunk 4.5 (renderer remediation) was implemented after Chunk-4 investigation, but post-v2 active-path validation / synthetic re-baselining remains a separate gate before Chunk 5 is interpreted as current.
 
 ## Implementation Notes
 

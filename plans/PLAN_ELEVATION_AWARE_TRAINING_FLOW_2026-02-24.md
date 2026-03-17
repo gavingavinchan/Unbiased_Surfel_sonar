@@ -6,7 +6,7 @@
 - Base decision ledger: `plans/PLAN_ELEVATION_AWARE_TRAINING_2026-01-28.md`
 - Contract-level source of truth: `plans/PLAN_ELEVATION_AWARE_TRAINING_detailed_2026-02-01.md`
 - Chunk execution/governance: `plans/PLAN_ELEVATION_AWARE_IMPLEMENTATION_EXECUTION_2026-02-10.md`
-- Renderer remediation tranche: `plans/PLAN_MISSING_OCCLUSION_AND_RENDERER_FIX_2026-03-02.md`
+- Chunk 4.5 (renderer remediation): `plans/PLAN_MISSING_OCCLUSION_AND_RENDERER_FIX_2026-03-02.md`
 
 ---
 
@@ -79,7 +79,7 @@ Stage intent:
 1. Stage 0: elevation-aware initialization.
 2. Stage 1: GT-anchored bin likelihood + entropy/temperature shaping.
 3. Stage 1 coupling/support: force posterior belief to move surfel geometry and enforce multi-view support retention.
-4. Renderer-baseline remediation and post-v2 re-baselining before late refinements are interpreted.
+4. Chunk 4.5: renderer-baseline remediation and post-v2 re-baselining before late refinements are interpreted.
 5. Stage 2 (optional): densify along arc peaks for persistent high-error areas.
 6. Late refinements: normals path ramp once posterior confidence is sufficient.
 
@@ -186,14 +186,14 @@ Reference: `plans/PLAN_ELEVATION_AWARE_CHUNK4_EXECUTION_2026-02-23.md`
 
 ---
 
-## Renderer remediation / rebaseline (post-Chunk-4, pre-Chunk-5)
+## Chunk 4.5: Renderer remediation / rebaseline (post-Chunk-4, pre-Chunk-5)
 
 **Focus**
 - Normal-init ingestion, gradient-safe Lambertian transfer, ray-binned occlusion, renderer-v2 footprint modes, densification-signal wiring, and post-v2 synthetic re-baselining.
 
 **Why this sits here**
 - Chunk-4 investigation showed renderer-level defects were upstream of both Stage-1 evidence quality and Chunk-4 coupling/support behavior.
-- Therefore this tranche is a prerequisite gate before late Chunk-5 normals work is interpreted.
+- Therefore Chunk 4.5 is a prerequisite gate before late Chunk-5 normals work is interpreted.
 
 **Current posture**
 - Implemented in code, but active-path validation / synthetic re-baseline posture is still open.
@@ -210,7 +210,7 @@ Reference: `plans/PLAN_MISSING_OCCLUSION_AND_RENDERER_FIX_2026-03-02.md`
 - Optional densification hooks (off by default until stable).
 
 **Readiness dependency**
-- Should start only after Chunk-3 parity gap, renderer-remediation gate, and post-v2 Chunk-4 blocker posture are resolved or explicitly waived.
+- Should start only after Chunk-3 parity gap, Chunk-4.5 gate, and post-v2 Chunk-4 blocker posture are resolved or explicitly waived.
 
 **Status**
 - Pending.
@@ -408,7 +408,7 @@ timeline
                 : Add testruns experiment ledger policy
                 : Publish option-status map
     2026-02-16 : Add synthetic Dataset-C validation track
-    2026-03-02 : Insert renderer-baseline remediation between Chunk 4 and Chunk 5
+    2026-03-02 : Insert Chunk 4.5 (renderer-baseline remediation) between Chunk 4 and Chunk 5
                : Define v2 renderer contracts for normal init, transfer, occlusion, and footprint modes
     2026-03-10 : Record active-path v2 validation failure and require post-v2 re-baseline before Chunk 5
 ```
@@ -525,7 +525,7 @@ flowchart TD
 ## Immediate next actions (flow-ordered)
 
 1. Close or explicitly bracket the Chunk-3 Stage-1 likelihood parity gap against the detailed contract path.
-2. Complete renderer-v2 active-path validation and post-v2 synthetic re-baseline.
+2. Complete Chunk-4.5 renderer-v2 active-path validation and post-v2 synthetic re-baseline.
 3. Re-run Chunk-4 gates against the corrected Stage-1 path under matching renderer-v2 fingerprints.
 4. Re-assess Dataset-C blocker with consistent comparator hygiene.
 5. Record explicit GO/NO-GO decision with blocker resolution or approved waiver rationale.

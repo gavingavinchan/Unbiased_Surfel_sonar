@@ -22,7 +22,7 @@ To keep future sessions consistent and avoid plan drift:
 - This document remains the contract-level source of truth for Stage 0/1/2 behavior and acceptance criteria.
 - Current codebase status: Chunk 1 and Chunk 2 work is implemented; Chunk 3 runtime infrastructure and tests are implemented.
 - Known parity gap: the current Stage-1 training-loop likelihood path is still an interim per-frame surrogate and does not yet fully match this document's overlap-neighbor `back_project_bins` multi-view evidence contract.
-- Renderer-baseline remediation was introduced after Chunk-4 investigation and before Chunk 5. Its contracts now sit inside this document because Chunk-5 normals/densification work is not meaningful unless the renderer baseline is corrected and re-gated.
+- Chunk 4.5 (renderer-baseline remediation) was introduced after Chunk-4 investigation and before Chunk 5. Its contracts now sit inside this document because Chunk-5 normals/densification work is not meaningful unless the renderer baseline is corrected and re-gated.
 - Treat pre-v2 renderer evidence as historical-only when comparing against runs that use the renderer-v2 semantics contract.
 - This is a status-only note; intended algorithmic scope and validation intent are unchanged.
 
@@ -116,7 +116,7 @@ Output contract:
       `intensity *= gain / (max(range, r0)^p + eps)`.
     - Default for raw sonar data: attenuation enabled, `p=2.0`, near-range floor `r0=0.35`.
 5. **Renderer baseline v2 prerequisite**
-   - Renderer remediation is interposed between Chunk 4 and Chunk 5. Chunk 5 is a late refinement stage, not a substitute for renderer correction.
+   - Chunk 4.5 (renderer remediation) is interposed between Chunk 4 and Chunk 5. Chunk 5 is a late refinement stage, not a substitute for renderer correction.
    - Normal initialization must consume provided `pcd.normals` when available; random quaternion initialization is no longer the active baseline contract.
    - Active renderer semantics use explicit transfer/occlusion/render-mode contracts rather than legacy bilinear additive scatter semantics.
    - Synthetic comparisons across runs are valid only when renderer semantic fingerprints match.
@@ -177,7 +177,7 @@ Output contract:
 
 ## Renderer Baseline Contract v2 (2026-03-12)
 
-This addendum records the renderer contracts introduced after the Chunk-4 investigation. It does not renumber the elevation chunks; it inserts a prerequisite renderer-remediation gate before Chunk 5 is treated as actionable.
+This addendum records the renderer contracts introduced after the Chunk-4 investigation (now canonically Chunk 4.5). It inserts a prerequisite gate before Chunk 5 is treated as actionable.
 
 ### 1) Normal initialization contract
 
@@ -1009,7 +1009,7 @@ v1 policy:
 4. Integrate Stage 1 likelihood bins + annealing.
 5. Integrate belief-to-geometry coupling loss (expected-point to surfel).
 6. Add multi-view support tracking and retention/pruning schedule.
-7. Remediate renderer baseline v2 and re-baseline synthetic gates before late refinements are interpreted.
+7. Chunk 4.5: remediate renderer baseline v2 and re-baseline synthetic gates before late refinements are interpreted.
 8. Add staged normals update path.
 9. Enable optional Stage 2 densification.
 

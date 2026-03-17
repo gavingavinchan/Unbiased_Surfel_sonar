@@ -2,7 +2,7 @@
 
 **Date/Time:** 2026-01-28 (updated 2026-03-12)
 **Git Commit:** 88b210c
-**Status:** Design exploration with decision addenda (implementation in progress via chunk plans; renderer remediation interposed after Chunk 4 and before Chunk 5)
+**Status:** Design exploration with decision addenda (implementation in progress via chunk plans; Chunk 4.5 (renderer remediation) interposed after Chunk 4 and before Chunk 5)
 
 ---
 
@@ -27,18 +27,18 @@ Execution is active under chunked delivery plans:
 | Chunk 2 | Implemented and validated |
 | Chunk 3 | Partially implemented — runtime infrastructure landed; full Stage-1 likelihood contract parity still open |
 | Chunk 4 | Implemented, then blocked — synthetic cube failures traced to renderer defects, not elevation-aware design |
-| Renderer remediation | Interposed between Chunk 4 and Chunk 5; code changes landed, but post-v2 active-path validation and synthetic re-baselining remain open |
+| Chunk 4.5 (renderer remediation) | Interposed between Chunk 4 and Chunk 5; code changes landed, but post-v2 active-path validation and synthetic re-baselining remain open |
 | Chunk 5 | Pending — must be evaluated against the post-v2 renderer baseline, not pre-v2 Chunk-4 results |
 
 This base plan remains a decision ledger; implementation contracts and gate details live in the detailed plan and chunk execution plans.
 
 ---
 
-## Renderer Remediation Addendum (2026-03-12)
+## Chunk 4.5 — Renderer Remediation Addendum (2026-03-12)
 
 Chunk-4 investigation revealed that the sonar renderer had fundamental defects that predated all elevation-aware work. These defects contaminated Stage-1 posterior evidence, Chunk-4 coupling outcomes, and all synthetic gate results. See `plans/PLAN_MISSING_OCCLUSION_AND_RENDERER_FIX_2026-03-02.md` for full diagnosis and fix plan.
 
-**Decision**: Renderer remediation is an interposed prerequisite between Chunk 4 and Chunk 5 — not part of Chunk 5 scope. Chunk 5 (late normals refinement, optional densification) proceeds only after the renderer is fixed and synthetic gates are re-baselined.
+**Decision**: Chunk 4.5 (renderer remediation) is an interposed prerequisite between Chunk 4 and Chunk 5 — not part of Chunk 5 scope. Chunk 5 (late normals refinement, optional densification) proceeds only after the renderer is fixed and synthetic gates are re-baselined.
 
 **Active renderer contract (v2)**: Normal-derived quaternion initialization, leaky Lambertian transfer (gradient-safe), ray-binned acoustic occlusion, and `2dgs`/`2dgs_nonlinear` footprint modes. Legacy bilinear scatter is removed.
 
@@ -1364,7 +1364,7 @@ These defects meant the photometric loss taught surfels the wrong geometry, Stag
 
 ### Decision
 
-Insert renderer remediation as a prerequisite tranche between Chunk 4 and Chunk 5. Full fix plan: `plans/PLAN_MISSING_OCCLUSION_AND_RENDERER_FIX_2026-03-02.md`.
+Insert Chunk 4.5 (renderer remediation) as a prerequisite tranche between Chunk 4 and Chunk 5. Full fix plan: `plans/PLAN_MISSING_OCCLUSION_AND_RENDERER_FIX_2026-03-02.md`.
 
 ### Post-v2 active renderer contract
 
@@ -1384,4 +1384,4 @@ Insert renderer remediation as a prerequisite tranche between Chunk 4 and Chunk 
 
 ### Chunk-5 scope (unchanged)
 
-Late normals refinement and optional densification — after renderer remediation and post-v2 re-gating. Chunk 5 is not a substitute for baseline renderer correction.
+Late normals refinement and optional densification — after Chunk 4.5 and post-v2 re-gating. Chunk 5 is not a substitute for baseline renderer correction.

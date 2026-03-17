@@ -1,9 +1,9 @@
 # Progress Overview (Post-Fork, Multi-Branch)
 
 ## 2026-03-12 Evidence Split Note
-- Renderer remediation now sits between Chunk 4 and Chunk 5 in the planning hierarchy.
+- Chunk 4.5 (renderer remediation) now sits between Chunk 4 and Chunk 5 in the planning hierarchy.
 - Treat pre-v2 Chunk-4 evidence as historical when comparing against runs that use renderer-v2 semantics.
-- Current posture is mixed: renderer remediation is implemented in code, but post-v2 active-path validation and synthetic re-baselining are still open, so Chunk 5 is not yet on a clean baseline.
+- Current posture is mixed: Chunk 4.5 is implemented in code, but post-v2 active-path validation and synthetic re-baselining are still open, so Chunk 5 is not yet on a clean baseline.
 
 ## 2026-03-11 Sonar Visualizer Checkpoint
 - Added Blender-first offline visualizer exports for `debug_multiframe.py`: stage-aligned surfel-state PLYs, deterministic sampled surfel glyphs, per-frame near/full-range wireframes, per-frame rendered sonar PNGs, and a narrow `visualizer/manifest.json` index.
