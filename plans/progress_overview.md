@@ -1,5 +1,11 @@
 # Progress Overview (Post-Fork, Multi-Branch)
 
+## 2026-03-17 Chunk-5 Plan Tightening
+- Tightened `plans/PLAN_ELEVATION_AWARE_CHUNK5_EXECUTION_2026-03-16.md` against upstream plans and current code reality before any Chunk-5 TDD work begins.
+- Clarified that late-normal finite-difference supervision must explicitly materialize the image-grid 4-neighborhood around sparse Stage-1 anchor pixels rather than assuming dense pixel-bank support.
+- Clarified that Chunk-5 introduces a new explicit normal-supervision term into `debug_multiframe.py`, requires `SONAR_OCCLUSION_MODE=ray_binned` for densification eligibility, and should store resume state in a sibling `elevation_chunk5_state` payload.
+- Corrected the reduced-budget synthetic command examples so they explicitly override iteration gates when they are intended to exercise late normals or densification.
+
 ## 2026-03-12 Evidence Split Note
 - Chunk 4.5 (renderer remediation) now sits between Chunk 4 and Chunk 5 in the planning hierarchy.
 - Treat pre-v2 Chunk-4 evidence as historical when comparing against runs that use renderer-v2 semantics.

@@ -3,6 +3,11 @@
 ## Abstract
 We extended 2D Gaussian Splatting to forward-looking multibeam sonar by introducing polar rendering, backward projection, metric scale alignment, and sonar-specific training constraints. The work adds sonar mode data flow, pose interpolation from camera trajectories, a learnable global scale factor, camera-to-sonar extrinsics, differentiable polar rendering with intensity modeling, size-aware field-of-view (FOV) constraints, and loss shaping for bright sonar returns. We also introduced mesh tuning workflows and dataset preparation guidelines to support real-world sonar reconstructions.
 
+## 2026-03-17 Chunk-5 Planning Clarification Addendum
+The current Chunk-5 execution contract is now tightened to match the actual Stage-1 data layout used by `debug_multiframe.py`. Stage-1 posteriors are maintained on a sparse bright-pixel bank, so any expected-elevation finite-difference normal estimate in Chunk 5 must explicitly query the exact local image-grid neighborhood around each anchor pixel instead of assuming a dense posterior image exists. This removes an ambiguity that would otherwise make the late-normal supervision coverage ill-defined.
+
+The planning contract is also now explicit that Chunk 5 adds a new normal-supervision term to the existing debug-training objective rather than reusing a pre-existing normal-loss block, and that optional densification should only be interpreted under the active ray-binned renderer semantics family. Reduced-budget synthetic gates are therefore only scientifically meaningful for Chunk 5 when they state their iteration-threshold overrides directly, so that the exercised late-normal or densification regime is unambiguous in the resulting artifacts.
+
 ## 2026-03-11 Visualizer Addendum
 The debugging workflow now includes an explicit offline visualizer contract for surfel-state inspection in Blender. Instead of relying on latent Gaussian PLYs and a single merged pose wireframe, the run exports per-stage surfel states, per-frame wireframes, per-frame FOV surfel glyphs, and per-frame rendered sonar images under a shared `visualizer/` root.
 
