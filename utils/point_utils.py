@@ -37,6 +37,8 @@ def depth_to_normal(view, depth, sonar_mode=False, sonar_config=None, scale_fact
         sonar_mode: If True, use sonar polar geometry instead of pinhole
         sonar_config: SonarConfig instance (required if sonar_mode=True)
         scale_factor: SonarScaleFactor instance for pose scaling (optional)
+        elevation_image: Optional per-pixel elevation image [1, H, W] or [H, W]
+            used only in sonar mode. ``None`` preserves the legacy zero-elevation path.
         
     Returns:
         Normal map [H, W, 3] in world coordinates
@@ -91,6 +93,8 @@ def sonar_ranges_to_points(view, range_image, sonar_config, scale_factor=None, e
         range_image: Range values [1, H, W] in meters
         sonar_config: SonarConfig instance with sonar parameters
         scale_factor: Optional SonarScaleFactor to scale pose translation
+        elevation_image: Optional per-pixel elevation angles [1, H, W] or [H, W]
+            in radians. ``None`` preserves the legacy collapsed zero-elevation geometry.
         
     Returns:
         points: World-space 3D points [H, W, 3]
@@ -111,7 +115,10 @@ def sonar_ranges_to_points(view, range_image, sonar_config, scale_factor=None, e
     r = range_image  # [H, W]
     
     if elevation_image is None:
-        elevation = torch.zeros_like(r)
+        # Fast legacy path: collapsed zero-elevation geometry.
+        x_s = -r * torch.sin(azimuth)
+        y_s = torch.zeros_like(r)
+        z_s = r * torch.cos(azimuth)
     else:
         if elevation_image.dim() == 3:
             elevation_image = elevation_image.squeeze(0)
@@ -120,14 +127,13 @@ def sonar_ranges_to_points(view, range_image, sonar_config, scale_factor=None, e
                 f"elevation_image shape {tuple(elevation_image.shape)} does not match range_image shape {tuple(range_image.shape)}"
             )
         elevation = elevation_image.to(device=r.device, dtype=r.dtype)
-
-    # Convert polar to Cartesian in the canonical sonar/view frame.
-    # right   = -r * sin(azimuth) * cos(elevation)
-    # down    =  r * sin(elevation)
-    # forward =  r * cos(azimuth) * cos(elevation)
-    x_s = -r * torch.sin(azimuth) * torch.cos(elevation)
-    y_s = r * torch.sin(elevation)
-    z_s = r * torch.cos(azimuth) * torch.cos(elevation)
+        # Convert polar to Cartesian in the canonical sonar/view frame.
+        # right   = -r * sin(azimuth) * cos(elevation)
+        # down    =  r * sin(elevation)
+        # forward =  r * cos(azimuth) * cos(elevation)
+        x_s = -r * torch.sin(azimuth) * torch.cos(elevation)
+        y_s = r * torch.sin(elevation)
+        z_s = r * torch.cos(azimuth) * torch.cos(elevation)
     
     # Stack to get points in sonar frame [H, W, 3]
     points_sonar = torch.stack([x_s, y_s, z_s], dim=-1)

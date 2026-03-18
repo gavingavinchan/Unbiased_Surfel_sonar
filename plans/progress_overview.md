@@ -6,6 +6,8 @@
 - Implemented the first real late-normal runtime path in `debug_multiframe.py`: sparse Stage-1 anchor pixels now request an explicit local 4-neighborhood closure, compute expected-elevation world points, derive finite-difference normals, associate them back to visible surfels with the existing Chunk-4 gates, and add cosine normal supervision once into the unified Stage-2/Stage-3 loss.
 - Extended `utils/point_utils.py` so the sonar point-conversion path accepts optional per-pixel elevation while preserving `elevation_image=None` parity with the previous zero-elevation behavior.
 - Added densify shadow scaffolding only: high-error tracker updates, trigger diagnostics, and checkpoint persistence exist, but active surfel spawning is still intentionally unimplemented.
+- Posture note: because default `ELEV_NORMAL_MODE` remains `shadow`, this wiring is treated as implementation prep rather than gate evidence. Any ad hoc `ELEV_NORMAL_MODE=active` run executed before the Chunk-3 / Chunk-4.5 readiness prerequisites close must not be used as formal Chunk-5 gate evidence.
+- Follow-up wiring now extends Chunk 5 beyond helper-only prep: active densify spawning exists, spawn orientation prefers local expected normals when the neighborhood is valid, focused runtime smokes pass for both active late normals and active densify, and tracker/checkpoint hygiene was tightened for stale bank entries and empty frame-key payloads.
 
 ## 2026-03-17 Chunk-5 Plan Tightening
 - Tightened `plans/PLAN_ELEVATION_AWARE_CHUNK5_EXECUTION_2026-03-16.md` against upstream plans and current code reality before any Chunk-5 TDD work begins.

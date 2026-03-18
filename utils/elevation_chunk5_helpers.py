@@ -1,6 +1,6 @@
 import hashlib
 import math
-from typing import Dict, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 
@@ -141,6 +141,75 @@ def select_arc_peak_bin(*, scores: torch.Tensor, min_score: float) -> Optional[i
     if float(scores_t[peak].item()) < float(min_score):
         return None
     return peak
+
+
+def make_high_error_key(frame_key: str, row: int, col: int) -> str:
+    return f"{str(frame_key)}:{int(row)}:{int(col)}"
+
+
+def parse_high_error_key(key: str) -> Tuple[str, int, int]:
+    parts = str(key).rsplit(":", 2)
+    if len(parts) != 3:
+        raise ValueError(f"Invalid high-error tracker key: {key}")
+    frame_key, row_str, col_str = parts
+    return frame_key, int(row_str), int(col_str)
+
+
+def select_persistent_high_error_candidates(
+    *,
+    high_error_tracker: Dict[str, int],
+    frame_keys: Sequence[str],
+    min_hits: int = 2,
+    max_candidates: int = 0,
+) -> List[Tuple[str, int, int, int]]:
+    frame_key_set = {str(key) for key in frame_keys}
+    candidates: List[Tuple[str, int, int, int]] = []
+    for raw_key, raw_count in dict(high_error_tracker).items():
+        frame_key, row, col = parse_high_error_key(str(raw_key))
+        count = int(raw_count)
+        if frame_key not in frame_key_set or count < int(min_hits):
+            continue
+        candidates.append((frame_key, row, col, count))
+
+    candidates.sort(key=lambda item: (-item[3], item[0], item[1], item[2]))
+    limit = int(max_candidates)
+    if limit > 0:
+        candidates = candidates[:limit]
+    return candidates
+
+
+def select_peak_bin_from_loglik(
+    *,
+    loglik: torch.Tensor,
+    support_mask: torch.Tensor,
+    min_score: float,
+) -> Tuple[Optional[int], torch.Tensor]:
+    loglik_t = loglik.to(dtype=torch.float32)
+    support_t = support_mask.to(device=loglik_t.device, dtype=torch.bool)
+    scores = torch.exp(loglik_t.clamp(max=0.0)) * support_t.to(dtype=loglik_t.dtype)
+    return select_arc_peak_bin(scores=scores, min_score=min_score), scores
+
+
+def quaternions_from_normals(normals: torch.Tensor) -> torch.Tensor:
+    eps = 1e-8
+    normals_t = torch.nn.functional.normalize(normals.to(dtype=torch.float32), dim=-1, eps=eps)
+    z_axis = torch.tensor([0.0, 0.0, 1.0], dtype=normals_t.dtype, device=normals_t.device)
+    z_axis = z_axis.unsqueeze(0).expand_as(normals_t)
+
+    dot = torch.sum(z_axis * normals_t, dim=-1).clamp(-1.0, 1.0)
+    cross = torch.cross(z_axis, normals_t, dim=-1)
+    s = torch.sqrt(torch.clamp(1.0 + dot, min=eps) * 2.0)
+    inv_s = 1.0 / s
+
+    quat = torch.zeros((normals_t.shape[0], 4), dtype=normals_t.dtype, device=normals_t.device)
+    quat[:, 0] = 0.5 * s
+    quat[:, 1:] = cross * inv_s.unsqueeze(-1)
+
+    antiparallel = dot < (-1.0 + 1e-4)
+    if antiparallel.any():
+        quat[antiparallel] = torch.tensor([0.0, 1.0, 0.0, 0.0], dtype=normals_t.dtype, device=normals_t.device)
+
+    return torch.nn.functional.normalize(quat, dim=-1, eps=eps)
 
 
 def _compute_frame_fingerprint(active_frame_keys: Sequence[str]) -> str:

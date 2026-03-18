@@ -101,9 +101,12 @@ from utils.elevation_chunk5_helpers import (
     compute_expected_elevation,
     compute_finite_difference_normals,
     compute_normal_supervision_loss,
+    make_high_error_key,
     mode_enables_densify_candidates,
-    mode_enables_densify_spawn,
     mode_enables_normal_loss,
+    quaternions_from_normals,
+    select_peak_bin_from_loglik,
+    select_persistent_high_error_candidates,
     is_densify_iteration_eligible,
     resolve_normal_weight,
     resolve_effective_chunk5_modes,
@@ -1265,6 +1268,180 @@ def _chunk5_expected_world_points(frame_idx, rows, cols, expected_elevation, tra
     return view_points_to_world(points_view, w2v, scale_factor=sonar_scale_factor)
 
 
+def _compute_chunk5_local_expected_geometry(
+    *,
+    frame_idx,
+    frame_key,
+    rows,
+    cols,
+    center_probs,
+    center_support_mask,
+    training_frames,
+    frame_key_to_index,
+    overlap_table,
+    gt_frame_cache,
+    frame_stats_cache,
+    elev_angle_bins,
+    sonar_config,
+    sonar_scale_factor,
+    stage1_cfg,
+    confidence_thresh,
+):
+    out = {
+        "supported_mask": torch.zeros((0,), dtype=torch.bool, device=rows.device),
+        "confident_mask": torch.zeros((0,), dtype=torch.bool, device=rows.device),
+        "neighbor_ready_mask": torch.zeros((0,), dtype=torch.bool, device=rows.device),
+        "finite_mask": torch.zeros((0,), dtype=torch.bool, device=rows.device),
+        "rows_selected": torch.empty((0,), dtype=torch.long, device=rows.device),
+        "cols_selected": torch.empty((0,), dtype=torch.long, device=rows.device),
+        "pts_center": torch.empty((0, 3), dtype=torch.float32, device=rows.device),
+        "normals_expected": torch.empty((0, 3), dtype=torch.float32, device=rows.device),
+    }
+
+    probs = center_probs.detach().to(dtype=torch.float32)
+    support_mask = center_support_mask.detach().to(dtype=torch.bool)
+    if probs.ndim != 2 or support_mask.ndim != 2:
+        return out
+    total = int(min(probs.shape[0], support_mask.shape[0], rows.shape[0], cols.shape[0]))
+    if total <= 0:
+        return out
+
+    probs = probs[:total]
+    support_mask = support_mask[:total]
+    rows_bank = rows[:total]
+    cols_bank = cols[:total]
+    confident_mask, _ = compute_confidence_mask(
+        probs=probs,
+        support_mask=support_mask,
+        confidence_thresh=confidence_thresh,
+    )
+    supported_mask = support_mask.any(dim=-1)
+
+    rows_bank, cols_bank, anchor_interior, neighbor_lookup, query_rows, query_cols = _build_chunk5_neighbor_queries(
+        rows_bank,
+        cols_bank,
+        image_height=training_frames[int(frame_idx)].image_height,
+        image_width=training_frames[int(frame_idx)].image_width,
+    )
+    neighbor_ready = supported_mask & confident_mask & anchor_interior
+    out["supported_mask"] = supported_mask
+    out["confident_mask"] = confident_mask
+    out["neighbor_ready_mask"] = neighbor_ready.clone()
+    if not bool(neighbor_ready.any().item()) or query_rows.numel() == 0:
+        return out
+
+    query_loglik, query_support = build_stage1_multiview_loglik_for_pixels(
+        frame_idx=frame_idx,
+        frame_key=frame_key,
+        rows=query_rows,
+        cols=query_cols,
+        training_frames=training_frames,
+        frame_key_to_index=frame_key_to_index,
+        overlap_table=overlap_table,
+        gt_frame_cache=gt_frame_cache,
+        frame_stats_cache=frame_stats_cache,
+        elev_angle_bins=elev_angle_bins,
+        sonar_config=sonar_config,
+        sonar_scale_factor=sonar_scale_factor,
+        cfg=stage1_cfg,
+    )
+    query_probs = masked_softmax(
+        query_loglik,
+        query_support,
+        dim=-1,
+        min_support=stage1_cfg.lik_min_support,
+    )
+    query_confident, _ = compute_confidence_mask(
+        probs=query_probs,
+        support_mask=query_support,
+        confidence_thresh=confidence_thresh,
+    )
+
+    left_idx = neighbor_lookup["left"]
+    right_idx = neighbor_lookup["right"]
+    up_idx = neighbor_lookup["up"]
+    down_idx = neighbor_lookup["down"]
+    for idx_tensor in (left_idx, right_idx, up_idx, down_idx):
+        valid_idx = idx_tensor >= 0
+        ready_i = torch.zeros_like(neighbor_ready)
+        if bool(valid_idx.any().item()):
+            ready_i[valid_idx] = query_confident[idx_tensor[valid_idx]]
+        neighbor_ready &= valid_idx & ready_i
+
+    out["neighbor_ready_mask"] = neighbor_ready.clone()
+    if not bool(neighbor_ready.any().item()):
+        return out
+
+    center_expected = compute_expected_elevation(probs=probs[neighbor_ready], elev_bins=elev_angle_bins)
+    left_expected = compute_expected_elevation(probs=query_probs[left_idx[neighbor_ready]], elev_bins=elev_angle_bins)
+    right_expected = compute_expected_elevation(probs=query_probs[right_idx[neighbor_ready]], elev_bins=elev_angle_bins)
+    up_expected = compute_expected_elevation(probs=query_probs[up_idx[neighbor_ready]], elev_bins=elev_angle_bins)
+    down_expected = compute_expected_elevation(probs=query_probs[down_idx[neighbor_ready]], elev_bins=elev_angle_bins)
+
+    rows_sel = rows_bank[neighbor_ready]
+    cols_sel = cols_bank[neighbor_ready]
+    pts_center = _chunk5_expected_world_points(
+        frame_idx,
+        rows_sel,
+        cols_sel,
+        center_expected,
+        training_frames,
+        sonar_config,
+        sonar_scale_factor,
+    )
+    pts_left = _chunk5_expected_world_points(
+        frame_idx,
+        query_rows[left_idx[neighbor_ready]],
+        query_cols[left_idx[neighbor_ready]],
+        left_expected,
+        training_frames,
+        sonar_config,
+        sonar_scale_factor,
+    )
+    pts_right = _chunk5_expected_world_points(
+        frame_idx,
+        query_rows[right_idx[neighbor_ready]],
+        query_cols[right_idx[neighbor_ready]],
+        right_expected,
+        training_frames,
+        sonar_config,
+        sonar_scale_factor,
+    )
+    pts_up = _chunk5_expected_world_points(
+        frame_idx,
+        query_rows[up_idx[neighbor_ready]],
+        query_cols[up_idx[neighbor_ready]],
+        up_expected,
+        training_frames,
+        sonar_config,
+        sonar_scale_factor,
+    )
+    pts_down = _chunk5_expected_world_points(
+        frame_idx,
+        query_rows[down_idx[neighbor_ready]],
+        query_cols[down_idx[neighbor_ready]],
+        down_expected,
+        training_frames,
+        sonar_config,
+        sonar_scale_factor,
+    )
+    normals_expected = compute_finite_difference_normals(
+        pts_left=pts_left,
+        pts_right=pts_right,
+        pts_up=pts_up,
+        pts_down=pts_down,
+        eps=1e-8,
+    )
+    finite_mask = torch.isfinite(normals_expected).all(dim=-1)
+
+    out["finite_mask"] = finite_mask
+    out["rows_selected"] = rows_sel[finite_mask]
+    out["cols_selected"] = cols_sel[finite_mask]
+    out["pts_center"] = pts_center[finite_mask]
+    out["normals_expected"] = normals_expected[finite_mask]
+    return out
+
+
 def compute_chunk5_normal_for_frame(
     *,
     frame_idx,
@@ -1328,36 +1505,13 @@ def compute_chunk5_normal_for_frame(
     rows_total = int(min(probs.shape[0], support_mask.shape[0], rows_bank.shape[0], cols_bank.shape[0]))
     if rows_total <= 0:
         return out
-    rows_bank = rows_bank[:rows_total]
-    cols_bank = cols_bank[:rows_total]
-    probs = probs[:rows_total]
-    support_mask = support_mask[:rows_total]
-    confident_mask, _ = compute_confidence_mask(
-        probs=probs,
-        support_mask=support_mask,
-        confidence_thresh=cfg.normal_confidence_thresh,
-    )
-    supported_mask = support_mask.any(dim=-1)
-    out["expected_coverage"] = float(supported_mask.float().mean().item()) if supported_mask.numel() > 0 else 0.0
-
-    rows_bank, cols_bank, anchor_interior, neighbor_lookup, query_rows, query_cols = _build_chunk5_neighbor_queries(
-        rows_bank,
-        cols_bank,
-        image_height=training_frames[int(frame_idx)].image_height,
-        image_width=training_frames[int(frame_idx)].image_width,
-    )
-    center_eligible = supported_mask & confident_mask & anchor_interior
-    if not bool(center_eligible.any().item()) or query_rows.numel() == 0:
-        out["confidence_coverage"] = float(center_eligible.float().mean().item()) if center_eligible.numel() > 0 else 0.0
-        out["finite_count"] = int(center_eligible.sum().item())
-        out["skipped_count"] = int(center_eligible.numel() - center_eligible.sum().item())
-        return out
-
-    query_loglik, query_support = build_stage1_multiview_loglik_for_pixels(
+    geometry = _compute_chunk5_local_expected_geometry(
         frame_idx=frame_idx,
         frame_key=frame_key,
-        rows=query_rows,
-        cols=query_cols,
+        rows=rows_bank[:rows_total],
+        cols=cols_bank[:rows_total],
+        center_probs=probs[:rows_total],
+        center_support_mask=support_mask[:rows_total],
         training_frames=training_frames,
         frame_key_to_index=frame_key_to_index,
         overlap_table=overlap_table,
@@ -1366,106 +1520,22 @@ def compute_chunk5_normal_for_frame(
         elev_angle_bins=elev_angle_bins,
         sonar_config=sonar_config,
         sonar_scale_factor=sonar_scale_factor,
-        cfg=stage1_cfg,
-    )
-    query_probs = masked_softmax(
-        query_loglik,
-        query_support,
-        dim=-1,
-        min_support=stage1_cfg.lik_min_support,
-    )
-    query_confident, _ = compute_confidence_mask(
-        probs=query_probs,
-        support_mask=query_support,
+        stage1_cfg=stage1_cfg,
         confidence_thresh=cfg.normal_confidence_thresh,
     )
+    supported_mask = geometry["supported_mask"]
+    out["expected_coverage"] = float(supported_mask.float().mean().item()) if supported_mask.numel() > 0 else 0.0
 
-    left_idx = neighbor_lookup["left"]
-    right_idx = neighbor_lookup["right"]
-    up_idx = neighbor_lookup["up"]
-    down_idx = neighbor_lookup["down"]
-    neighbor_ready = center_eligible.clone()
-    for idx_tensor in (left_idx, right_idx, up_idx, down_idx):
-        valid_idx = idx_tensor >= 0
-        ready_i = torch.zeros_like(center_eligible)
-        if bool(valid_idx.any().item()):
-            ready_i[valid_idx] = query_confident[idx_tensor[valid_idx]]
-        neighbor_ready &= valid_idx & ready_i
-
+    neighbor_ready = geometry["neighbor_ready_mask"]
     out["confidence_coverage"] = float(neighbor_ready.float().mean().item()) if neighbor_ready.numel() > 0 else 0.0
-    if not bool(neighbor_ready.any().item()):
-        out["finite_count"] = int(neighbor_ready.sum().item())
-        out["skipped_count"] = int(neighbor_ready.numel() - neighbor_ready.sum().item())
-        return out
-
-    center_expected = compute_expected_elevation(probs=probs[neighbor_ready], elev_bins=elev_angle_bins)
-    left_expected = compute_expected_elevation(probs=query_probs[left_idx[neighbor_ready]], elev_bins=elev_angle_bins)
-    right_expected = compute_expected_elevation(probs=query_probs[right_idx[neighbor_ready]], elev_bins=elev_angle_bins)
-    up_expected = compute_expected_elevation(probs=query_probs[up_idx[neighbor_ready]], elev_bins=elev_angle_bins)
-    down_expected = compute_expected_elevation(probs=query_probs[down_idx[neighbor_ready]], elev_bins=elev_angle_bins)
-
-    rows_sel = rows_bank[neighbor_ready]
-    cols_sel = cols_bank[neighbor_ready]
-    pts_center = _chunk5_expected_world_points(
-        frame_idx,
-        rows_sel,
-        cols_sel,
-        center_expected,
-        training_frames,
-        sonar_config,
-        sonar_scale_factor,
-    )
-    pts_left = _chunk5_expected_world_points(
-        frame_idx,
-        query_rows[left_idx[neighbor_ready]],
-        query_cols[left_idx[neighbor_ready]],
-        left_expected,
-        training_frames,
-        sonar_config,
-        sonar_scale_factor,
-    )
-    pts_right = _chunk5_expected_world_points(
-        frame_idx,
-        query_rows[right_idx[neighbor_ready]],
-        query_cols[right_idx[neighbor_ready]],
-        right_expected,
-        training_frames,
-        sonar_config,
-        sonar_scale_factor,
-    )
-    pts_up = _chunk5_expected_world_points(
-        frame_idx,
-        query_rows[up_idx[neighbor_ready]],
-        query_cols[up_idx[neighbor_ready]],
-        up_expected,
-        training_frames,
-        sonar_config,
-        sonar_scale_factor,
-    )
-    pts_down = _chunk5_expected_world_points(
-        frame_idx,
-        query_rows[down_idx[neighbor_ready]],
-        query_cols[down_idx[neighbor_ready]],
-        down_expected,
-        training_frames,
-        sonar_config,
-        sonar_scale_factor,
-    )
-    normals_expected = compute_finite_difference_normals(
-        pts_left=pts_left,
-        pts_right=pts_right,
-        pts_up=pts_up,
-        pts_down=pts_down,
-        eps=1e-8,
-    )
-    finite_normals = torch.isfinite(normals_expected).all(dim=-1)
+    finite_normals = geometry["finite_mask"]
     out["finite_count"] = int(finite_normals.sum().item())
     out["skipped_count"] = int(neighbor_ready.numel() - finite_normals.sum().item())
-    if not bool(finite_normals.any().item()):
+    if geometry["pts_center"].numel() == 0 or geometry["normals_expected"].numel() == 0:
         return out
 
-    pts_center = pts_center[finite_normals]
-    normals_expected = normals_expected[finite_normals]
+    pts_center = geometry["pts_center"]
+    normals_expected = geometry["normals_expected"]
     exp_proj = sonar_project_points(
         pts_center,
         training_frames[int(frame_idx)],
@@ -1550,13 +1620,25 @@ def update_chunk5_densify_tracker_for_frame(
     if rows_i.numel() == 0 or cols_i.numel() == 0:
         return out
 
+    current_keys = {
+        make_high_error_key(frame_key, int(rows_i[i].item()), int(cols_i[i].item()))
+        for i in range(int(min(rows_i.shape[0], cols_i.shape[0])))
+    }
+    stale_keys = [
+        key for key in list(tracker.keys())
+        if str(key).startswith(f"{frame_key}:") and str(key) not in current_keys
+    ]
+    for key in stale_keys:
+        tracker.pop(key, None)
+        out["reset_count"] += 1
+
     intensity = gt_gray[rows_i, cols_i]
     residual = torch.abs(rendered_gray[rows_i, cols_i] - intensity)
     qualifies = (intensity >= float(cfg.densify_min_intensity)) & (residual >= float(cfg.densify_residual_thresh))
     out["high_error_count"] = int(qualifies.sum().item())
 
     for i in range(int(min(rows_i.shape[0], cols_i.shape[0]))):
-        key = f"{frame_key}:{int(rows_i[i].item())}:{int(cols_i[i].item())}"
+        key = make_high_error_key(frame_key, int(rows_i[i].item()), int(cols_i[i].item()))
         if bool(qualifies[i].item()):
             tracker[key] = int(tracker.get(key, 0)) + 1
         elif key in tracker:
@@ -1565,6 +1647,221 @@ def update_chunk5_densify_tracker_for_frame(
 
     persistent_keys = [key for key, count in tracker.items() if int(count) >= 2 and str(key).startswith(f"{frame_key}:")]
     out["persistent_candidate_count"] = len(persistent_keys)
+    return out
+
+
+def spawn_chunk5_surfels_for_event(
+    *,
+    global_iter,
+    sampled_frame_indices,
+    training_frames,
+    frame_key_to_index,
+    overlap_table,
+    gt_frame_cache,
+    frame_stats_cache,
+    gaussians,
+    sonar_config,
+    sonar_scale_factor,
+    elev_angle_bins,
+    stage1_cfg,
+    chunk4_runtime_state,
+    chunk4_cfg,
+    chunk5_runtime_state,
+    chunk5_cfg,
+):
+    out = {
+        "candidate_count": 0,
+        "persistent_candidate_count": 0,
+        "spawn_count": 0,
+        "skip_flat_count": 0,
+        "skip_support_count": 0,
+    }
+    if chunk5_runtime_state is None:
+        return out
+
+    sampled_frame_keys = [str(training_frames[int(frame_idx)].image_name) for frame_idx in sampled_frame_indices]
+    candidates = select_persistent_high_error_candidates(
+        high_error_tracker=chunk5_runtime_state.get("high_error_tracker", {}),
+        frame_keys=sampled_frame_keys,
+        min_hits=2,
+        max_candidates=chunk5_cfg.densify_max_per_event,
+    )
+    out["candidate_count"] = len(sampled_frame_keys)
+    out["persistent_candidate_count"] = len(candidates)
+    if not candidates:
+        return out
+
+    device = gaussians.get_xyz.device
+    if gaussians.get_xyz.shape[0] > 0:
+        default_scaling = gaussians._scaling.detach().median(dim=0).values.unsqueeze(0)
+        default_dc = gaussians._features_dc.detach().mean(dim=0, keepdim=True)
+        default_rest = gaussians._features_rest.detach().mean(dim=0, keepdim=True)
+        default_opacity = gaussians._opacity.detach().mean(dim=0, keepdim=True)
+    else:
+        default_scaling = torch.zeros((1, 2), dtype=torch.float32, device=device)
+        default_dc = torch.zeros((1, 1, 3), dtype=torch.float32, device=device)
+        default_rest = torch.zeros((1, 0, 3), dtype=torch.float32, device=device)
+        default_opacity = inverse_sigmoid(torch.full((1, 1), FIXED_OPACITY_TARGET, dtype=torch.float32, device=device))
+
+    new_xyz = []
+    new_rotation = []
+    new_scaling = []
+    new_opacity = []
+    new_features_dc = []
+    new_features_rest = []
+    tracker = chunk5_runtime_state.get("high_error_tracker", {})
+
+    for frame_key, row, col, _count in candidates:
+        frame_idx = frame_key_to_index.get(frame_key)
+        if frame_idx is None:
+            continue
+        rows_t = torch.tensor([row], dtype=torch.long, device=device)
+        cols_t = torch.tensor([col], dtype=torch.long, device=device)
+        loglik, support_mask = build_stage1_multiview_loglik_for_pixels(
+            frame_idx=frame_idx,
+            frame_key=frame_key,
+            rows=rows_t,
+            cols=cols_t,
+            training_frames=training_frames,
+            frame_key_to_index=frame_key_to_index,
+            overlap_table=overlap_table,
+            gt_frame_cache=gt_frame_cache,
+            frame_stats_cache=frame_stats_cache,
+            elev_angle_bins=elev_angle_bins,
+            sonar_config=sonar_config,
+            sonar_scale_factor=sonar_scale_factor,
+            cfg=stage1_cfg,
+        )
+        if not bool(support_mask.any().item()):
+            out["skip_support_count"] += 1
+            continue
+
+        peak_bin, _scores = select_peak_bin_from_loglik(
+            loglik=loglik[0],
+            support_mask=support_mask[0],
+            min_score=chunk5_cfg.densify_multiview_min_score,
+        )
+        if peak_bin is None:
+            out["skip_flat_count"] += 1
+            continue
+
+        spawn_xyz = back_project_bins(
+            frame_idx=int(frame_idx),
+            rows=rows_t,
+            cols=cols_t,
+            elev_bins=elev_angle_bins[int(peak_bin): int(peak_bin) + 1],
+            cameras=training_frames,
+            sonar_config=sonar_config,
+            scale_factor=sonar_scale_factor,
+        ).reshape(1, 3)
+
+        center_probs = masked_softmax(
+            loglik,
+            support_mask,
+            dim=-1,
+            min_support=stage1_cfg.lik_min_support,
+        )
+        spawn_geometry = _compute_chunk5_local_expected_geometry(
+            frame_idx=frame_idx,
+            frame_key=frame_key,
+            rows=rows_t,
+            cols=cols_t,
+            center_probs=center_probs,
+            center_support_mask=support_mask,
+            training_frames=training_frames,
+            frame_key_to_index=frame_key_to_index,
+            overlap_table=overlap_table,
+            gt_frame_cache=gt_frame_cache,
+            frame_stats_cache=frame_stats_cache,
+            elev_angle_bins=elev_angle_bins,
+            sonar_config=sonar_config,
+            sonar_scale_factor=sonar_scale_factor,
+            stage1_cfg=stage1_cfg,
+            confidence_thresh=chunk5_cfg.normal_confidence_thresh,
+        )
+        if int(spawn_geometry["normals_expected"].shape[0]) > 0:
+            spawn_rotation = quaternions_from_normals(spawn_geometry["normals_expected"][:1])
+        else:
+            camera_pos = camera_world_position_tensor(training_frames[int(frame_idx)], device=device).reshape(1, 3)
+            fallback_normal = camera_pos - spawn_xyz
+            fallback_normal = fallback_normal / fallback_normal.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+            spawn_rotation = quaternions_from_normals(fallback_normal)
+
+        spawn_proj = sonar_project_points(
+            spawn_xyz,
+            training_frames[int(frame_idx)],
+            sonar_config,
+            scale_factor=sonar_scale_factor,
+        )
+        visible_mask = torch.ones((gaussians.get_xyz.shape[0],), dtype=torch.bool, device=device)
+        surfel_xyz = gaussians.get_xyz[visible_mask]
+        surfel_match_idx = None
+        if surfel_xyz.shape[0] > 0:
+            surf_proj = sonar_project_points(
+                surfel_xyz,
+                training_frames[int(frame_idx)],
+                sonar_config,
+                scale_factor=sonar_scale_factor,
+            )
+            surf_idx, _assoc_w, match_valid = associate_expected_points_to_surfels(
+                exp_row=spawn_proj.row,
+                exp_col=spawn_proj.col,
+                exp_depth=spawn_proj.range_vals,
+                exp_valid=spawn_proj.valid,
+                surf_row=surf_proj.row,
+                surf_col=surf_proj.col,
+                surf_depth=surf_proj.range_vals,
+                surf_valid=surf_proj.valid,
+                max_pix_err=chunk4_cfg.couple_max_pix_err,
+                max_depth_err=chunk4_cfg.couple_max_depth_err,
+                sigma_pix=chunk4_cfg.couple_sigma_pix,
+                sigma_depth=chunk4_cfg.couple_sigma_depth,
+                min_w=chunk4_cfg.couple_min_w,
+            )
+            if bool(match_valid.any().item()):
+                surfel_match_idx = int(surf_idx[match_valid][0].item())
+
+        if surfel_match_idx is None:
+            spawn_scaling = default_scaling.clone()
+            spawn_features_dc = default_dc.clone()
+            spawn_features_rest = default_rest.clone()
+            spawn_opacity = (
+                inverse_sigmoid(torch.full((1, 1), FIXED_OPACITY_TARGET, dtype=torch.float32, device=device))
+                if SONAR_FIXED_OPACITY
+                else default_opacity.clone()
+            )
+        else:
+            spawn_scaling = gaussians._scaling[surfel_match_idx:surfel_match_idx + 1].detach().clone()
+            spawn_features_dc = gaussians._features_dc[surfel_match_idx:surfel_match_idx + 1].detach().clone()
+            spawn_features_rest = gaussians._features_rest[surfel_match_idx:surfel_match_idx + 1].detach().clone()
+            spawn_opacity = (
+                inverse_sigmoid(torch.full((1, 1), FIXED_OPACITY_TARGET, dtype=torch.float32, device=device))
+                if SONAR_FIXED_OPACITY
+                else gaussians._opacity[surfel_match_idx:surfel_match_idx + 1].detach().clone()
+            )
+
+        new_xyz.append(spawn_xyz)
+        new_rotation.append(spawn_rotation)
+        new_scaling.append(spawn_scaling)
+        new_opacity.append(spawn_opacity)
+        new_features_dc.append(spawn_features_dc)
+        new_features_rest.append(spawn_features_rest)
+        tracker.pop(make_high_error_key(frame_key, row, col), None)
+
+    if not new_xyz:
+        return out
+
+    gaussians.densification_postfix(
+        torch.cat(new_xyz, dim=0),
+        torch.cat(new_features_dc, dim=0),
+        torch.cat(new_features_rest, dim=0),
+        torch.cat(new_opacity, dim=0),
+        torch.cat(new_scaling, dim=0),
+        torch.cat(new_rotation, dim=0),
+    )
+    if chunk4_runtime_state is not None:
+        ensure_chunk4_state_capacity(chunk4_runtime_state, gaussians, chunk4_cfg, global_iter)
+    out["spawn_count"] = len(new_xyz)
     return out
 
 
@@ -2046,32 +2343,32 @@ def restore_chunk4_runtime_state_from_checkpoint(chunk4_payload, gaussians, cfg)
 
 
 def init_chunk5_runtime_state(cfg, active_frame_keys, active_frame_fingerprint):
-    return build_chunk5_checkpoint_payload(
+    payload = build_chunk5_checkpoint_payload(
         normal_mode=cfg.effective_normal_mode,
         densify_enabled=cfg.densify_enabled,
         densify_mode=cfg.effective_densify_mode,
         densify_event_count=0,
         high_error_tracker={},
         active_frame_keys=active_frame_keys,
-    ) | {
-        "active_frame_fingerprint": str(active_frame_fingerprint),
-    }
+    )
+    payload["active_frame_fingerprint"] = str(active_frame_fingerprint)
+    return payload
 
 
 def build_chunk5_runtime_checkpoint_state(chunk5_runtime_state, active_frame_keys, active_frame_fingerprint, cfg):
     if chunk5_runtime_state is None:
         return None
 
-    return build_chunk5_checkpoint_payload(
+    payload = build_chunk5_checkpoint_payload(
         normal_mode=chunk5_runtime_state.get("normal_mode", cfg.effective_normal_mode),
         densify_enabled=chunk5_runtime_state.get("densify_enabled", cfg.densify_enabled),
         densify_mode=chunk5_runtime_state.get("densify_mode", cfg.effective_densify_mode),
         densify_event_count=chunk5_runtime_state.get("densify_event_count", 0),
         high_error_tracker=chunk5_runtime_state.get("high_error_tracker", {}),
         active_frame_keys=active_frame_keys,
-    ) | {
-        "active_frame_fingerprint": str(active_frame_fingerprint),
-    }
+    )
+    payload["active_frame_fingerprint"] = str(active_frame_fingerprint)
+    return payload
 
 
 def restore_chunk5_runtime_state_from_checkpoint(chunk5_payload, cfg, active_frame_keys, active_frame_fingerprint):
@@ -2103,7 +2400,9 @@ def restore_chunk5_runtime_state_from_checkpoint(chunk5_payload, cfg, active_fra
     high_error_tracker = {str(k): int(v) for k, v in high_error_tracker_raw.items()}
 
     loaded_keys = [str(key) for key in chunk5_payload.get("active_frame_keys", [])]
-    if loaded_keys and loaded_keys != list(active_frame_keys):
+    if not loaded_keys:
+        raise ValueError("Chunk-5 checkpoint active_frame_keys is empty")
+    if loaded_keys != list(active_frame_keys):
         raise ValueError("Chunk-5 checkpoint active_frame_keys mismatch")
 
     loaded_fingerprint = str(chunk5_payload.get("active_frame_fingerprint", ""))
@@ -3954,6 +4253,11 @@ def main():
         f"multiview_min_score={ELEV_CHUNK5_CFG.densify_multiview_min_score:.3f}, "
         f"resume_policy={ELEV_CHUNK5_CFG.resume_mismatch_policy}"
     )
+    if ELEV_CHUNK5_CFG.normal_weight_early > ELEV_CHUNK5_CFG.normal_weight_late:
+        print(
+            "[Elevation Chunk 5] warning: normal ramp decreases over time "
+            f"({ELEV_CHUNK5_CFG.normal_weight_early:.3f} -> {ELEV_CHUNK5_CFG.normal_weight_late:.3f})"
+        )
     if ELEV_STAGE1_CFG.effective_stage1_mode == "off":
         print("[Elevation Stage 1] effective_mode=off -> sampler fallback=legacy single-frame shuffled path")
     if SONAR_FIXED_OPACITY:
@@ -4614,8 +4918,6 @@ def main():
                     f"[Elevation Chunk 5] resume action={chunk5_resume_action}; "
                     "using fresh runtime state"
                 )
-            else:
-                print(f"[Elevation Chunk 5] resume action={chunk5_resume_action}; state skipped")
 
         if resume_stage1_state and ELEV_STAGE1_CFG.effective_stage1_mode != "off":
             resume_schema = str(resume_stage1_state.get("checkpoint_schema_version", ""))
@@ -5077,9 +5379,9 @@ def main():
             normal_loss_enabled = mode_enables_normal_loss(ELEV_CHUNK5_CFG.effective_normal_mode)
             densify_candidate_enabled = (
                 mode_enables_densify_candidates(ELEV_CHUNK5_CFG.effective_densify_mode)
+                and chunk4_runtime_state is not None
                 and os.environ.get("SONAR_OCCLUSION_MODE", "ray_binned").strip().lower() == "ray_binned"
             )
-            densify_spawn_enabled = mode_enables_densify_spawn(ELEV_CHUNK5_CFG.effective_densify_mode)
             densify_iter_eligible = is_densify_iteration_eligible(
                 iteration=global_iter,
                 stage2_start_iter=ELEV_CHUNK5_CFG.stage2_start_iter,
@@ -5108,6 +5410,7 @@ def main():
             batch_densify_high_error = []
             batch_densify_candidates = []
             batch_densify_resets = []
+            batch_densify_spawn = []
             iter_cached_loglik = {}
             iter_cached_support_mask = {}
             iter_p_post = {}
@@ -5273,6 +5576,7 @@ def main():
                 batch_densify_high_error.append(int(densify_stats["high_error_count"]))
                 batch_densify_candidates.append(int(densify_stats["persistent_candidate_count"]))
                 batch_densify_resets.append(int(densify_stats["reset_count"]))
+                batch_densify_spawn.append(int(densify_stats.get("spawn_count", 0)))
 
                 if chunk4_runtime_state is not None:
                     iter_support_obs[frame_idx] = compute_chunk4_support_observations_for_frame(
@@ -5312,12 +5616,17 @@ def main():
             densify_high_error_mean = float(np.mean(batch_densify_high_error)) if batch_densify_high_error else 0.0
             densify_candidates_mean = float(np.mean(batch_densify_candidates)) if batch_densify_candidates else 0.0
             densify_resets_mean = float(np.mean(batch_densify_resets)) if batch_densify_resets else 0.0
+            densify_spawn_mean = float(np.mean(batch_densify_spawn)) if batch_densify_spawn else 0.0
             cached_loglik = iter_cached_loglik
             cached_support_mask = iter_cached_support_mask
             p_post = iter_p_post
-
-            if densify_candidate_enabled and densify_iter_eligible and chunk5_runtime_state is not None:
-                chunk5_runtime_state["densify_event_count"] = int(chunk5_runtime_state.get("densify_event_count", 0)) + 1
+            densify_event_stats = {
+                "candidate_count": 0,
+                "persistent_candidate_count": int(round(densify_candidates_mean)),
+                "spawn_count": 0,
+                "skip_flat_count": 0,
+                "skip_support_count": 0,
+            }
 
             # Backward
             loss.backward()
@@ -5352,6 +5661,36 @@ def main():
                         chunk4_runtime_state=chunk4_runtime_state,
                         chunk4_cfg=ELEV_CHUNK4_CFG,
                     )
+
+                if densify_candidate_enabled and densify_iter_eligible and chunk5_runtime_state is not None:
+                    chunk5_runtime_state["densify_event_count"] = int(chunk5_runtime_state.get("densify_event_count", 0)) + 1
+                    if ELEV_CHUNK5_CFG.effective_densify_mode == "active":
+                        densify_event_stats = spawn_chunk5_surfels_for_event(
+                            global_iter=global_iter,
+                            sampled_frame_indices=sampled_frame_indices,
+                            training_frames=training_frames,
+                            frame_key_to_index=frame_key_to_index,
+                            overlap_table=overlap_table,
+                            gt_frame_cache=gt_frame_cache,
+                            frame_stats_cache=frame_stats_cache,
+                            gaussians=gaussians,
+                            sonar_config=sonar_config,
+                            sonar_scale_factor=sonar_scale_factor,
+                            elev_angle_bins=elev_angle_bins,
+                            stage1_cfg=ELEV_STAGE1_CFG,
+                            chunk4_runtime_state=chunk4_runtime_state,
+                            chunk4_cfg=ELEV_CHUNK4_CFG,
+                            chunk5_runtime_state=chunk5_runtime_state,
+                            chunk5_cfg=ELEV_CHUNK5_CFG,
+                        )
+                    else:
+                        densify_event_stats = {
+                            "candidate_count": len(sampled_frame_indices),
+                            "persistent_candidate_count": int(round(densify_candidates_mean)),
+                            "spawn_count": 0,
+                            "skip_flat_count": 0,
+                            "skip_support_count": 0,
+                        }
 
                 # FOV-aware pruning: remove surfels that drifted outside all training FOVs
                 if FOV_PRUNE_INTERVAL > 0 and iteration % FOV_PRUNE_INTERVAL == 0:
@@ -5413,7 +5752,8 @@ def main():
                         sampler_tail += (
                             f", densify_mode={ELEV_CHUNK5_CFG.effective_densify_mode}, trig={int(densify_iter_eligible)}, "
                             f"high_err={densify_high_error_mean:.1f}, cand={densify_candidates_mean:.1f}, "
-                            f"reset={densify_resets_mean:.1f}, spawn={int(densify_spawn_enabled) * 0}"
+                            f"reset={densify_resets_mean:.1f}, spawn={densify_event_stats['spawn_count']}, "
+                            f"skip_flat={densify_event_stats['skip_flat_count']}, skip_sup={densify_event_stats['skip_support_count']}"
                         )
                 if chunk4_runtime_state is not None:
                     sampler_tail += (
@@ -5552,9 +5892,9 @@ def main():
             normal_loss_enabled = mode_enables_normal_loss(ELEV_CHUNK5_CFG.effective_normal_mode)
             densify_candidate_enabled = (
                 mode_enables_densify_candidates(ELEV_CHUNK5_CFG.effective_densify_mode)
+                and chunk4_runtime_state is not None
                 and os.environ.get("SONAR_OCCLUSION_MODE", "ray_binned").strip().lower() == "ray_binned"
             )
-            densify_spawn_enabled = mode_enables_densify_spawn(ELEV_CHUNK5_CFG.effective_densify_mode)
             densify_iter_eligible = is_densify_iteration_eligible(
                 iteration=global_iter,
                 stage2_start_iter=ELEV_CHUNK5_CFG.stage2_start_iter,
@@ -5583,6 +5923,7 @@ def main():
             batch_densify_high_error = []
             batch_densify_candidates = []
             batch_densify_resets = []
+            batch_densify_spawn = []
             iter_cached_loglik = {}
             iter_cached_support_mask = {}
             iter_p_post = {}
@@ -5746,6 +6087,7 @@ def main():
                 batch_densify_high_error.append(int(densify_stats["high_error_count"]))
                 batch_densify_candidates.append(int(densify_stats["persistent_candidate_count"]))
                 batch_densify_resets.append(int(densify_stats["reset_count"]))
+                batch_densify_spawn.append(int(densify_stats.get("spawn_count", 0)))
 
                 if chunk4_runtime_state is not None:
                     iter_support_obs[frame_idx] = compute_chunk4_support_observations_for_frame(
@@ -5785,12 +6127,17 @@ def main():
             densify_high_error_mean = float(np.mean(batch_densify_high_error)) if batch_densify_high_error else 0.0
             densify_candidates_mean = float(np.mean(batch_densify_candidates)) if batch_densify_candidates else 0.0
             densify_resets_mean = float(np.mean(batch_densify_resets)) if batch_densify_resets else 0.0
+            densify_spawn_mean = float(np.mean(batch_densify_spawn)) if batch_densify_spawn else 0.0
             cached_loglik = iter_cached_loglik
             cached_support_mask = iter_cached_support_mask
             p_post = iter_p_post
-
-            if densify_candidate_enabled and densify_iter_eligible and chunk5_runtime_state is not None:
-                chunk5_runtime_state["densify_event_count"] = int(chunk5_runtime_state.get("densify_event_count", 0)) + 1
+            densify_event_stats = {
+                "candidate_count": 0,
+                "persistent_candidate_count": int(round(densify_candidates_mean)),
+                "spawn_count": 0,
+                "skip_flat_count": 0,
+                "skip_support_count": 0,
+            }
 
             loss.backward()
 
@@ -5824,6 +6171,36 @@ def main():
                         chunk4_runtime_state=chunk4_runtime_state,
                         chunk4_cfg=ELEV_CHUNK4_CFG,
                     )
+
+                if densify_candidate_enabled and densify_iter_eligible and chunk5_runtime_state is not None:
+                    chunk5_runtime_state["densify_event_count"] = int(chunk5_runtime_state.get("densify_event_count", 0)) + 1
+                    if ELEV_CHUNK5_CFG.effective_densify_mode == "active":
+                        densify_event_stats = spawn_chunk5_surfels_for_event(
+                            global_iter=global_iter,
+                            sampled_frame_indices=sampled_frame_indices,
+                            training_frames=training_frames,
+                            frame_key_to_index=frame_key_to_index,
+                            overlap_table=overlap_table,
+                            gt_frame_cache=gt_frame_cache,
+                            frame_stats_cache=frame_stats_cache,
+                            gaussians=gaussians,
+                            sonar_config=sonar_config,
+                            sonar_scale_factor=sonar_scale_factor,
+                            elev_angle_bins=elev_angle_bins,
+                            stage1_cfg=ELEV_STAGE1_CFG,
+                            chunk4_runtime_state=chunk4_runtime_state,
+                            chunk4_cfg=ELEV_CHUNK4_CFG,
+                            chunk5_runtime_state=chunk5_runtime_state,
+                            chunk5_cfg=ELEV_CHUNK5_CFG,
+                        )
+                    else:
+                        densify_event_stats = {
+                            "candidate_count": len(sampled_frame_indices),
+                            "persistent_candidate_count": int(round(densify_candidates_mean)),
+                            "spawn_count": 0,
+                            "skip_flat_count": 0,
+                            "skip_support_count": 0,
+                        }
 
                 # FOV-aware pruning
                 if FOV_PRUNE_INTERVAL > 0 and iteration % FOV_PRUNE_INTERVAL == 0:
@@ -5885,7 +6262,8 @@ def main():
                         sampler_tail += (
                             f", densify_mode={ELEV_CHUNK5_CFG.effective_densify_mode}, trig={int(densify_iter_eligible)}, "
                             f"high_err={densify_high_error_mean:.1f}, cand={densify_candidates_mean:.1f}, "
-                            f"reset={densify_resets_mean:.1f}, spawn={int(densify_spawn_enabled) * 0}"
+                            f"reset={densify_resets_mean:.1f}, spawn={densify_event_stats['spawn_count']}, "
+                            f"skip_flat={densify_event_stats['skip_flat_count']}, skip_sup={densify_event_stats['skip_support_count']}"
                         )
                 if chunk4_runtime_state is not None:
                     sampler_tail += (

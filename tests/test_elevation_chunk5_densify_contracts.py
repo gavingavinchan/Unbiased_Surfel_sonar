@@ -1,4 +1,5 @@
 import importlib.util
+import math
 import random
 from pathlib import Path
 
@@ -142,3 +143,75 @@ def test_c5_t06_arc_peak_selection_argmax_and_skip_contract(chunk5):
         min_score=0.30,
     )
     assert skipped_nontrivial is None
+
+
+def test_c5_t06_high_error_tracker_key_roundtrip_and_ranking_contract(chunk5):
+    key = chunk5.make_high_error_key("frame_001", 12, 34)
+    assert key == "frame_001:12:34"
+    assert chunk5.parse_high_error_key(key) == ("frame_001", 12, 34)
+
+    tracker = {
+        "frame_001:10:20": 2,
+        "frame_001:5:3": 4,
+        "frame_002:7:9": 3,
+        "frame_003:1:1": 10,
+    }
+    selected = chunk5.select_persistent_high_error_candidates(
+        high_error_tracker=tracker,
+        frame_keys=["frame_001", "frame_002"],
+        min_hits=2,
+        max_candidates=3,
+    )
+
+    assert selected == [
+        ("frame_001", 5, 3, 4),
+        ("frame_002", 7, 9, 3),
+        ("frame_001", 10, 20, 2),
+    ]
+
+
+def test_c5_t06_peak_selection_from_loglik_contract(chunk5):
+    peak, scores = chunk5.select_peak_bin_from_loglik(
+        loglik=torch.tensor([-0.1, -1.0, -0.2], dtype=torch.float32),
+        support_mask=torch.tensor([1, 0, 1], dtype=torch.bool),
+        min_score=0.5,
+    )
+
+    assert peak == 0
+    assert torch.allclose(scores, torch.tensor([math.exp(-0.1), 0.0, math.exp(-0.2)], dtype=torch.float32), atol=1e-6)
+
+
+def test_c5_t06_peak_selection_from_loglik_skips_unsupported_bins(chunk5):
+    peak, scores = chunk5.select_peak_bin_from_loglik(
+        loglik=torch.tensor([-0.01, -0.02], dtype=torch.float32),
+        support_mask=torch.tensor([0, 0], dtype=torch.bool),
+        min_score=0.1,
+    )
+
+    assert peak is None
+    assert torch.equal(scores, torch.zeros((2,), dtype=torch.float32))
+
+
+def test_c5_t07_quaternion_from_normal_contract(chunk5):
+    normals = torch.tensor(
+        [
+            [0.0, 0.0, 1.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, -1.0],
+        ],
+        dtype=torch.float32,
+    )
+
+    quats = chunk5.quaternions_from_normals(normals)
+
+    assert quats.shape == (3, 4)
+    assert torch.allclose(torch.norm(quats, dim=-1), torch.ones((3,), dtype=torch.float32), atol=1e-6)
+    z_rotated = torch.stack(
+        [
+            2 * (quats[:, 1] * quats[:, 3] + quats[:, 0] * quats[:, 2]),
+            2 * (quats[:, 2] * quats[:, 3] - quats[:, 0] * quats[:, 1]),
+            1 - 2 * (quats[:, 1] * quats[:, 1] + quats[:, 2] * quats[:, 2]),
+        ],
+        dim=-1,
+    )
+    assert torch.allclose(z_rotated, normals, atol=1e-5)
