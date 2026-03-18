@@ -27,7 +27,7 @@ def depths_to_points(view, depthmap):
     points = depthmap.reshape(-1, 1) * rays_d + rays_o
     return points
 
-def depth_to_normal(view, depth, sonar_mode=False, sonar_config=None, scale_factor=None):
+def depth_to_normal(view, depth, sonar_mode=False, sonar_config=None, scale_factor=None, elevation_image=None):
     """
     Convert depth/range map to surface normals.
     
@@ -44,7 +44,13 @@ def depth_to_normal(view, depth, sonar_mode=False, sonar_config=None, scale_fact
     if sonar_mode:
         if sonar_config is None:
             raise ValueError("sonar_config required when sonar_mode=True")
-        points = sonar_ranges_to_points(view, depth, sonar_config, scale_factor)
+        points = sonar_ranges_to_points(
+            view,
+            depth,
+            sonar_config,
+            scale_factor,
+            elevation_image=elevation_image,
+        )
         return sonar_points_to_normals(points, depth)
     else:
         # Original camera path
@@ -61,7 +67,7 @@ def depth_to_normal(view, depth, sonar_mode=False, sonar_config=None, scale_fact
 # Sonar (Polar) Projection Functions
 # =============================================================================
 
-def sonar_ranges_to_points(view, range_image, sonar_config, scale_factor=None):
+def sonar_ranges_to_points(view, range_image, sonar_config, scale_factor=None, elevation_image=None):
     """
     Convert sonar range image to 3D world-space points.
     
@@ -104,14 +110,24 @@ def sonar_ranges_to_points(view, range_image, sonar_config, scale_factor=None):
     # Range values come directly from the image (already in meters)
     r = range_image  # [H, W]
     
+    if elevation_image is None:
+        elevation = torch.zeros_like(r)
+    else:
+        if elevation_image.dim() == 3:
+            elevation_image = elevation_image.squeeze(0)
+        if elevation_image.shape != range_image.shape:
+            raise ValueError(
+                f"elevation_image shape {tuple(elevation_image.shape)} does not match range_image shape {tuple(range_image.shape)}"
+            )
+        elevation = elevation_image.to(device=r.device, dtype=r.dtype)
+
     # Convert polar to Cartesian in the canonical sonar/view frame.
-    # We assume zero elevation for the collapsed range image used here.
-    # right   = -r * sin(azimuth)
-    # down    = 0
-    # forward =  r * cos(azimuth)
-    x_s = -r * torch.sin(azimuth)
-    y_s = torch.zeros_like(r)
-    z_s = r * torch.cos(azimuth)
+    # right   = -r * sin(azimuth) * cos(elevation)
+    # down    =  r * sin(elevation)
+    # forward =  r * cos(azimuth) * cos(elevation)
+    x_s = -r * torch.sin(azimuth) * torch.cos(elevation)
+    y_s = r * torch.sin(elevation)
+    z_s = r * torch.cos(azimuth) * torch.cos(elevation)
     
     # Stack to get points in sonar frame [H, W, 3]
     points_sonar = torch.stack([x_s, y_s, z_s], dim=-1)

@@ -3,6 +3,22 @@
 ## Abstract
 We extended 2D Gaussian Splatting to forward-looking multibeam sonar by introducing polar rendering, backward projection, metric scale alignment, and sonar-specific training constraints. The work adds sonar mode data flow, pose interpolation from camera trajectories, a learnable global scale factor, camera-to-sonar extrinsics, differentiable polar rendering with intensity modeling, size-aware field-of-view (FOV) constraints, and loss shaping for bright sonar returns. We also introduced mesh tuning workflows and dataset preparation guidelines to support real-world sonar reconstructions.
 
+## 2026-03-18 Chunk-5 Runtime Addendum
+Chunk 5 now has a first concrete late-normal runtime path in `debug_multiframe.py`. For each sparse Stage-1 anchor pixel with a valid posterior, the implementation explicitly queries the image-grid 4-neighborhood, evaluates Stage-1 multi-view evidence on those exact neighbors, forms an expected elevation
+$$
+e_{\mathrm{exp}}(u,v) = \sum_k p_{\mathrm{post}}(u,v,k)\, e_k,
+$$
+back-projects the center and four neighbors into world coordinates, and computes a finite-difference normal using
+$$
+n_{\mathrm{fd}} = \frac{(p_{\mathrm{right}} - p_{\mathrm{left}}) \times (p_{\mathrm{down}} - p_{\mathrm{up}})}{\left\|(p_{\mathrm{right}} - p_{\mathrm{left}}) \times (p_{\mathrm{down}} - p_{\mathrm{up}})\right\| + \varepsilon}.
+$$
+
+Those expected normals are then associated to visible surfels using the same projection/error gates already used by Chunk 4, and the supervision term added to the unified Stage-2/Stage-3 objective is the sign-ambiguous cosine loss
+$$
+\mathcal{L}_{\mathrm{normal}} = 1 - \left| n_{\mathrm{quat}} \cdot n_{\mathrm{expected}} \right|.
+$$
+The current rollout remains conservative: confidence gating still decides which anchors participate, and densification remains in shadow mode only. The new point-utils contract also now admits an optional per-pixel elevation field so the sonar back-projection equations are consistent between the standalone geometry helpers and the training-loop Chunk-5 path.
+
 ## 2026-03-17 Chunk-5 Planning Clarification Addendum
 The current Chunk-5 execution contract is now tightened to match the actual Stage-1 data layout used by `debug_multiframe.py`. Stage-1 posteriors are maintained on a sparse bright-pixel bank, so any expected-elevation finite-difference normal estimate in Chunk 5 must explicitly query the exact local image-grid neighborhood around each anchor pixel instead of assuming a dense posterior image exists. This removes an ambiguity that would otherwise make the late-normal supervision coverage ill-defined.
 

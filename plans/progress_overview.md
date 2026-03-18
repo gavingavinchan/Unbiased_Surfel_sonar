@@ -1,5 +1,12 @@
 # Progress Overview (Post-Fork, Multi-Branch)
 
+## 2026-03-18 Chunk-5 TDD and Runtime Wiring
+- Added the first Chunk-5 helper/test tranche: schedule, confidence-mask, checkpoint, mode-gating, densify-gating, and point-utils contracts now live under `tests/test_elevation_chunk5_*` with `utils/elevation_chunk5_helpers.py` as the initial helper surface.
+- Wired `debug_multiframe.py` to parse Chunk-5 config, log Chunk-5 modes, carry a sibling `elevation_chunk5_state` checkpoint payload, and restore/reset that state under an explicit mismatch policy.
+- Implemented the first real late-normal runtime path in `debug_multiframe.py`: sparse Stage-1 anchor pixels now request an explicit local 4-neighborhood closure, compute expected-elevation world points, derive finite-difference normals, associate them back to visible surfels with the existing Chunk-4 gates, and add cosine normal supervision once into the unified Stage-2/Stage-3 loss.
+- Extended `utils/point_utils.py` so the sonar point-conversion path accepts optional per-pixel elevation while preserving `elevation_image=None` parity with the previous zero-elevation behavior.
+- Added densify shadow scaffolding only: high-error tracker updates, trigger diagnostics, and checkpoint persistence exist, but active surfel spawning is still intentionally unimplemented.
+
 ## 2026-03-17 Chunk-5 Plan Tightening
 - Tightened `plans/PLAN_ELEVATION_AWARE_CHUNK5_EXECUTION_2026-03-16.md` against upstream plans and current code reality before any Chunk-5 TDD work begins.
 - Clarified that late-normal finite-difference supervision must explicitly materialize the image-grid 4-neighborhood around sparse Stage-1 anchor pixels rather than assuming dense pixel-bank support.
