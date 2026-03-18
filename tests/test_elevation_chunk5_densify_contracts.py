@@ -96,6 +96,18 @@ def test_c5_t05_densify_iteration_and_interval_eligibility_contract(chunk5):
     )
 
 
+def test_c5_t05_stage2_start_default_stays_fixed_for_short_and_long_runs(chunk5):
+    assert chunk5.resolve_chunk5_stage2_start_default(stage2_iters=0) == 12000
+    assert chunk5.resolve_chunk5_stage2_start_default(stage2_iters=5000) == 12000
+    assert chunk5.resolve_chunk5_stage2_start_default(stage2_iters=50000) == 12000
+
+
+def test_c5_t05_renderer_contract_gate_requires_2dgs_and_ray_binned(chunk5):
+    assert chunk5.chunk5_renderer_contract_is_active(render_mode="2dgs", occlusion_mode="ray_binned")
+    assert not chunk5.chunk5_renderer_contract_is_active(render_mode="2dgs", occlusion_mode="legacy")
+    assert not chunk5.chunk5_renderer_contract_is_active(render_mode="pinhole", occlusion_mode="ray_binned")
+
+
 def test_c5_t06_arc_bin_scoring_formula_contract(chunk5):
     gt_intensity = torch.tensor(
         [

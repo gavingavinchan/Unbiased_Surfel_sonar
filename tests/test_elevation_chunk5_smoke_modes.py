@@ -204,3 +204,5 @@ def test_c5_t13_runtime_active_densify_smoke(tmp_path):
     assert math.isfinite(out["stats"]["ssim_mean"])
     assert "densify_mode=active" in out["log_text"]
     assert "spawn=" in out["log_text"]
+    assert "cand=" in out["log_text"]
+    assert "supp=" in out["log_text"]

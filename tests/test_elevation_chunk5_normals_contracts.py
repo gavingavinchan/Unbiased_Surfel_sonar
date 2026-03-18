@@ -139,6 +139,25 @@ def test_c5_t02_finite_difference_normal_tilted_surface_contract(chunk5):
     assert torch.allclose(normals, expected, atol=1e-6)
 
 
+def test_c5_t02_finite_difference_normal_degenerate_geometry_is_rejected(chunk5):
+    pts_left = torch.tensor([[0.0, 0.0, 0.0]], dtype=torch.float32)
+    pts_right = torch.tensor([[1.0, 0.0, 0.0]], dtype=torch.float32)
+    pts_up = torch.tensor([[0.0, 0.0, 0.0]], dtype=torch.float32)
+    pts_down = torch.tensor([[2.0, 0.0, 0.0]], dtype=torch.float32)
+
+    normals = chunk5.compute_finite_difference_normals(
+        pts_left=pts_left,
+        pts_right=pts_right,
+        pts_up=pts_up,
+        pts_down=pts_down,
+        eps=1e-8,
+        min_norm=1e-6,
+    )
+
+    assert normals.shape == (1, 3)
+    assert not torch.isfinite(normals).all()
+
+
 def test_c5_t03_confidence_mask_contract(chunk5):
     probs = torch.tensor(
         [

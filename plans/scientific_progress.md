@@ -17,6 +17,29 @@ Those expected normals are then associated to visible surfels using the same pro
 $$
 \mathcal{L}_{\mathrm{normal}} = 1 - \left| n_{\mathrm{quat}} \cdot n_{\mathrm{expected}} \right|.
 $$
+The repaired Chunk-5 runtime now treats degenerate finite-difference neighborhoods as invalid rather than as zero-vector normals. Concretely, if
+$$
+\left\|(p_{\mathrm{right}} - p_{\mathrm{left}}) \times (p_{\mathrm{down}} - p_{\mathrm{up}})\right\| \le \tau_{\mathrm{fd}},
+$$
+with the current implementation using $\tau_{\mathrm{fd}} = 10^{-6}$, that anchor contributes no normal supervision. This keeps the cosine objective from assigning a spurious maximum penalty to geometrically collapsed neighborhoods.
+
+The Chunk-5 densify rollout is also now interpreted under a stricter renderer fingerprint. Candidate tracking and optional spawning are considered active only when
+$$
+\texttt{SONAR\_RENDER\_MODE}=\texttt{2dgs}
+\quad \text{and} \quad
+\texttt{SONAR\_OCCLUSION\_MODE}=\texttt{ray\_binned},
+$$
+which restores the intended renderer-v2 contract for any scientifically meaningful Chunk-5 densify evidence. The default delayed trigger remains the fixed plan threshold $t_{\mathrm{start}} = 12000$ iterations; reduced-budget experiments must still override that threshold explicitly when they want to exercise Chunk-5 behavior earlier.
+
+For densify events themselves, the duplicate-suppression contract is now two-stage. A candidate spawn $s_c$ is rejected if it matches either an already-visible surfel set $\mathcal{S}_{\mathrm{vis}}$ for the current frame or the set of pending accepted spawns $\mathcal{S}_{\mathrm{new}}$ accumulated earlier in the same event:
+$$
+\operatorname{spawn}(s_c) = 0
+\quad \text{if} \quad
+\exists s \in \mathcal{S}_{\mathrm{vis}} \cup \mathcal{S}_{\mathrm{new}}
+\text{ such that } w(s_c, s) \ge w_{\min}.
+$$
+This makes the event-level spawn batch consistent with the duplicate-suppression intent already used for existing surfels, while avoiding same-event near-duplicate growth that would otherwise be invisible until after `densification_postfix` completes.
+
 The current rollout remains conservative in interpretation but no longer purely shadow-mode in implementation. Optional Chunk-5 densification now has a first active spawn path: persistent high-error candidates are ranked deterministically, a peak elevation bin is chosen from Stage-1 support, and a new surfel is initialized at the resulting world point. When the local 4-neighborhood geometry is valid, the spawn rotation is initialized from the expected finite-difference normal; otherwise it falls back to a deterministic camera-facing normal. The new point-utils contract also now admits an optional per-pixel elevation field so the sonar back-projection equations are consistent between the standalone geometry helpers and the training-loop Chunk-5 path, while `elevation_image=None` still uses the legacy collapsed zero-elevation geometry exactly.
 
 ## 2026-03-17 Chunk-5 Planning Clarification Addendum

@@ -46,11 +46,16 @@ def compute_finite_difference_normals(
     pts_up: torch.Tensor,
     pts_down: torch.Tensor,
     eps: float = 1e-8,
+    min_norm: float = 1e-6,
 ) -> torch.Tensor:
     dp_az = pts_right - pts_left
     dp_rg = pts_down - pts_up
     n_fd = torch.cross(dp_az, dp_rg, dim=-1)
-    return n_fd / n_fd.norm(dim=-1, keepdim=True).clamp_min(float(eps))
+    n_fd_norm = n_fd.norm(dim=-1, keepdim=True)
+    safe = n_fd_norm > max(float(eps), float(min_norm))
+    normalized = n_fd / n_fd_norm.clamp_min(float(eps))
+    invalid = torch.full_like(normalized, float("nan"))
+    return torch.where(safe.expand_as(normalized), normalized, invalid)
 
 
 def compute_confidence_mask(
@@ -119,6 +124,18 @@ def is_densify_iteration_eligible(*, iteration: int, stage2_start_iter: int, den
     if interval_i <= 0:
         return False
     return int(iteration) >= int(stage2_start_iter) and (int(iteration) % interval_i == 0)
+
+
+def resolve_chunk5_stage2_start_default(*, stage2_iters: int) -> int:
+    _ = int(stage2_iters)
+    return 12000
+
+
+def chunk5_renderer_contract_is_active(*, render_mode: str, occlusion_mode: str) -> bool:
+    return (
+        str(render_mode).strip().lower() == "2dgs"
+        and str(occlusion_mode).strip().lower() == "ray_binned"
+    )
 
 
 def compute_arc_bin_scores(
