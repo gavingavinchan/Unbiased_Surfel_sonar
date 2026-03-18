@@ -48,7 +48,10 @@ Chunk-5 is a refinement tranche, not a rescue tranche:
 - Active synthetic inventory and commands:
   - `docs/SYNTHETIC_DATASET_GUIDE.md`
 
-If any mismatch appears, follow the detailed training plan for algorithm contracts and the implementation-execution plan for gate policy.
+If any mismatch appears, higher-level upstream plans supersede this Chunk-5 execution note. In practice:
+- follow `plans/PLAN_ELEVATION_AWARE_TRAINING_2026-01-28.md` and `plans/PLAN_ELEVATION_AWARE_TRAINING_detailed_2026-02-01.md` for algorithm intent and stage semantics,
+- follow `plans/PLAN_ELEVATION_AWARE_IMPLEMENTATION_EXECUTION_2026-02-10.md` for sequencing and gate policy,
+- treat this document as the Chunk-5 refinement/rollout contract only where it does not conflict with those upstream plans.
 
 ---
 
@@ -265,16 +268,22 @@ Mode semantics:
 
 - For each selected candidate pixel, score elevation bins using multi-view agreement across overlap neighbors.
 - Use the active Stage-1 projection validity and reliability rules; invalid projections remain neutral, not punitive.
+- Keep densify placement scoring logically separate from the primary Stage-1 belief path: Stage-1 likelihood / posterior machinery remains the main optimization driver, while Stage-2 densify peak selection uses a derived multi-view agreement score for placement only.
 - Minimum v1 placement rule:
-  - one-surface case: spawn at the strongest peak bin,
-  - optional multi-peak mode: allow more than one spawn only when peaks are clearly separated and pass explicit thresholds.
+   - one-surface case: spawn at the strongest peak bin,
+   - optional multi-peak mode: allow more than one spawn only when peaks are clearly separated and pass explicit thresholds.
 - If the score profile is flat/unsupported, skip densification for that candidate and log the skip reason.
-- Recommended first-pass scoring rule:
+- Recommended first-pass scoring rule for the separate placement score:
 
 ```python
 score_e = sum_b reliability_b * valid_b * gt_intensity_b
 ```
 
+- Because the higher-level plans supersede this document, the exact formula above is a recommended v1 implementation, not a mandatory law. Alternative multi-view agreement scores are acceptable if they preserve the upstream architecture:
+  - Stage-1 likelihood remains the primary GT-anchored belief path,
+  - optional Stage-2 densify uses a separate agreement score rather than becoming a new global loss,
+  - validity/reliability neutrality is preserved,
+  - the resulting placement behavior is documented and tested.
 - Densification rate must be capped per trigger event for safety (`ELEV_DENSIFY_MAX_PER_EVENT`).
 
 ### 8. New-surfel initialization contract
