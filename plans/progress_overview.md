@@ -491,3 +491,12 @@ flowchart TB
 - Ran a harsher Chunk-4 ablation to force support-prune engagement: `output/chunk4_aggressive_probe_run2_harsh/`.
 - Manual visual review verdict: **regressed**; the torus did not move toward cube geometry, and approximately half the torus disappeared (collapse-by-pruning behavior).
 - Recorded observer note in `output/chunk4_aggressive_probe_run2_harsh/manual_visual_note_2026-02-24.md`.
+
+## Recent Updates (2026-03-25, Backward-Projection Rotation Bug Fix)
+
+- Fixed rotation transpose bug in `sonar_frame_to_points()`: `camera.R` is R_c2w, not R_w2c — the extra `.T` was placing initial surfels ~2 m from correct positions. Forward render path (`render_sonar`) was unaffected.
+- Same convention fix applied to all callers in `debug_multiframe.py` and `generate_pose_pyramids.py`.
+- Added unambiguous comparison naming (`comparison_<stage>_<idx>_<image>.png`) and `training_frame_index_map.csv`.
+- Chunk-5 arc scoring refactored: `build_stage1_multiview_evidence_for_pixels`, `compute_arc_score_contribution`, `select_arc_peak_bin`.
+- Post-fix rerun metrics: `loss_mean=0.003451`, `ssim_mean=0.9781`, 717 surfels.
+- Details: `docs/SYNTHETIC_DATASET_GUIDE.md` (Backward-Projection Rotation Convention Bug section).

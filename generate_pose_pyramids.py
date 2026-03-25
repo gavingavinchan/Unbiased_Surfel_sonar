@@ -149,16 +149,12 @@ def main():
     
     print("\nGenerating pyramids...")
     for i, cam in enumerate(train_cameras):
-        # Get camera pose
-        # cam.R is world-to-camera rotation (3x3)
-        # cam.T is world-to-camera translation (3,)
-        # Camera position in world = -R^T @ T
-        
-        R_w2c = cam.R  # [3, 3] world-to-camera rotation
+        # Get camera pose.
+        # cam.R stores camera-to-world rotation (3x3), cam.T stores world-to-camera
+        # translation (3,), so camera position in world is -R_c2w @ T.
+
+        R_c2w = cam.R  # [3, 3] camera-to-world rotation
         T_w2c = cam.T  # [3] world-to-camera translation
-        
-        # Camera position in world coordinates
-        R_c2w = R_w2c.T  # camera-to-world rotation
         position = -R_c2w @ T_w2c  # camera center in world
         
         # Create pyramid for this pose
@@ -201,9 +197,8 @@ def main():
     point_offset = 0
     
     for i, cam in enumerate(train_cameras):
-        R_w2c = cam.R
+        R_c2w = cam.R
         T_w2c = cam.T
-        R_c2w = R_w2c.T
         position = -R_c2w @ T_w2c
         
         # Get pyramid vertices in world frame

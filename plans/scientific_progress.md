@@ -805,3 +805,17 @@ Current closeout decision is **NO-GO** due to:
 1. `C4-S2` synthetic cube gate overall fail,
 2. coupling residual threshold miss ($0.30195 > 0.30$),
 3. pending manual `C4-T17` visual verdict.
+
+## 20. Backward-projection rotation convention bug (2026-03-25)
+
+Fixed a rotation transpose bug in `sonar_frame_to_points()`: `camera.R` stores $\mathbf{R}_{c \to w}$ (set in `dataset_readers.py:82` as `R = np.transpose(qvec2rotmat(...))`), but the backward projection assumed it was $\mathbf{R}_{w \to c}$ and transposed again. This placed initial surfel positions ~2 m from correct world locations. The forward path (`render_sonar` via `getWorld2View2`) was unaffected because it correctly un-transposes.
+
+The correct backward projection is:
+
+$$
+\mathbf{p}_w = \mathbf{R}_{c \to w}\,\mathbf{p}_c + \mathbf{c}_w, \qquad \mathbf{c}_w = -\mathbf{R}_{c \to w}\,\mathbf{t}_{w \to c}
+$$
+
+Same convention fix applied to all callers in `debug_multiframe.py` and `generate_pose_pyramids.py`.
+
+Details: `docs/SYNTHETIC_DATASET_GUIDE.md` (Backward-Projection Rotation Convention Bug section).

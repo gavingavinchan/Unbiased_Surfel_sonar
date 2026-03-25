@@ -34,7 +34,7 @@ from scene.dataset_readers import readColmapSceneInfo
 from utils.sonar_utils import SonarConfig, get_camera_to_sonar_transform, sonar_frame_to_points
 
 
-SCRIPT_VERSION = "2026-02-16"
+SCRIPT_VERSION = "2026-03-22"
 
 SPHERE_VARIANTS = {"A_clean", "A_noisy"}
 CUBE_VARIANTS = {"C_clean", "C_noisy"}
@@ -103,8 +103,26 @@ def parse_args() -> argparse.Namespace:
         default="-12,-6,0,6,12",
         help="Comma-separated elevation bands in degrees for multi_band policy",
     )
+    parser.add_argument(
+        "--pose-band-jitter-frac",
+        type=float,
+        default=0.2,
+        help=(
+            "Uniform elevation jitter as a fraction of the minimum pose-band spacing for "
+            "multi_band policy; set to 0 to keep band positions deterministic"
+        ),
+    )
     parser.add_argument("--translation-jitter-sigma", type=float, default=0.02)
     parser.add_argument("--rotation-jitter-sigma-deg", type=float, default=1.5)
+    parser.add_argument(
+        "--orientation-azimuth-jitter-max-deg",
+        type=float,
+        default=0.0,
+        help=(
+            "Uniform azimuth-only orientation jitter around the world up axis, in degrees, "
+            "applied to the center-facing pose"
+        ),
+    )
 
     parser.add_argument("--image-width", type=int, default=256)
     parser.add_argument("--image-height", type=int, default=200)
@@ -242,6 +260,7 @@ def generate_orbit_angles(
     elev_max_deg: float,
     policy: str,
     pose_bands_deg: np.ndarray,
+    pose_band_jitter_frac: float,
     rng: np.random.Generator,
 ) -> Tuple[np.ndarray, np.ndarray]:
     azimuths = np.linspace(0.0, 2.0 * math.pi, num_frames, endpoint=False, dtype=np.float64)
@@ -270,8 +289,12 @@ def generate_orbit_angles(
         sorted_bands = np.sort(np.unique(bands))
         if sorted_bands.shape[0] > 1:
             min_step = float(np.min(np.diff(sorted_bands)))
-            if min_step > 1e-9:
-                jitter = rng.uniform(low=-0.2 * min_step, high=0.2 * min_step, size=num_frames)
+            if min_step > 1e-9 and pose_band_jitter_frac > 0.0:
+                jitter = rng.uniform(
+                    low=-float(pose_band_jitter_frac) * min_step,
+                    high=float(pose_band_jitter_frac) * min_step,
+                    size=num_frames,
+                )
                 elevations = elevations + jitter
 
     elevations = np.clip(elevations, math.radians(elev_min_deg), math.radians(elev_max_deg))
@@ -305,11 +328,14 @@ def build_pose_records(args: argparse.Namespace, rng: np.random.Generator) -> Li
         elev_max_deg=float(args.elevation_max_deg),
         policy=pose_policy,
         pose_bands_deg=pose_bands_deg,
+        pose_band_jitter_frac=float(args.pose_band_jitter_frac),
         rng=rng,
     )
 
     poses: List[PoseRecord] = []
     rot_sigma_rad = math.radians(float(args.rotation_jitter_sigma_deg))
+    orientation_azimuth_jitter_max_rad = math.radians(float(args.orientation_azimuth_jitter_max_deg))
+    world_up = np.array([0.0, -1.0, 0.0], dtype=np.float64)
 
     for i in range(num_frames):
         az = azimuths[i]
@@ -327,7 +353,17 @@ def build_pose_records(args: argparse.Namespace, rng: np.random.Generator) -> Li
         trans_jitter = rng.normal(loc=0.0, scale=float(args.translation_jitter_sigma), size=3)
         sonar_center = base_sonar_center + trans_jitter
 
-        R_w2s = look_at_rotation_w2c(sonar_center, center)
+        target_world = center
+        if orientation_azimuth_jitter_max_rad > 0.0:
+            delta_az = rng.uniform(
+                low=-orientation_azimuth_jitter_max_rad,
+                high=orientation_azimuth_jitter_max_rad,
+            )
+            base_forward = normalize(center - sonar_center)
+            R_az = rotation_matrix_from_rotvec(world_up * delta_az)
+            target_world = sonar_center + (R_az @ base_forward)
+
+        R_w2s = look_at_rotation_w2c(sonar_center, target_world)
 
         rotvec_jitter = rng.normal(loc=0.0, scale=rot_sigma_rad, size=3)
         R_delta = rotation_matrix_from_rotvec(rotvec_jitter)
@@ -457,8 +493,9 @@ def render_sonar_frame(
     """
     Elevation-integrated forward model:
       - For each azimuth column, cast rays across elevation samples.
-      - Deposit 1.0 per hit in the corresponding range bin.
-      - Normalize by number of elevation samples.
+      - Resolve occlusion per (azimuth, elevation) ray via first hit.
+      - Collapse the elevation fan to the front envelope in range.
+      - Deposit the elevation hit fraction at the nearest range bin(s).
     """
     R_s2w = pose.R_w2s.T
     dirs_w_flat = dirs_s_flat @ R_s2w.T
@@ -485,20 +522,31 @@ def render_sonar_frame(
     W = int(sonar_cfg.image_width)
     span = float(sonar_cfg.range_max - sonar_cfg.range_min)
 
-    valid = np.isfinite(hit_ranges)
-    row_idx = np.zeros_like(hit_ranges, dtype=np.int64)
-    row_f = np.zeros_like(hit_ranges, dtype=np.float64)
-    row_f[valid] = (hit_ranges[valid] - float(sonar_cfg.range_min)) / span * H
-    row_idx[valid] = np.floor(row_f[valid]).astype(np.int64)
-
-    valid &= row_idx >= 0
-    valid &= row_idx < H
-
     counts = np.zeros((H, W), dtype=np.float64)
-    if np.any(valid):
-        np.add.at(counts, (row_idx[valid], col_idx_flat[valid]), 1.0)
+    hit_ranges_grid = hit_ranges.reshape(W, elev_samples)
+    valid_grid = np.isfinite(hit_ranges_grid)
+    if np.any(valid_grid):
+        valid_counts = valid_grid.sum(axis=1).astype(np.float64)
+        front_ranges = np.min(np.where(valid_grid, hit_ranges_grid, np.inf), axis=1)
+        front_valid = np.isfinite(front_ranges)
+        if np.any(front_valid):
+            front_row_f = (front_ranges[front_valid] - float(sonar_cfg.range_min)) / span * H
+            in_bounds = (front_row_f >= 0.0) & (front_row_f <= float(H - 1))
+            if np.any(in_bounds):
+                cols = np.nonzero(front_valid)[0][in_bounds]
+                rows = front_row_f[in_bounds]
+                weights = valid_counts[cols] / float(elev_samples)
 
-    img_float = counts / float(elev_samples)
+                row0 = np.floor(rows).astype(np.int64)
+                frac = rows - row0.astype(np.float64)
+                row1 = np.clip(row0 + 1, 0, H - 1)
+
+                np.add.at(counts, (row0, cols), weights * (1.0 - frac))
+                upper_mask = row1 != row0
+                if np.any(upper_mask):
+                    np.add.at(counts, (row1[upper_mask], cols[upper_mask]), weights[upper_mask] * frac[upper_mask])
+
+    img_float = counts
     img_float = np.clip(img_float, 0.0, 1.0)
     return img_float.astype(np.float32)
 
@@ -687,8 +735,10 @@ def write_dataset_settings_md(path: Path, manifest: Dict) -> None:
             f"- Elevation sweep (deg): `{pose['elevation_sweep_deg']}`",
             f"- Pose policy: `{pose['pose_policy']}`",
             f"- Pose bands (deg): `{pose.get('pose_bands_deg', [])}`",
+            f"- Pose band jitter frac: `{pose.get('pose_band_jitter_frac', 0.0)}`",
             f"- Translation jitter sigma (m): `{pose['translation_jitter_sigma_m']}`",
             f"- Rotation jitter sigma (deg): `{pose['rotation_jitter_sigma_deg']}`",
+            f"- Orientation azimuth jitter max (deg): `{pose.get('orientation_azimuth_jitter_max_deg', 0.0)}`",
             f"- Orientation policy: `{pose['orientation_policy']}`",
             f"- Pose mode: `{pose['pose_mode']}`",
             f"- Pose export contract: `{pose['pose_export_contract']}`",
@@ -1027,6 +1077,16 @@ def write_dataset(
 
     pose_policy = resolve_pose_policy(args)
     pose_bands_deg = parse_pose_bands_deg(args.pose_bands_deg)
+    orientation_policy_terms = [f"look-at {target_name} center"]
+    if float(args.orientation_azimuth_jitter_max_deg) > 0.0:
+        orientation_policy_terms.append(
+            f"uniform azimuth jitter +/-{float(args.orientation_azimuth_jitter_max_deg):.3f} deg"
+        )
+    if float(args.rotation_jitter_sigma_deg) > 0.0:
+        orientation_policy_terms.append(
+            f"rotation jitter sigma {float(args.rotation_jitter_sigma_deg):.3f} deg"
+        )
+    orientation_policy = " + ".join(orientation_policy_terms)
 
     manifest = {
         "dataset_id": dataset_id,
@@ -1050,17 +1110,19 @@ def write_dataset(
             "elevation_sweep_deg": [float(args.elevation_min_deg), float(args.elevation_max_deg)],
             "pose_policy": pose_policy,
             "pose_bands_deg": [float(x) for x in pose_bands_deg.tolist()],
+            "pose_band_jitter_frac": float(args.pose_band_jitter_frac),
             "translation_jitter_sigma_m": float(args.translation_jitter_sigma),
             "rotation_jitter_sigma_deg": float(args.rotation_jitter_sigma_deg),
-            "orientation_policy": f"look-at {target_name} center + rotation jitter",
+            "orientation_azimuth_jitter_max_deg": float(args.orientation_azimuth_jitter_max_deg),
+            "orientation_policy": orientation_policy,
             "pose_mode": args.pose_mode,
             "pose_export_contract": pose_export_contract,
         },
         "simulation": {
             "elevation_samples": int(args.elevation_samples),
             "intersection_policy": intersection_policy,
-            "intensity_model": "binary hit accumulation per elevation sample",
-            "normalization": "img_float = hit_count / elevation_samples",
+            "intensity_model": "first-hit per (azimuth,elevation) ray, collapsed to front envelope per azimuth",
+            "normalization": "img_float deposits elevation hit fraction at the nearest range bin(s)",
         },
         "noise_model": {
             "enabled": bool(variant_is_noisy(args.variant)),

@@ -144,10 +144,26 @@ def compute_arc_bin_scores(
     valid_mask: torch.Tensor,
     reliability: torch.Tensor,
 ) -> torch.Tensor:
+    return torch.sum(
+        compute_arc_score_contribution(
+            gt_intensity=gt_intensity,
+            valid_mask=valid_mask,
+            reliability=reliability,
+        ),
+        dim=0,
+    )
+
+
+def compute_arc_score_contribution(
+    *,
+    gt_intensity: torch.Tensor,
+    valid_mask: torch.Tensor,
+    reliability: torch.Tensor,
+) -> torch.Tensor:
     gt_t = gt_intensity.to(dtype=torch.float32)
     valid_t = valid_mask.to(device=gt_t.device, dtype=torch.float32)
     rel_t = reliability.to(device=gt_t.device, dtype=torch.float32).reshape(-1, 1)
-    return torch.sum(rel_t * valid_t * gt_t, dim=0)
+    return rel_t * valid_t * gt_t
 
 
 def select_arc_peak_bin(*, scores: torch.Tensor, min_score: float) -> Optional[int]:

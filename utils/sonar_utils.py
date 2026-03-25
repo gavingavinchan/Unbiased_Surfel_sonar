@@ -647,17 +647,13 @@ def sonar_frame_to_points(
     
     points_cam_metric = np.stack([x_cam, y_cam, z_cam], axis=1)  # [N, 3] metric
     
-    # Transform to world coordinates
-    # Camera pose: R is world-to-camera rotation, T is world-to-camera translation
-    # point_world = R^T @ (point_cam - T) ... wait, that's not right
-    # Actually: point_cam = R @ point_world + T
-    # So: point_world = R^T @ point_cam - R^T @ T = R^T @ (point_cam - T)
-    # But T is not subtracted from point_cam, it's: point_world = R^T @ point_cam + camera_center
-    # where camera_center = -R^T @ T
-    
-    R_w2c = camera.R  # [3, 3]
+    # Transform to world coordinates.
+    # In this codebase, camera.R stores the camera-to-world rotation (R_c2w), while
+    # camera.T stores the world-to-camera translation (t_w2c).
+    # point_world = R_c2w @ point_cam + camera_center, where camera_center = -R_c2w @ t_w2c.
+
+    R_c2w = camera.R  # [3, 3]
     T_w2c = camera.T  # [3]
-    R_c2w = R_w2c.T
     camera_center_colmap = -R_c2w @ T_w2c
     camera_center_metric = camera_center_colmap * scale_factor
     

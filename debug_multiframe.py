@@ -20,7 +20,7 @@ Outputs:
 - mesh_poisson_after_stage2.ply: Poisson mesh after Stage 2
 - mesh_poisson_after_stage3.ply: Poisson mesh after Stage 3
 - mesh_poisson_after_iter1.ply: Poisson mesh after iter 1
-- comparison_frame_N.png: GT vs rendered for each training frame
+- comparison_<stage>_<idx>_<image>.png: GT vs rendered for each training frame
 """
 
 import os
@@ -98,6 +98,7 @@ from utils.elevation_chunk5_helpers import (
     CHECKPOINT_PAYLOAD_KEY as CHUNK5_CHECKPOINT_PAYLOAD_KEY,
     build_chunk5_checkpoint_payload,
     chunk5_renderer_contract_is_active,
+    compute_arc_score_contribution,
     compute_confidence_mask,
     compute_expected_elevation,
     compute_finite_difference_normals,
@@ -106,7 +107,7 @@ from utils.elevation_chunk5_helpers import (
     mode_enables_densify_candidates,
     mode_enables_normal_loss,
     quaternions_from_normals,
-    select_peak_bin_from_loglik,
+    select_arc_peak_bin,
     select_persistent_high_error_candidates,
     is_densify_iteration_eligible,
     resolve_chunk5_stage2_start_default,
@@ -481,9 +482,8 @@ def build_pose_overlap_table(training_frames, overlap_cfg):
     yaws_deg = {}
     for cam in training_frames:
         frame_key = str(cam.image_name)
-        r_w2c = np.asarray(cam.R, dtype=np.float64)
+        r_c2w = np.asarray(cam.R, dtype=np.float64)
         t_w2c = np.asarray(cam.T, dtype=np.float64)
-        r_c2w = r_w2c.T
 
         position = -r_c2w @ t_w2c
         forward = r_c2w[:, 2]
@@ -707,6 +707,40 @@ def build_stage1_multiview_loglik_for_pixels(
     sonar_scale_factor,
     cfg,
 ):
+    evidence = build_stage1_multiview_evidence_for_pixels(
+        frame_idx=frame_idx,
+        frame_key=frame_key,
+        rows=rows,
+        cols=cols,
+        training_frames=training_frames,
+        frame_key_to_index=frame_key_to_index,
+        overlap_table=overlap_table,
+        gt_frame_cache=gt_frame_cache,
+        frame_stats_cache=frame_stats_cache,
+        elev_angle_bins=elev_angle_bins,
+        sonar_config=sonar_config,
+        sonar_scale_factor=sonar_scale_factor,
+        cfg=cfg,
+    )
+    return evidence["loglik"], evidence["support_mask"]
+
+
+def build_stage1_multiview_evidence_for_pixels(
+    *,
+    frame_idx,
+    frame_key,
+    rows,
+    cols,
+    training_frames,
+    frame_key_to_index,
+    overlap_table,
+    gt_frame_cache,
+    frame_stats_cache,
+    elev_angle_bins,
+    sonar_config,
+    sonar_scale_factor,
+    cfg,
+):
     if str(cfg.lik_invalid_mode) != "neutral":
         raise ValueError(f"Unsupported ELEV_LIK_INVALID_MODE: {cfg.lik_invalid_mode}")
 
@@ -716,8 +750,13 @@ def build_stage1_multiview_loglik_for_pixels(
 
     loglik = torch.full((p, k), float(cfg.lik_log_floor), dtype=torch.float32, device=device)
     support_mask = torch.zeros((p, k), dtype=torch.bool, device=device)
+    arc_scores = torch.zeros((p, k), dtype=torch.float32, device=device)
     if p <= 0 or k <= 0:
-        return loglik, support_mask
+        return {
+            "loglik": loglik,
+            "support_mask": support_mask,
+            "arc_scores": arc_scores,
+        }
 
     pts_bins = back_project_bins(
         frame_idx=int(frame_idx),
@@ -787,6 +826,11 @@ def build_stage1_multiview_loglik_for_pixels(
 
         loglik_sum = loglik_sum + (weighted_valid * log_evidence)
         valid_w = valid_w + weighted_valid
+        arc_scores = arc_scores + compute_arc_score_contribution(
+            gt_intensity=norm_vals,
+            valid_mask=valid_mask,
+            reliability=torch.full((p,), reliability, dtype=torch.float32, device=device),
+        )
 
     supported = valid_w > 0.0
     loglik = torch.where(
@@ -795,7 +839,11 @@ def build_stage1_multiview_loglik_for_pixels(
         torch.full_like(loglik_sum, float(cfg.lik_log_floor)),
     )
     support_mask = valid_w > float(cfg.lik_min_support)
-    return loglik, support_mask
+    return {
+        "loglik": loglik,
+        "support_mask": support_mask,
+        "arc_scores": arc_scores,
+    }
 
 
 def select_topk_bright_pixels(gt_gray, k):
@@ -1196,9 +1244,8 @@ def compute_chunk4_coupling_for_frame(
 
 
 def camera_world_position_tensor(camera, device):
-    r_w2c = torch.as_tensor(camera.R, device=device, dtype=torch.float32)
+    r_c2w = torch.as_tensor(camera.R, device=device, dtype=torch.float32)
     t_w2c = torch.as_tensor(camera.T, device=device, dtype=torch.float32)
-    r_c2w = r_w2c.transpose(0, 1)
     return -(r_c2w @ t_w2c)
 
 
@@ -1840,7 +1887,7 @@ def spawn_chunk5_surfels_for_event(
             continue
         rows_t = torch.tensor([row], dtype=torch.long, device=device)
         cols_t = torch.tensor([col], dtype=torch.long, device=device)
-        loglik, support_mask = build_stage1_multiview_loglik_for_pixels(
+        densify_evidence = build_stage1_multiview_evidence_for_pixels(
             frame_idx=frame_idx,
             frame_key=frame_key,
             rows=rows_t,
@@ -1855,14 +1902,16 @@ def spawn_chunk5_surfels_for_event(
             sonar_scale_factor=sonar_scale_factor,
             cfg=stage1_cfg,
         )
+        loglik = densify_evidence["loglik"]
+        support_mask = densify_evidence["support_mask"]
+        arc_scores = densify_evidence["arc_scores"]
         if not bool(support_mask.any().item()):
             out["skip_support_count"] += 1
             continue
         out["supported_candidate_count"] += 1
 
-        peak_bin, _scores = select_peak_bin_from_loglik(
-            loglik=loglik[0],
-            support_mask=support_mask[0],
+        peak_bin = select_arc_peak_bin(
+            scores=arc_scores[0],
             min_score=chunk5_cfg.densify_multiview_min_score,
         )
         if peak_bin is None:
@@ -2001,8 +2050,7 @@ def spawn_chunk5_surfels_for_event(
 
 
 def camera_forward_world_tensor(camera, device):
-    r_w2c = torch.as_tensor(camera.R, device=device, dtype=torch.float32)
-    r_c2w = r_w2c.transpose(0, 1)
+    r_c2w = torch.as_tensor(camera.R, device=device, dtype=torch.float32)
     forward = r_c2w[:, 2]
     return forward / torch.norm(forward).clamp_min(1e-8)
 
@@ -2895,6 +2943,7 @@ def save_comparison_images(training_frames, gaussians, background, sonar_config,
                            scale_factor, output_dir, stage_name):
     """Save GT vs rendered comparison images for all training frames at a given stage."""
     print(f"\n  Saving comparison images for {stage_name}...")
+    frame_width = max(3, len(str(max(len(training_frames) - 1, 0))))
     for i, cam in enumerate(training_frames):
         gt_image = preprocess_gt_image(cam.original_image)
 
@@ -2916,7 +2965,8 @@ def save_comparison_images(training_frames, gaussians, background, sonar_config,
 
         # Brightened comparison
         comparison_bright = np.hstack([brighten_image(gt_np), brighten_image(rendered_np)])
-        filename = f"comparison_{stage_name}_frame{i}.png"
+        stem = build_frame_stem(i, cam.image_name, width=frame_width)
+        filename = f"comparison_{stage_name}_{stem}.png"
         Image.fromarray(comparison_bright, mode='L').save(os.path.join(output_dir, filename))
 
     print(f"  Saved comparison images for {stage_name}")
@@ -2940,6 +2990,7 @@ def save_raw_comparison_images(training_frames, gaussians, background, sonar_con
         # Keep raw comparison faithful; avoid per-frame auto-gain amplification.
         raw_render_kwargs["range_atten_auto_gain"] = False
         raw_render_kwargs["range_atten_gain"] = SONAR_RANGE_ATTEN_GAIN
+    frame_width = max(3, len(str(max(len(training_frames) - 1, 0))))
     for i, cam in enumerate(training_frames):
         raw_path = resolve_raw_sonar_path(cam, dataset_path, sonar_dir)
         if raw_path is None:
@@ -2964,7 +3015,8 @@ def save_raw_comparison_images(training_frames, gaussians, background, sonar_con
         rendered_resized = np.array(rendered_img)
 
         comparison_raw = np.hstack([raw_np, rendered_resized])
-        filename = f"comparison_{stage_name}_raw_frame{i}.png"
+        stem = build_frame_stem(i, cam.image_name, width=frame_width)
+        filename = f"comparison_{stage_name}_raw_{stem}.png"
         Image.fromarray(comparison_raw, mode="L").save(os.path.join(output_dir, filename))
 
     print(f"  Saved raw-frame comparisons for {stage_name}")
@@ -3159,7 +3211,7 @@ def export_frame_visualizer_artifacts(
     for frame_idx, cam in enumerate(training_frames):
         stem = build_frame_stem(frame_idx, cam.image_name, width=frame_width)
         color = colors[frame_idx % len(colors)]
-        r_c2w = cam.R.T
+        r_c2w = np.asarray(cam.R, dtype=np.float64)
         position = -r_c2w @ cam.T
 
         wireframe_near_path = os.path.join(visualizer_dir, f"{stem}_wireframe_near.ply")
@@ -3269,6 +3321,17 @@ def write_csv_rows(csv_path, fieldnames, rows):
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
+
+
+def save_frame_index_map_csv(csv_path, frames):
+    rows = []
+    for frame_idx, cam in enumerate(frames):
+        rows.append({
+            "frame_idx": frame_idx,
+            "image_name": cam.image_name,
+            "frame_stem": build_frame_stem(frame_idx, cam.image_name),
+        })
+    write_csv_rows(csv_path, ["frame_idx", "image_name", "frame_stem"], rows)
 
 
 def evaluate_frame_set(frame_set_name, frames, gaussians, background, sonar_config,
@@ -4508,11 +4571,17 @@ def main():
     print(f"Selected {len(training_frames)} training frames:")
     for i, cam in enumerate(training_frames):
         print(f"  [{i}] {cam.image_name}")
+    train_frame_map_path = os.path.join(OUTPUT_DIR, "training_frame_index_map.csv")
+    save_frame_index_map_csv(train_frame_map_path, training_frames)
+    print(f"Saved training frame map: {train_frame_map_path}")
 
     if holdout_frames:
         print(f"Selected {len(holdout_frames)} holdout frames:")
         for i, cam in enumerate(holdout_frames):
             print(f"  [H{i}] {cam.image_name}")
+        holdout_frame_map_path = os.path.join(OUTPUT_DIR, "holdout_frame_index_map.csv")
+        save_frame_index_map_csv(holdout_frame_map_path, holdout_frames)
+        print(f"Saved holdout frame map: {holdout_frame_map_path}")
 
     active_frame_keys = [str(cam.image_name) for cam in training_frames]
     assert_frame_keys_unique(active_frame_keys)
@@ -4646,9 +4715,8 @@ def main():
     colors = [[1, 0, 0], [0, 1, 0], [0, 0, 1], [1, 1, 0], [1, 0, 1]]  # Different colors for each frame
 
     for i, cam in enumerate(training_frames):
-        R_w2c = cam.R
+        R_c2w = np.asarray(cam.R, dtype=np.float64)
         T_w2c = cam.T
-        R_c2w = R_w2c.T
         position = -R_c2w @ T_w2c
 
         color = colors[i % len(colors)]
@@ -4711,7 +4779,7 @@ def main():
             continue
 
         # Compute normals pointing toward camera
-        R_c2w = cam.R.T
+        R_c2w = np.asarray(cam.R, dtype=np.float64)
         cam_pos = -R_c2w @ cam.T
         normals = np.zeros_like(points)
         for j in range(len(points)):
@@ -4758,7 +4826,7 @@ def main():
         n_pts = len(all_points[i]) if i < len(all_points) else 0
         if n_pts == 0:
             continue
-        R_c2w = cam.R.T
+        R_c2w = np.asarray(cam.R, dtype=np.float64)
         cam_pos = -R_c2w @ cam.T
         pts = all_points[i]
         distances = np.linalg.norm(pts - cam_pos, axis=1)
@@ -6814,11 +6882,12 @@ def main():
     print(f"  - mesh_after_stage1.ply       (Mesh after Stage 1: scale learning)")
     print(f"  - mesh_after_stage2.ply       (Mesh after Stage 2: surfel learning)")
     print(f"  - mesh_after_stage3.ply       (Mesh after Stage 3: joint fine-tuning)")
-    print(f"  - comparison_before_training_frameN.png (Before any training)")
-    print(f"  - comparison_after_stage1_frameN.png    (After scale learning)")
-    print(f"  - comparison_after_stage2_frameN.png    (After surfel learning)")
-    print(f"  - comparison_after_stage3_frameN.png    (After joint fine-tuning)")
-    print(f"  - comparison_after_stage3_raw_frameN.png (Raw sonar vs rendered)")
+    print(f"  - training_frame_index_map.csv         (Training frame idx -> image name map)")
+    print(f"  - comparison_before_training_<idx>_<image>.png (Before any training)")
+    print(f"  - comparison_after_stage1_<idx>_<image>.png    (After scale learning)")
+    print(f"  - comparison_after_stage2_<idx>_<image>.png    (After surfel learning)")
+    print(f"  - comparison_after_stage3_<idx>_<image>.png    (After joint fine-tuning)")
+    print(f"  - comparison_after_stage3_raw_<idx>_<image>.png (Raw sonar vs rendered)")
     print(f"  - scale_and_loss.png                    (Scale and loss curves)")
     print(f"  - frame_training_visits.csv             (Per-frame optimizer visit coverage)")
     print(f"  - final_eval_train_frames.csv           (Per-frame final train losses)")

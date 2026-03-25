@@ -137,6 +137,40 @@ def test_c5_t06_arc_bin_scoring_formula_contract(chunk5):
     assert torch.allclose(scores, expected, atol=1e-6)
 
 
+def test_c5_t06_arc_score_contribution_preserves_per_pixel_scores(chunk5):
+    gt_intensity = torch.tensor(
+        [
+            [0.9, 0.2, 0.1],
+            [0.5, 0.4, 0.0],
+        ],
+        dtype=torch.float32,
+    )
+    valid_mask = torch.tensor(
+        [
+            [1, 1, 0],
+            [1, 0, 0],
+        ],
+        dtype=torch.bool,
+    )
+    reliability = torch.tensor([1.0, 0.5], dtype=torch.float32)
+
+    contribution = chunk5.compute_arc_score_contribution(
+        gt_intensity=gt_intensity,
+        valid_mask=valid_mask,
+        reliability=reliability,
+    )
+
+    expected = torch.tensor(
+        [
+            [0.9, 0.2, 0.0],
+            [0.25, 0.0, 0.0],
+        ],
+        dtype=torch.float32,
+    )
+    assert contribution.shape == gt_intensity.shape
+    assert torch.allclose(contribution, expected, atol=1e-6)
+
+
 def test_c5_t06_arc_peak_selection_argmax_and_skip_contract(chunk5):
     peak = chunk5.select_arc_peak_bin(
         scores=torch.tensor([0.15, 0.55, 0.30], dtype=torch.float32),
