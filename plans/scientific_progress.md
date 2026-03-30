@@ -3,6 +3,29 @@
 ## Abstract
 We extended 2D Gaussian Splatting to forward-looking multibeam sonar by introducing polar rendering, backward projection, metric scale alignment, and sonar-specific training constraints. The work adds sonar mode data flow, pose interpolation from camera trajectories, a learnable global scale factor, camera-to-sonar extrinsics, differentiable polar rendering with intensity modeling, size-aware field-of-view (FOV) constraints, and loss shaping for bright sonar returns. We also introduced mesh tuning workflows and dataset preparation guidelines to support real-world sonar reconstructions.
 
+## 2026-03-30 Chunk-5.5 Diagnostic Framing Addendum
+The current scientific interpretation of Chunk-5 late-normal behavior is now split between a main implementation contract and a dedicated diagnostic follow-on note. The new `plans/PLAN_ELEVATION_AWARE_CHUNK5_5_EXECUTION_2026-03-30.md` records the immediate requirement that any scientifically meaningful rerun must expose the full gate stack
+$$
+\text{support} \rightarrow \text{confidence} \rightarrow \text{4-neighbor readiness} \rightarrow \text{finite normal} \rightarrow \text{surfel match},
+$$
+before threshold tuning or algorithm changes are interpreted as fixes.
+
+This framing matters because the current late-normal path is not a dense camera-style consistency term. Instead, it constructs an expected local surface patch from Stage-1 elevation posteriors and then derives a finite-difference normal from that inferred patch. The practical implication is that the supervision can fail discontinuously: if the per-anchor survival probability through the gate stack collapses, then the total normal signal can go to zero even while the rest of training remains finite.
+
+The companion explainer `docs/CHUNK5_NORMALS_EXPLAINER.md` now documents the corresponding comparison to the original camera path from commit `0d41037`. In that baseline, the normal regularizer used two dense image-space fields,
+$$
+\mathcal{L}_{\mathrm{camera\ normal}} = 1 - \big( n_{\mathrm{rend}} \cdot n_{\mathrm{surf}} \big),
+$$
+where $n_{\mathrm{rend}}$ is the alpha-composited surfel-orientation normal map and $n_{\mathrm{surf}}$ is the normal implied by the rendered depth surface. In the current sonar path, the analogous supervision target is instead derived from posterior-expected geometry,
+$$
+n_{\mathrm{expected}} = \operatorname{FDNormal}\big(p_{\mathrm{left}}, p_{\mathrm{right}}, p_{\mathrm{up}}, p_{\mathrm{down}}\big),
+$$
+with the sign-agnostic supervision term
+$$
+\mathcal{L}_{\mathrm{chunk5\ normal}} = 1 - \left| n_{\mathrm{quat}} \cdot n_{\mathrm{expected}} \right|.
+$$
+Scientifically, this means Chunk 5 is currently best understood not as a direct extension of the original dense normal-consistency law, but as a sparse, posterior-mediated surrogate whose first failure mode is complete signal starvation.
+
 ## 2026-03-18 Chunk-5 Runtime Addendum
 Chunk 5 now has a first concrete late-normal runtime path in `debug_multiframe.py`. For each sparse Stage-1 anchor pixel with a valid posterior, the implementation explicitly queries the image-grid 4-neighborhood, evaluates Stage-1 multi-view evidence on those exact neighbors, forms an expected elevation
 $$
@@ -819,3 +842,39 @@ $$
 Same convention fix applied to all callers in `debug_multiframe.py` and `generate_pose_pyramids.py`.
 
 Details: `docs/SYNTHETIC_DATASET_GUIDE.md` (Backward-Projection Rotation Convention Bug section).
+
+### 20.1 Post-fix 20-frame synthetic cube run
+
+Ran `debug_multiframe.py` on `synthetic_cube_C_azimuth45_fixedpos` with `20` evenly spaced frames and `30000` Stage-2 iterations:
+
+- output: `output/cube_20frames_30k_azimuth45_fixedpos_backprojfix/`
+- selected frames: `sonar_000000, 000025, 000050, ..., 000475`
+- final train metrics: loss mean `0.006357`, SSIM mean `0.9576`
+- support summary: mean `11.787`, median `13.0`
+- final surfel count: `583`
+
+Relative to the corrected `8`-frame / `3000`-iteration run (`output/cube_8frames_cardinal_corners_longer_azimuth45_fixedpos_backprojfix/`), the larger orbit subset improves cross-view support but makes the image-fitting objective harder:
+
+$$
+\text{support mean}: 6.095 \rightarrow 11.787, \qquad
+\text{loss mean}: 0.003451 \rightarrow 0.006357, \qquad
+\text{SSIM mean}: 0.9781 \rightarrow 0.9576
+$$
+
+The run also converges to fewer surfels:
+
+$$
+717 \rightarrow 583
+$$
+
+This is consistent with a stronger multi-view compromise under denser azimuth coverage: the optimizer is forced to explain more corner/oblique returns with a smaller shared surfel set, so average per-frame fidelity drops even while average observation support rises.
+
+Worst final-loss frames for the 20-frame run were `sonar_000300`, `sonar_000225`, `sonar_000425`, `sonar_000475`, and `sonar_000150`, suggesting the remaining fit errors are concentrated in off-axis views rather than the easiest cardinal poses.
+
+Qualitative manual review of the same run indicates that the pose/backprojection fix improved surfel center placement more than orientation quality:
+
+- in the comparison images, most rendered line segments now appear at the correct image locations, but the cube-face returns are still incomplete and break into disconnected segments instead of continuous traces;
+- a notable failure mode is a large surfel whose center is correct but whose normal/rotation is wrong, producing a line segment with a slope that disagrees with adjacent correctly aligned segments;
+- Blender inspection shows that most surfel centers cluster near the cube surfaces, while surfel orientations remain visibly poor and a residual set of floating surfels still sits inside or outside the cube.
+
+This qualitative evidence reinforces the current hypothesis that the dominant post-fix failure mode has shifted from gross pose/center misplacement to rotation/orientation quality plus residual off-surface outliers.

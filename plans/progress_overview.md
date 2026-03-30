@@ -1,5 +1,11 @@
 # Progress Overview (Post-Fork, Multi-Branch)
 
+## 2026-03-30 Chunk-5.5 Diagnostic Split And Normals Explainer
+- Split the post-2026-03-25 Chunk-5 zero-signal investigation out of `plans/PLAN_ELEVATION_AWARE_CHUNK5_EXECUTION_2026-03-16.md` into the new follow-on diagnostic note `plans/PLAN_ELEVATION_AWARE_CHUNK5_5_EXECUTION_2026-03-30.md` so the main Chunk-5 plan stays focused on the implementation contract while the zero-signal blocker gets its own execution track.
+- Added an explicit new-session handoff prompt in the Chunk-5.5 plan that requires the first rerun to log the full late-normal gate stack (`support -> confidence -> 4-neighbor -> finite -> match`) before any threshold or algorithm changes are proposed.
+- Added `docs/CHUNK5_NORMALS_EXPLAINER.md`, a code-grounded explainer for the current Chunk-5 late-normal path, log metrics, center-vs-neighbor posterior asymmetry, and the contrast with the original camera-based normal-consistency path from commit `0d41037`.
+- Clarified in docs that the camera baseline's strength comes from dense depth-geometry normal consistency, while the current sonar path relies on sparse posterior-derived expected-elevation normals and can therefore fail by going fully silent when confidence gates collapse.
+
 ## 2026-03-18 Chunk-5 TDD and Runtime Wiring
 - Added the first Chunk-5 helper/test tranche: schedule, confidence-mask, checkpoint, mode-gating, densify-gating, and point-utils contracts now live under `tests/test_elevation_chunk5_*` with `utils/elevation_chunk5_helpers.py` as the initial helper surface.
 - Wired `debug_multiframe.py` to parse Chunk-5 config, log Chunk-5 modes, carry a sibling `elevation_chunk5_state` checkpoint payload, and restore/reset that state under an explicit mismatch policy.
@@ -499,4 +505,9 @@ flowchart TB
 - Added unambiguous comparison naming (`comparison_<stage>_<idx>_<image>.png`) and `training_frame_index_map.csv`.
 - Chunk-5 arc scoring refactored: `build_stage1_multiview_evidence_for_pixels`, `compute_arc_score_contribution`, `select_arc_peak_bin`.
 - Post-fix rerun metrics: `loss_mean=0.003451`, `ssim_mean=0.9781`, 717 surfels.
+- Follow-up 20-frame / 30k run on `synthetic_cube_C_azimuth45_fixedpos` completed at `output/cube_20frames_30k_azimuth45_fixedpos_backprojfix/` with evenly spaced frames (`sonar_000000`..`sonar_000475` in steps of 25): `loss_mean=0.006357`, `ssim_mean=0.9576`, support mean `11.787`, median `13`, final surfels `583`.
+- Relative to the corrected 8-frame / 3k run, the 20-frame run increases cross-view support (`6.095 -> 11.787`) but fits the training images worse (`0.003451/0.9781 -> 0.006357/0.9576`) and converges to a smaller surfel set (`717 -> 583`), which is consistent with stronger multi-view compression/tension under the broader orbit coverage.
+- Worst final-loss frames in the 20-frame run cluster around oblique views (`sonar_000300`, `sonar_000225`, `sonar_000425`, `sonar_000475`, `sonar_000150`) rather than the axial cardinal frames.
+- Manual review note from the 20-frame run: rendered sonar lines are usually centered in the correct places, but the cube-surface traces remain fragmented into line segments instead of continuous face returns; one recurring failure mode is a large centered surfel with incorrect orientation producing a line segment whose slope disagrees with the surrounding correctly placed segments.
+- Blender/manual geometry note from the same run: most surfel centers now appear to lie near the intended cube surfaces, but orientations remain poor and a residual set of floating surfels still sits inside or outside the cube rather than on the surface.
 - Details: `docs/SYNTHETIC_DATASET_GUIDE.md` (Backward-Projection Rotation Convention Bug section).

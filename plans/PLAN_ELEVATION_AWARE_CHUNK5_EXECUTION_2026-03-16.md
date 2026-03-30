@@ -638,3 +638,6 @@ Commit message format:
 - This plan intentionally keeps densification optional and late. The first success criterion for Chunk 5 is that late normals improve or preserve geometry without destabilization.
 - If late normals are stable but densification remains too risky, Chunk 5 may be split into `5A` (normals) and `5B` (densification) for implementation order, but the gate report must say so explicitly.
 - If any Chunk-5 implementation decision changes the detailed-plan algorithm contract, patch `plans/PLAN_ELEVATION_AWARE_TRAINING_detailed_2026-02-01.md` before code changes proceed.
+- Follow-on investigation, diagnostic rerun guidance, and zero-signal analysis were moved to `plans/PLAN_ELEVATION_AWARE_CHUNK5_5_EXECUTION_2026-03-30.md` so this document stays focused on the main Chunk-5 implementation contract.
+
+---
