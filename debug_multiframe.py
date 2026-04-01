@@ -1339,8 +1339,13 @@ def _compute_chunk5_local_expected_geometry(
     out = {
         "supported_mask": torch.zeros((0,), dtype=torch.bool, device=rows.device),
         "confident_mask": torch.zeros((0,), dtype=torch.bool, device=rows.device),
+        "anchor_interior_mask": torch.zeros((0,), dtype=torch.bool, device=rows.device),
         "neighbor_ready_mask": torch.zeros((0,), dtype=torch.bool, device=rows.device),
         "finite_mask": torch.zeros((0,), dtype=torch.bool, device=rows.device),
+        "center_entropy": torch.empty((0,), dtype=torch.float32, device=rows.device),
+        "query_supported_mask": torch.zeros((0,), dtype=torch.bool, device=rows.device),
+        "query_confident_mask": torch.zeros((0,), dtype=torch.bool, device=rows.device),
+        "query_entropy": torch.empty((0,), dtype=torch.float32, device=rows.device),
         "rows_selected": torch.empty((0,), dtype=torch.long, device=rows.device),
         "cols_selected": torch.empty((0,), dtype=torch.long, device=rows.device),
         "pts_center": torch.empty((0, 3), dtype=torch.float32, device=rows.device),
@@ -1359,12 +1364,13 @@ def _compute_chunk5_local_expected_geometry(
     support_mask = support_mask[:total]
     rows_bank = rows[:total]
     cols_bank = cols[:total]
-    confident_mask, _ = compute_confidence_mask(
+    confident_mask, center_entropy = compute_confidence_mask(
         probs=probs,
         support_mask=support_mask,
         confidence_thresh=confidence_thresh,
     )
     supported_mask = support_mask.any(dim=-1)
+    out["center_entropy"] = center_entropy
 
     rows_bank, cols_bank, anchor_interior, neighbor_lookup, query_rows, query_cols = _build_chunk5_neighbor_queries(
         rows_bank,
@@ -1375,6 +1381,7 @@ def _compute_chunk5_local_expected_geometry(
     neighbor_ready = supported_mask & confident_mask & anchor_interior
     out["supported_mask"] = supported_mask
     out["confident_mask"] = confident_mask
+    out["anchor_interior_mask"] = anchor_interior
     out["neighbor_ready_mask"] = neighbor_ready.clone()
     if not bool(neighbor_ready.any().item()) or query_rows.numel() == 0:
         return out
@@ -1400,11 +1407,14 @@ def _compute_chunk5_local_expected_geometry(
         dim=-1,
         min_support=stage1_cfg.lik_min_support,
     )
-    query_confident, _ = compute_confidence_mask(
+    query_confident, query_entropy = compute_confidence_mask(
         probs=query_probs,
         support_mask=query_support,
         confidence_thresh=confidence_thresh,
     )
+    out["query_supported_mask"] = query_support.any(dim=-1)
+    out["query_confident_mask"] = query_confident
+    out["query_entropy"] = query_entropy
 
     left_idx = neighbor_lookup["left"]
     right_idx = neighbor_lookup["right"]
@@ -1516,12 +1526,31 @@ def compute_chunk5_normal_for_frame(
 ):
     out = {
         "loss": zero,
+        "loss_value": 0.0,
         "weight": 0.0,
         "expected_coverage": 0.0,
         "confidence_coverage": 0.0,
+        "anchor_count": 0,
+        "center_supported_count": 0,
+        "center_confident_count": 0,
+        "interior_anchor_count": 0,
+        "all_neighbors_confident_count": 0,
+        "neighbor_query_count": 0,
+        "neighbor_supported_count": 0,
+        "neighbor_confident_count": 0,
         "finite_count": 0,
         "match_count": 0,
+        "applied_count": 0,
+        "applied_loss_value": 0.0,
+        "skip_unsupported_count": 0,
+        "skip_center_confidence_count": 0,
+        "skip_border_count": 0,
+        "skip_neighbor_confidence_count": 0,
+        "skip_nonfinite_count": 0,
+        "skip_unmatched_count": 0,
         "skipped_count": 0,
+        "center_entropy_values": zero.new_empty((0,), dtype=torch.float32),
+        "neighbor_entropy_values": zero.new_empty((0,), dtype=torch.float32),
     }
 
     if p_post_frame is None or support_mask_frame is None:
@@ -1554,6 +1583,7 @@ def compute_chunk5_normal_for_frame(
     rows_total = int(min(probs.shape[0], support_mask.shape[0], rows_bank.shape[0], cols_bank.shape[0]))
     if rows_total <= 0:
         return out
+    out["anchor_count"] = rows_total
     geometry = _compute_chunk5_local_expected_geometry(
         frame_idx=frame_idx,
         frame_key=frame_key,
@@ -1573,14 +1603,39 @@ def compute_chunk5_normal_for_frame(
         confidence_thresh=cfg.normal_confidence_thresh,
     )
     supported_mask = geometry["supported_mask"]
+    confident_mask = geometry["confident_mask"]
+    anchor_interior_mask = geometry["anchor_interior_mask"]
     out["expected_coverage"] = float(supported_mask.float().mean().item()) if supported_mask.numel() > 0 else 0.0
+    out["center_supported_count"] = int(supported_mask.sum().item())
+    out["center_confident_count"] = int(confident_mask.sum().item())
+    interior_anchor_mask = supported_mask & confident_mask & anchor_interior_mask
+    out["interior_anchor_count"] = int(interior_anchor_mask.sum().item())
+    out["skip_unsupported_count"] = max(0, out["anchor_count"] - out["center_supported_count"])
+    out["skip_center_confidence_count"] = max(0, out["center_supported_count"] - out["center_confident_count"])
+    out["skip_border_count"] = max(0, out["center_confident_count"] - out["interior_anchor_count"])
+    center_entropy = geometry["center_entropy"]
+    if center_entropy.numel() > 0 and supported_mask.numel() == center_entropy.numel():
+        out["center_entropy_values"] = center_entropy[supported_mask].detach()
+
+    query_supported_mask = geometry["query_supported_mask"]
+    query_confident_mask = geometry["query_confident_mask"]
+    out["neighbor_query_count"] = int(query_supported_mask.shape[0])
+    out["neighbor_supported_count"] = int(query_supported_mask.sum().item())
+    out["neighbor_confident_count"] = int(query_confident_mask.sum().item())
+    query_entropy = geometry["query_entropy"]
+    if query_entropy.numel() > 0 and query_supported_mask.numel() == query_entropy.numel():
+        out["neighbor_entropy_values"] = query_entropy[query_supported_mask].detach()
 
     neighbor_ready = geometry["neighbor_ready_mask"]
     out["confidence_coverage"] = float(neighbor_ready.float().mean().item()) if neighbor_ready.numel() > 0 else 0.0
+    out["all_neighbors_confident_count"] = int(neighbor_ready.sum().item())
+    out["skip_neighbor_confidence_count"] = max(0, out["interior_anchor_count"] - out["all_neighbors_confident_count"])
     finite_normals = geometry["finite_mask"]
     out["finite_count"] = int(finite_normals.sum().item())
-    out["skipped_count"] = max(0, int(neighbor_ready.sum().item() - finite_normals.sum().item()))
+    out["skip_nonfinite_count"] = max(0, out["all_neighbors_confident_count"] - out["finite_count"])
+    out["skipped_count"] = out["skip_nonfinite_count"]
     if geometry["pts_center"].numel() == 0 or geometry["normals_expected"].numel() == 0:
+        out["skip_unmatched_count"] = out["finite_count"]
         return out
 
     pts_center = geometry["pts_center"]
@@ -1604,6 +1659,7 @@ def compute_chunk5_normal_for_frame(
         ).round().to(dtype=torch.long)
         candidate_rows = candidate_rows[pick]
     if candidate_rows.numel() == 0:
+        out["skip_unmatched_count"] = out["finite_count"]
         return out
 
     surfel_xyz = gaussians.get_xyz[candidate_rows]
@@ -1629,17 +1685,116 @@ def compute_chunk5_normal_for_frame(
         min_w=chunk4_cfg.couple_min_w,
     )
     if not bool(match_valid.any().item()):
+        out["skip_unmatched_count"] = out["finite_count"]
         return out
 
     surfel_normals = quaternion_to_normal(gaussians.get_rotation[candidate_rows])
     out["match_count"] = int(match_valid.sum().item())
+    out["skip_unmatched_count"] = max(0, out["finite_count"] - out["match_count"])
     loss_normal = compute_normal_supervision_loss(
         n_quat=surfel_normals[surf_idx[match_valid]],
         n_expected=normals_expected[match_valid],
     )
     if bool(torch.isfinite(loss_normal).item()):
         out["loss"] = loss_normal
+        out["loss_value"] = float(loss_normal.item())
+        if str(cfg.effective_normal_mode) == "active" and out["weight"] > 0.0:
+            out["applied_count"] = out["match_count"]
+            out["applied_loss_value"] = float(out["weight"] * out["loss_value"])
     return out
+
+
+def summarize_chunk5_entropy(values):
+    if not torch.is_tensor(values) or values.numel() == 0:
+        return {
+            "count": 0,
+            "mean": 0.0,
+            "median": 0.0,
+            "p95": 0.0,
+            "max": 0.0,
+        }
+
+    vals = values.detach().to(dtype=torch.float32).reshape(-1)
+    vals = vals[torch.isfinite(vals)]
+    if vals.numel() == 0:
+        return {
+            "count": 0,
+            "mean": 0.0,
+            "median": 0.0,
+            "p95": 0.0,
+            "max": 0.0,
+        }
+
+    quantiles = torch.quantile(vals, torch.tensor([0.5, 0.95], device=vals.device, dtype=vals.dtype))
+    return {
+        "count": int(vals.numel()),
+        "mean": float(vals.mean().item()),
+        "median": float(quantiles[0].item()),
+        "p95": float(quantiles[1].item()),
+        "max": float(vals.max().item()),
+    }
+
+
+def summarize_chunk5_batch_diagnostics(batch_stats):
+    def sum_int(key):
+        return int(sum(int(stat.get(key, 0)) for stat in batch_stats))
+
+    def mean_float(key):
+        if not batch_stats:
+            return 0.0
+        return float(np.mean([float(stat.get(key, 0.0)) for stat in batch_stats]))
+
+    def cat_entropy(key):
+        tensors = []
+        for stat in batch_stats:
+            vals = stat.get(key)
+            if torch.is_tensor(vals) and vals.numel() > 0:
+                tensors.append(vals.detach().to(dtype=torch.float32).reshape(-1))
+        if not tensors:
+            return torch.empty((0,), dtype=torch.float32)
+        return torch.cat(tensors, dim=0)
+
+    anchor_count = sum_int("anchor_count")
+    center_supported_count = sum_int("center_supported_count")
+    center_confident_count = sum_int("center_confident_count")
+    interior_anchor_count = sum_int("interior_anchor_count")
+    all_neighbors_confident_count = sum_int("all_neighbors_confident_count")
+    finite_count = sum_int("finite_count")
+    match_count = sum_int("match_count")
+
+    center_entropy_summary = summarize_chunk5_entropy(cat_entropy("center_entropy_values"))
+    neighbor_entropy_summary = summarize_chunk5_entropy(cat_entropy("neighbor_entropy_values"))
+
+    denom = max(1, anchor_count)
+    return {
+        "anchor_count": anchor_count,
+        "center_supported_count": center_supported_count,
+        "center_supported_frac": float(center_supported_count / denom),
+        "center_confident_count": center_confident_count,
+        "center_confident_frac": float(center_confident_count / denom),
+        "interior_anchor_count": interior_anchor_count,
+        "interior_anchor_frac": float(interior_anchor_count / denom),
+        "all_neighbors_confident_count": all_neighbors_confident_count,
+        "all_neighbors_confident_frac": float(all_neighbors_confident_count / denom),
+        "finite_count": finite_count,
+        "finite_frac": float(finite_count / denom),
+        "match_count": match_count,
+        "match_frac": float(match_count / denom),
+        "applied_count": sum_int("applied_count"),
+        "skip_unsupported_count": sum_int("skip_unsupported_count"),
+        "skip_center_confidence_count": sum_int("skip_center_confidence_count"),
+        "skip_border_count": sum_int("skip_border_count"),
+        "skip_neighbor_confidence_count": sum_int("skip_neighbor_confidence_count"),
+        "skip_nonfinite_count": sum_int("skip_nonfinite_count"),
+        "skip_unmatched_count": sum_int("skip_unmatched_count"),
+        "neighbor_query_count": sum_int("neighbor_query_count"),
+        "neighbor_supported_count": sum_int("neighbor_supported_count"),
+        "neighbor_confident_count": sum_int("neighbor_confident_count"),
+        "loss_mean": mean_float("loss_value"),
+        "applied_loss_mean": mean_float("applied_loss_value"),
+        "center_entropy_summary": center_entropy_summary,
+        "neighbor_entropy_summary": neighbor_entropy_summary,
+    }
 
 
 def update_chunk5_densify_tracker_for_frame(
@@ -2713,6 +2868,8 @@ class Tee:
 LOG_FILE = None
 LOSS_LOG_HANDLE = None
 LOSS_LOG_PATH = None
+CHUNK5_DIAG_LOG_HANDLE = None
+CHUNK5_DIAG_LOG_PATH = None
 ORIGINAL_STDOUT = sys.stdout
 ORIGINAL_STDERR = sys.stderr
 
@@ -2735,6 +2892,23 @@ def init_loss_log(output_dir):
     LOSS_LOG_HANDLE.flush()
 
 
+def init_chunk5_diag_log(output_dir):
+    global CHUNK5_DIAG_LOG_HANDLE, CHUNK5_DIAG_LOG_PATH
+    CHUNK5_DIAG_LOG_PATH = os.path.join(output_dir, "chunk5_gate_log.csv")
+    CHUNK5_DIAG_LOG_HANDLE = open(CHUNK5_DIAG_LOG_PATH, "w")
+    CHUNK5_DIAG_LOG_HANDLE.write(
+        "iter,stage,anchors,center_supported_count,center_supported_frac,center_confident_count,center_confident_frac,"
+        "interior_anchor_count,interior_anchor_frac,all_neighbors_confident_count,all_neighbors_confident_frac,"
+        "finite_count,finite_frac,match_count,match_frac,applied_count,skip_unsupported_count,"
+        "skip_center_confidence_count,skip_border_count,skip_neighbor_confidence_count,skip_nonfinite_count,"
+        "skip_unmatched_count,neighbor_query_count,neighbor_supported_count,neighbor_confident_count,loss_mean,"
+        "applied_loss_mean,center_entropy_count,center_entropy_mean,center_entropy_median,center_entropy_p95,"
+        "center_entropy_max,neighbor_entropy_count,neighbor_entropy_mean,neighbor_entropy_median,neighbor_entropy_p95,"
+        "neighbor_entropy_max\n"
+    )
+    CHUNK5_DIAG_LOG_HANDLE.flush()
+
+
 def log_loss(iteration, stage_name, l1_value, ssim_value, base_loss, bright_loss, total_loss,
              scale_value, num_points):
     if LOSS_LOG_HANDLE is None:
@@ -2749,8 +2923,39 @@ def log_loss(iteration, stage_name, l1_value, ssim_value, base_loss, bright_loss
         LOSS_LOG_HANDLE.flush()
 
 
+def log_chunk5_diag(iteration, stage_name, diag):
+    if CHUNK5_DIAG_LOG_HANDLE is None or not isinstance(diag, dict):
+        return
+
+    center_entropy = diag.get("center_entropy_summary", {})
+    neighbor_entropy = diag.get("neighbor_entropy_summary", {})
+    CHUNK5_DIAG_LOG_HANDLE.write(
+        f"{iteration},{stage_name},{int(diag.get('anchor_count', 0))},"
+        f"{int(diag.get('center_supported_count', 0))},{float(diag.get('center_supported_frac', 0.0)):.6f},"
+        f"{int(diag.get('center_confident_count', 0))},{float(diag.get('center_confident_frac', 0.0)):.6f},"
+        f"{int(diag.get('interior_anchor_count', 0))},{float(diag.get('interior_anchor_frac', 0.0)):.6f},"
+        f"{int(diag.get('all_neighbors_confident_count', 0))},{float(diag.get('all_neighbors_confident_frac', 0.0)):.6f},"
+        f"{int(diag.get('finite_count', 0))},{float(diag.get('finite_frac', 0.0)):.6f},"
+        f"{int(diag.get('match_count', 0))},{float(diag.get('match_frac', 0.0)):.6f},"
+        f"{int(diag.get('applied_count', 0))},{int(diag.get('skip_unsupported_count', 0))},"
+        f"{int(diag.get('skip_center_confidence_count', 0))},{int(diag.get('skip_border_count', 0))},"
+        f"{int(diag.get('skip_neighbor_confidence_count', 0))},{int(diag.get('skip_nonfinite_count', 0))},"
+        f"{int(diag.get('skip_unmatched_count', 0))},{int(diag.get('neighbor_query_count', 0))},"
+        f"{int(diag.get('neighbor_supported_count', 0))},{int(diag.get('neighbor_confident_count', 0))},"
+        f"{float(diag.get('loss_mean', 0.0)):.6f},{float(diag.get('applied_loss_mean', 0.0)):.6f},"
+        f"{int(center_entropy.get('count', 0))},{float(center_entropy.get('mean', 0.0)):.6f},"
+        f"{float(center_entropy.get('median', 0.0)):.6f},{float(center_entropy.get('p95', 0.0)):.6f},"
+        f"{float(center_entropy.get('max', 0.0)):.6f},{int(neighbor_entropy.get('count', 0))},"
+        f"{float(neighbor_entropy.get('mean', 0.0)):.6f},{float(neighbor_entropy.get('median', 0.0)):.6f},"
+        f"{float(neighbor_entropy.get('p95', 0.0)):.6f},{float(neighbor_entropy.get('max', 0.0)):.6f}\n"
+    )
+
+    if LOSS_LOG_FLUSH_INTERVAL > 0 and iteration % LOSS_LOG_FLUSH_INTERVAL == 0:
+        CHUNK5_DIAG_LOG_HANDLE.flush()
+
+
 def close_logs():
-    global LOG_FILE, LOSS_LOG_HANDLE
+    global LOG_FILE, LOSS_LOG_HANDLE, CHUNK5_DIAG_LOG_HANDLE
 
     sys.stdout = ORIGINAL_STDOUT
     sys.stderr = ORIGINAL_STDERR
@@ -2761,6 +2966,12 @@ def close_logs():
             LOSS_LOG_HANDLE.close()
         finally:
             LOSS_LOG_HANDLE = None
+    if CHUNK5_DIAG_LOG_HANDLE is not None:
+        try:
+            CHUNK5_DIAG_LOG_HANDLE.flush()
+            CHUNK5_DIAG_LOG_HANDLE.close()
+        finally:
+            CHUNK5_DIAG_LOG_HANDLE = None
     if LOG_FILE is not None:
         try:
             LOG_FILE.flush()
@@ -4326,6 +4537,7 @@ def main():
 
     setup_logging(OUTPUT_DIR)
     init_loss_log(OUTPUT_DIR)
+    init_chunk5_diag_log(OUTPUT_DIR)
     atexit.register(close_logs)
 
     print("=" * 60)
@@ -5613,6 +5825,7 @@ def main():
             batch_normal_finite = []
             batch_normal_match = []
             batch_normal_skipped = []
+            batch_chunk5_diag = []
             batch_densify_high_error = []
             batch_densify_candidates = []
             batch_densify_resets = []
@@ -5764,6 +5977,7 @@ def main():
                 batch_normal_finite.append(int(chunk5_stats["finite_count"]))
                 batch_normal_match.append(int(chunk5_stats["match_count"]))
                 batch_normal_skipped.append(int(chunk5_stats["skipped_count"]))
+                batch_chunk5_diag.append(chunk5_stats)
 
                 densify_stats = {
                     "high_error_count": 0,
@@ -5823,6 +6037,7 @@ def main():
             normal_finite_mean = float(np.mean(batch_normal_finite)) if batch_normal_finite else 0.0
             normal_match_mean = float(np.mean(batch_normal_match)) if batch_normal_match else 0.0
             normal_skipped_mean = float(np.mean(batch_normal_skipped)) if batch_normal_skipped else 0.0
+            chunk5_diag_summary = summarize_chunk5_batch_diagnostics(batch_chunk5_diag)
             densify_high_error_mean = float(np.mean(batch_densify_high_error)) if batch_densify_high_error else 0.0
             densify_candidates_mean = float(np.mean(batch_densify_candidates)) if batch_densify_candidates else 0.0
             densify_resets_mean = float(np.mean(batch_densify_resets)) if batch_densify_resets else 0.0
@@ -5948,6 +6163,7 @@ def main():
                 scale_value,
                 len(gaussians.get_xyz)
             )
+            log_chunk5_diag(metric_step, "stage2", chunk5_diag_summary)
 
             if iteration % 10 == 0 or iteration == 1:
                 sampler_tail = ""
@@ -5964,10 +6180,16 @@ def main():
                             f"assoc_w={couple_assoc_w:.3f}"
                         )
                     if ELEV_CHUNK5_CFG.effective_normal_mode != "off":
+                        center_entropy = chunk5_diag_summary["center_entropy_summary"]
+                        neighbor_entropy = chunk5_diag_summary["neighbor_entropy_summary"]
                         sampler_tail += (
                             f", normal={loss_normal.item():.6f}, w_normal={normal_weight_mean:.3f}, "
                             f"cov={normal_cov:.4f}, conf_cov={normal_conf_cov:.4f}, "
-                            f"finite={normal_finite_mean:.1f}, match={normal_match_mean:.1f}, skip={normal_skipped_mean:.1f}"
+                            f"finite={normal_finite_mean:.1f}, match={normal_match_mean:.1f}, skip={normal_skipped_mean:.1f}, "
+                            f"anchors={chunk5_diag_summary['anchor_count']}, supp={chunk5_diag_summary['center_supported_count']}, "
+                            f"cconf={chunk5_diag_summary['center_confident_count']}, interior={chunk5_diag_summary['interior_anchor_count']}, "
+                            f"nconf={chunk5_diag_summary['all_neighbors_confident_count']}, unmatched={chunk5_diag_summary['skip_unmatched_count']}, "
+                            f"Hc={center_entropy['mean']:.3f}/{center_entropy['p95']:.3f}, Hn={neighbor_entropy['mean']:.3f}/{neighbor_entropy['p95']:.3f}"
                         )
                     if densify_candidate_enabled:
                         sampler_tail += (
@@ -6146,6 +6368,7 @@ def main():
             batch_normal_finite = []
             batch_normal_match = []
             batch_normal_skipped = []
+            batch_chunk5_diag = []
             batch_densify_high_error = []
             batch_densify_candidates = []
             batch_densify_resets = []
@@ -6295,6 +6518,7 @@ def main():
                 batch_normal_finite.append(int(chunk5_stats["finite_count"]))
                 batch_normal_match.append(int(chunk5_stats["match_count"]))
                 batch_normal_skipped.append(int(chunk5_stats["skipped_count"]))
+                batch_chunk5_diag.append(chunk5_stats)
 
                 densify_stats = {
                     "high_error_count": 0,
@@ -6354,6 +6578,7 @@ def main():
             normal_finite_mean = float(np.mean(batch_normal_finite)) if batch_normal_finite else 0.0
             normal_match_mean = float(np.mean(batch_normal_match)) if batch_normal_match else 0.0
             normal_skipped_mean = float(np.mean(batch_normal_skipped)) if batch_normal_skipped else 0.0
+            chunk5_diag_summary = summarize_chunk5_batch_diagnostics(batch_chunk5_diag)
             densify_high_error_mean = float(np.mean(batch_densify_high_error)) if batch_densify_high_error else 0.0
             densify_candidates_mean = float(np.mean(batch_densify_candidates)) if batch_densify_candidates else 0.0
             densify_resets_mean = float(np.mean(batch_densify_resets)) if batch_densify_resets else 0.0
@@ -6478,6 +6703,7 @@ def main():
                 scale_value,
                 len(gaussians.get_xyz)
             )
+            log_chunk5_diag(metric_step, "stage3", chunk5_diag_summary)
 
             if iteration % 10 == 0 or iteration == 1:
                 sampler_tail = ""
@@ -6494,10 +6720,16 @@ def main():
                             f"assoc_w={couple_assoc_w:.3f}"
                         )
                     if ELEV_CHUNK5_CFG.effective_normal_mode != "off":
+                        center_entropy = chunk5_diag_summary["center_entropy_summary"]
+                        neighbor_entropy = chunk5_diag_summary["neighbor_entropy_summary"]
                         sampler_tail += (
                             f", normal={loss_normal.item():.6f}, w_normal={normal_weight_mean:.3f}, "
                             f"cov={normal_cov:.4f}, conf_cov={normal_conf_cov:.4f}, "
-                            f"finite={normal_finite_mean:.1f}, match={normal_match_mean:.1f}, skip={normal_skipped_mean:.1f}"
+                            f"finite={normal_finite_mean:.1f}, match={normal_match_mean:.1f}, skip={normal_skipped_mean:.1f}, "
+                            f"anchors={chunk5_diag_summary['anchor_count']}, supp={chunk5_diag_summary['center_supported_count']}, "
+                            f"cconf={chunk5_diag_summary['center_confident_count']}, interior={chunk5_diag_summary['interior_anchor_count']}, "
+                            f"nconf={chunk5_diag_summary['all_neighbors_confident_count']}, unmatched={chunk5_diag_summary['skip_unmatched_count']}, "
+                            f"Hc={center_entropy['mean']:.3f}/{center_entropy['p95']:.3f}, Hn={neighbor_entropy['mean']:.3f}/{neighbor_entropy['p95']:.3f}"
                         )
                     if densify_candidate_enabled:
                         sampler_tail += (
@@ -6889,6 +7121,7 @@ def main():
     print(f"  - comparison_after_stage3_<idx>_<image>.png    (After joint fine-tuning)")
     print(f"  - comparison_after_stage3_raw_<idx>_<image>.png (Raw sonar vs rendered)")
     print(f"  - scale_and_loss.png                    (Scale and loss curves)")
+    print(f"  - chunk5_gate_log.csv                  (Chunk-5 gate-by-gate diagnostics)")
     print(f"  - frame_training_visits.csv             (Per-frame optimizer visit coverage)")
     print(f"  - final_eval_train_frames.csv           (Per-frame final train losses)")
     if holdout_frames:

@@ -878,3 +878,54 @@ Qualitative manual review of the same run indicates that the pose/backprojection
 - Blender inspection shows that most surfel centers cluster near the cube surfaces, while surfel orientations remain visibly poor and a residual set of floating surfels still sits inside or outside the cube.
 
 This qualitative evidence reinforces the current hypothesis that the dominant post-fix failure mode has shifted from gross pose/center misplacement to rotation/orientation quality plus residual off-surface outliers.
+
+### 20.2 Chunk-5.5 gate-by-gate diagnostic rerun
+
+Added explicit Chunk-5 gate logging to `debug_multiframe.py` and ran a short controlled rerun on `synthetic_cube_C_azimuth45_fixedpos` with active normals enabled from iteration `1`:
+
+- output: `output/chunk5_5_diag_cube20_short_active_v1/`
+- diagnostic artifact: `chunk5_gate_log.csv`
+- selected frames: `sonar_000000, 000025, 000050, ..., 000475`
+- Stage-2 iterations: `40`
+- Stage-1 mode: `shadow`
+- normal mode: `active`
+- confidence threshold: `0.5`
+
+The new gate log shows:
+
+- center support is effectively complete on every logged step:
+
+$$
+\text{center-supported fraction} = 1.0
+$$
+
+- center confidence is the first major collapse:
+
+$$
+\text{center-confident count} \in [0, 16], \qquad
+\text{fraction} \in [0.0000, 0.0374]
+$$
+
+- neighbor closure then removes almost all remaining anchors:
+
+$$
+\text{all-neighbors-confident count} \in \{0, 1\}
+$$
+
+- when an anchor does survive neighbor readiness, the later steps usually do not fail first:
+
+$$
+\text{if readiness}=1 \Rightarrow \text{finite}=1 \Rightarrow \text{match}=1
+$$
+
+The posterior entropies remain close to the `7`-bin maximum:
+
+$$
+H_{\max} = \log 7 = 1.945910
+$$
+
+with observed center-entropy means approximately `1.77` to `1.91` and queried-neighbor means approximately `1.72` to `1.87`.
+
+The practical conclusion from this rerun is that the current Chunk-5 path is blocked primarily by confidence collapse, not by finite-normal construction or surfel matching once a rare anchor survives the earlier gates.
+
+This result motivated the current Chunk-5.5 Phase-A execution direction: remove the sonar 4-neighbor pixel finite-difference stencil from the active path, preserve the diagnostics, rerun a few controlled tests, and only then decide whether any replacement local-geometry construction is justified.

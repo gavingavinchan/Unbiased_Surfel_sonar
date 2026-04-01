@@ -511,3 +511,10 @@ flowchart TB
 - Manual review note from the 20-frame run: rendered sonar lines are usually centered in the correct places, but the cube-surface traces remain fragmented into line segments instead of continuous face returns; one recurring failure mode is a large centered surfel with incorrect orientation producing a line segment whose slope disagrees with the surrounding correctly placed segments.
 - Blender/manual geometry note from the same run: most surfel centers now appear to lie near the intended cube surfaces, but orientations remain poor and a residual set of floating surfels still sits inside or outside the cube rather than on the surface.
 - Details: `docs/SYNTHETIC_DATASET_GUIDE.md` (Backward-Projection Rotation Convention Bug section).
+
+## Recent Updates (2026-04-01, Chunk-5.5 Gate Diagnostics)
+
+- Added focused Chunk-5 gate diagnostics to `debug_multiframe.py`, including per-step anchor/support/confidence/neighbor/finite/match counts, skip-reason counters, and center/neighbor entropy summaries via `chunk5_gate_log.csv`.
+- Ran controlled diagnostic rerun `output/chunk5_5_diag_cube20_short_active_v1/` on `synthetic_cube_C_azimuth45_fixedpos` with the same 20-frame subset and early active-normal schedule.
+- The rerun confirms the current collapse happens primarily at `support -> center confidence`, then again at neighbor-confidence closure; finite-normal formation and surfel matching were not the dominant blocker once an anchor survived to those steps.
+- Plan `PLAN_ELEVATION_AWARE_CHUNK5_5_EXECUTION_2026-03-30.md` was reorganized into a plan section plus progress log, with an explicit Phase-A next step: remove the sonar 4-neighbor finite-difference stencil, rerun a few controlled diagnostics, and only then decide whether any replacement geometry path is justified.
