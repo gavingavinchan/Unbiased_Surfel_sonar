@@ -3,6 +3,20 @@
 ## Abstract
 We extended 2D Gaussian Splatting to forward-looking multibeam sonar by introducing polar rendering, backward projection, metric scale alignment, and sonar-specific training constraints. The work adds sonar mode data flow, pose interpolation from camera trajectories, a learnable global scale factor, camera-to-sonar extrinsics, differentiable polar rendering with intensity modeling, size-aware field-of-view (FOV) constraints, and loss shaping for bright sonar returns. We also introduced mesh tuning workflows and dataset preparation guidelines to support real-world sonar reconstructions.
 
+## 2026-04-06 Chunk-5.6 TDD Addendum
+Chunk 5.6 is now grounded by an explicit pre-implementation test tranche that treats the current failure as a renderer/trainer contract disconnect rather than as a threshold-tuning issue. The new focused suite in `tests/test_elevation_chunk5_6_tdd_contracts.py` encodes the required recovery posture:
+
+1. `render_sonar()` must expose dense regularizer maps with non-placeholder semantics.
+2. The active Stage-2/Stage-3 normal path must consume renderer-connected quantities directly.
+3. Opacity must be learnable in the validated sonar path.
+4. The eventual hard-depth / distortion rollout must enter the same unified trainer objective rather than remaining a diagnostic-only side channel.
+
+Scientifically, this matters because the intended restored normal law is again a dense renderer self-consistency comparison,
+$$
+\mathcal{L}_{\mathrm{normal}} \propto 1 - \big( n_{\mathrm{rend}} \cdot (\alpha_{\mathrm{rend}}\, n_{\mathrm{surf}}) \big),
+$$
+with $n_{\mathrm{rend}}$ derived from composited surfel orientations and $n_{\mathrm{surf}}$ derived from a rendered sonar depth surface, rather than from sparse posterior-expected elevation anchors. The current red tests therefore serve as an explicit scientific baseline: the old sparse path is still what the code does, and Chunk 5.6 is not considered restored until those tests turn green under the new dense renderer-connected semantics.
+
 ## 2026-03-30 Chunk-5.5 Diagnostic Framing Addendum
 The current scientific interpretation of Chunk-5 late-normal behavior is now split between a main implementation contract and a dedicated diagnostic follow-on note. The new `plans/PLAN_ELEVATION_AWARE_CHUNK5_5_EXECUTION_2026-03-30.md` records the immediate requirement that any scientifically meaningful rerun must expose the full gate stack
 $$

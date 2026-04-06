@@ -1,5 +1,11 @@
 # Progress Overview (Post-Fork, Multi-Branch)
 
+## 2026-04-06 Chunk-5.6 TDD Tranche
+- Added the first dedicated Chunk-5.6 recovery test file `tests/test_elevation_chunk5_6_tdd_contracts.py` to lock in the renderer/trainer contract needed to restore sonar normal consistency before any implementation rewrite lands.
+- The new red suite targets the current architecture disconnect explicitly: placeholder `render_sonar()` regularizer outputs, missing compositing-state exposure, fixed-opacity default posture, the still-active sparse Stage-1 geometry dependency in `compute_chunk5_normal_for_frame()`, missing renderer-connected diagnostics, and missing depth-regularizer plumbing in `debug_multiframe.py`.
+- The test file now mixes structural AST checks with a small behavioral tranche for compositing-state math, opacity-policy behavior, mode gating, and Stage-2/Stage-3 normal-term alignment.
+- Current status of that tranche is intentionally pre-implementation: `12 failed, 2 passed, 3 skipped` on the focused test file, which is treated as the starting red baseline for Chunk 5.6 implementation rather than as a regression.
+
 ## 2026-03-30 Chunk-5.5 Diagnostic Split And Normals Explainer
 - Split the post-2026-03-25 Chunk-5 zero-signal investigation out of `plans/PLAN_ELEVATION_AWARE_CHUNK5_EXECUTION_2026-03-16.md` into the new follow-on diagnostic note `plans/PLAN_ELEVATION_AWARE_CHUNK5_5_EXECUTION_2026-03-30.md` so the main Chunk-5 plan stays focused on the implementation contract while the zero-signal blocker gets its own execution track.
 - Added an explicit new-session handoff prompt in the Chunk-5.5 plan that requires the first rerun to log the full late-normal gate stack (`support -> confidence -> 4-neighbor -> finite -> match`) before any threshold or algorithm changes are proposed.
