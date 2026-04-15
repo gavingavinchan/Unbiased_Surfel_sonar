@@ -735,18 +735,24 @@ Reasoning:
 
 ### Initial export scope
 
-For the first pass, generate only 2D images and generate them only at the end of training.
+For the first pass, generate only 2D images, and save them at the same cadence as the existing `comparison_*` images: `before_training`, `after_stage2`, and `after_stage3`.
 
-Suggested artifact types:
+Reasoning:
+
+- Chunk-5.6 runs are short (e.g. 240 iters on the cube), so an end-of-training-only snapshot gives no temporal signal,
+- the existing `comparison_*` hooks already iterate all training frames at those three boundaries, so the incremental cost is minimal,
+- having stage-boundary snapshots lets the visualization show whether `surf_depth`/`surf_normal` evolve during Stage 2, rather than only revealing the final state.
+
+Suggested artifact types per hook point:
 
 - `surf_depth` image per training frame,
 - `surf_normal` image per training frame.
 
-Naming should match the existing `comparison_*_<frame>.png` style as closely as practical while still making it clear these are macro-surface artifacts.
+Naming should match the existing `comparison_*_<frame>.png` style (e.g. `surf_depth_after_stage2_<frame>.png`).
 
 ### Diagnostic expansion note
 
-If the final-only images are not sufficient to explain failures, extend this to generate more of those images throughout training at saved checkpoints or stage boundaries.
+If the three-boundary images are not sufficient to explain failures, extend this to generate more of those images throughout training at finer intervals or per-iteration checkpoints.
 
 That deeper rollout is explicitly a follow-up diagnostic option, not the default first implementation.
 
