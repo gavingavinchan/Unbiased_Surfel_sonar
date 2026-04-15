@@ -712,8 +712,51 @@ What remains incomplete:
 2. Compare active vs shadow/off runs using an explicit orientation-quality metric, not only coverage/loss activation.
 3. Decide whether the current restored depth term is sufficient as the retained Chunk-5.6 `rend_dist` behavior or whether it needs a closer camera-parity distortion formulation.
 4. If preparing for commit, update the progress docs required by repo policy before committing:
-    - `plans/progress_overview.md`
-    - `plans/scientific_progress.md`
+     - `plans/progress_overview.md`
+     - `plans/scientific_progress.md`
+
+## Post-Closeout Visualization Follow-Up
+
+This sits after the main Chunk-5.6 closeout work and is intended as a lightweight inspection pass, not as a blocker for the closeout itself.
+
+### First visualization target
+
+The first macro-surface visualization target should be the renderer outputs:
+
+- `surf_depth`
+- `surf_normal`
+
+Reasoning:
+
+- these are the macro-surface outputs used on the target side of the restored normal-consistency path,
+- they already exist in the renderer contract,
+- they are simpler and more direct than jumping immediately to a 3D Blender export,
+- they should already reveal whether the implied surface on the synthetic cube is face-aligned, smeared, rounded, or phantom.
+
+### Initial export scope
+
+For the first pass, generate only 2D images and generate them only at the end of training.
+
+Suggested artifact types:
+
+- `surf_depth` image per training frame,
+- `surf_normal` image per training frame.
+
+Naming should match the existing `comparison_*_<frame>.png` style as closely as practical while still making it clear these are macro-surface artifacts.
+
+### Diagnostic expansion note
+
+If the final-only images are not sufficient to explain failures, extend this to generate more of those images throughout training at saved checkpoints or stage boundaries.
+
+That deeper rollout is explicitly a follow-up diagnostic option, not the default first implementation.
+
+### Future option
+
+If the 2D images indicate that deeper geometric inspection is needed, the next visualization step should be a Blender-friendly 3D macro-surface export:
+
+- backproject `surf_depth` into world-space macro-surface geometry,
+- carry `surf_normal` along with it,
+- compare that geometry against the synthetic cube ground truth in the same world frame.
 
 ## 2026-04-06 Closeout Update
 
