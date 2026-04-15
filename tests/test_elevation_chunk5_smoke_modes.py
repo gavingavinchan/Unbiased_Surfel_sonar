@@ -6,6 +6,7 @@ late-normal and densify paths in ``debug_multiframe.py``.
 
 import csv
 import importlib.util
+import json
 import math
 import os
 import py_compile
@@ -153,8 +154,10 @@ def _run_debug_smoke(
 
     surfel_path = run_dir / "surfels_after_training.ply"
     eval_csv = run_dir / "final_eval_train_frames.csv"
+    synthetic_diag_json = run_dir / "synthetic_surface_diagnostics.json"
     assert surfel_path.exists(), f"Missing artifact: {surfel_path}"
     assert eval_csv.exists(), f"Missing artifact: {eval_csv}"
+    assert synthetic_diag_json.exists(), f"Missing artifact: {synthetic_diag_json}"
 
     log_text = log_path.read_text(encoding="utf-8")
     return {
@@ -162,6 +165,7 @@ def _run_debug_smoke(
         "log_path": log_path,
         "eval_csv": eval_csv,
         "log_text": log_text,
+        "synthetic_diag": json.loads(synthetic_diag_json.read_text(encoding="utf-8")),
         "stats": _read_final_eval_stats(eval_csv),
     }
 
@@ -184,6 +188,8 @@ def test_c5_t11_runtime_active_normals_smoke(tmp_path):
     assert math.isfinite(out["stats"]["ssim_mean"])
     assert "normal=" in out["log_text"]
     assert "conf_cov=" in out["log_text"]
+    assert "stage3" in out["synthetic_diag"]["stages"]
+    assert "near_surface" in out["synthetic_diag"]["stages"]["stage3"]
 
 
 @pytest.mark.skipif(not RUN_RUNTIME_SMOKES, reason="Set RUN_CHUNK5_RUNTIME_SMOKES=1 to run runtime smokes")
@@ -206,3 +212,4 @@ def test_c5_t13_runtime_active_densify_smoke(tmp_path):
     assert "spawn=" in out["log_text"]
     assert "cand=" in out["log_text"]
     assert "supp=" in out["log_text"]
+    assert "stage3" in out["synthetic_diag"]["stages"]

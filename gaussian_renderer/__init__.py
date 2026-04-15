@@ -855,16 +855,25 @@ def compose_ray_binned_occlusion(ray_ids, range_vals, alpha_vals, value_vals, nu
     del kwargs
     if range_vals.numel() == 0:
         empty = torch.zeros_like(value_vals)
+        empty_long = ray_ids.new_zeros((0,), dtype=torch.long)
         return {
             "event_returns": empty,
             "ray_returns": value_vals.new_zeros(int(num_rays)),
             "final_transmittance": value_vals.new_ones(int(num_rays)),
+            "transmittance_before_event": empty,
+            "alpha_sorted": empty,
+            "range_sorted": empty,
+            "ray_ids_sorted": empty_long,
+            "segment_starts": empty_long,
+            "event_sort_order": empty_long,
+            "segment_ids": empty_long,
         }
 
     sort_stride = float(range_vals.detach().max().item()) + 1.0 if range_vals.numel() > 0 else 1.0
     sort_key = ray_ids.to(dtype=torch.float64) * sort_stride + range_vals.to(dtype=torch.float64)
     order = torch.argsort(sort_key)
     ray_sorted = ray_ids[order]
+    range_sorted = range_vals[order]
     alpha_sorted = torch.clamp(alpha_vals[order], min=0.0, max=1.0)
     value_sorted = value_vals[order]
     one_minus_alpha = (1.0 - alpha_sorted).clamp_min(1e-8)
@@ -898,6 +907,13 @@ def compose_ray_binned_occlusion(ray_ids, range_vals, alpha_vals, value_vals, nu
         "event_returns": event_returns,
         "ray_returns": ray_returns,
         "final_transmittance": final_transmittance,
+        "transmittance_before_event": trans_before,
+        "alpha_sorted": alpha_sorted,
+        "range_sorted": range_sorted,
+        "ray_ids_sorted": ray_sorted,
+        "segment_starts": segment_starts,
+        "event_sort_order": order,
+        "segment_ids": segment_ids,
     }
 
 
@@ -1228,6 +1244,14 @@ def render_sonar(
     returns_aer = torch.zeros(W, int(runtime_contract["elev_bins"]), H, device=device, dtype=viewspace_points.dtype)
     range_aer = torch.zeros_like(returns_aer)
     support_aer = torch.zeros_like(returns_aer)
+    reg_alpha_aer = torch.zeros_like(returns_aer)
+    reg_depth_num_aer = torch.zeros_like(returns_aer)
+    reg_dist_num_aer = torch.zeros_like(returns_aer)
+    reg_normal_aer = torch.zeros(W, int(runtime_contract["elev_bins"]), H, 3, device=device, dtype=viewspace_points.dtype)
+    alpha_surface_aer = torch.zeros_like(returns_aer)
+    depth_surface_num_aer = torch.zeros_like(returns_aer)
+    dist_surface_num_aer = torch.zeros_like(returns_aer)
+    normal_surface_aer = torch.zeros(W, int(runtime_contract["elev_bins"]), H, 3, device=device, dtype=viewspace_points.dtype)
 
     if hasattr(pc, "get_scaling"):
         scaling_xy = pc.get_scaling * float(scaling_modifier)
@@ -1341,7 +1365,151 @@ def render_sonar(
                 event_returns = composed["event_returns"]
             else:
                 event_returns = event_value
+                composed = {
+                    "final_transmittance": event_value.new_ones(num_ray_bins),
+                    "transmittance_before_event": event_value.new_ones_like(event_value),
+                    "alpha_sorted": torch.clamp(event_alpha, min=0.0, max=1.0),
+                    "range_sorted": event_range,
+                    "ray_ids_sorted": event_ray_ids,
+                    "segment_starts": torch.nonzero(torch.ones_like(event_ray_ids, dtype=torch.bool), as_tuple=False).squeeze(-1),
+                    "event_sort_order": torch.arange(event_ray_ids.shape[0], device=device, dtype=torch.long),
+                    "segment_ids": torch.arange(event_ray_ids.shape[0], device=device, dtype=torch.long),
+                }
             event_returns = torch.nan_to_num(event_returns, nan=0.0, posinf=0.0, neginf=0.0)
+
+            if event_ray_ids.numel() > 0:
+                ray_ids_sorted = composed["ray_ids_sorted"]
+                range_sorted = composed["range_sorted"]
+                alpha_sorted = composed["alpha_sorted"]
+                trans_before = composed["transmittance_before_event"]
+                segment_starts = composed["segment_starts"]
+                segment_ids = composed.get("segment_ids")
+                event_sort_order = composed["event_sort_order"]
+                sorted_surfel_idx = event_surfel_idx[event_sort_order]
+                sorted_normal = normals_world[visible_idx[sorted_surfel_idx]]
+                composite_weight = trans_before * alpha_sorted
+                event_comp_alpha = event_alpha.new_zeros(event_alpha.shape)
+                event_comp_alpha.scatter_(0, event_sort_order, composite_weight)
+
+                ray_normal = viewspace_points.new_zeros((num_ray_bins, 3))
+                ray_normal = ray_normal.scatter_add(
+                    0,
+                    ray_ids_sorted.unsqueeze(-1).expand(-1, 3),
+                    composite_weight.unsqueeze(-1) * sorted_normal,
+                )
+
+                if segment_starts.numel() > 0:
+                    segment_ends = torch.empty_like(segment_starts)
+                    if segment_starts.numel() > 1:
+                        segment_ends[:-1] = segment_starts[1:] - 1
+                    segment_ends[-1] = ray_ids_sorted.numel() - 1
+
+                    if segment_ids.numel() == 0:
+                        segment_ids = torch.zeros_like(ray_ids_sorted)
+
+                    ray_idx = torch.arange(ray_ids_sorted.shape[0], device=device, dtype=torch.long)
+                    cumulative_alpha = 1.0 - trans_before * (1.0 - alpha_sorted)
+                    candidate_idx = torch.where(
+                        cumulative_alpha >= 0.5,
+                        ray_idx,
+                        torch.full_like(ray_idx, ray_ids_sorted.shape[0]),
+                    )
+                    first_hit = torch.full(
+                        (segment_starts.shape[0],),
+                        ray_ids_sorted.shape[0],
+                        device=device,
+                        dtype=torch.long,
+                    )
+                    first_hit.scatter_reduce_(0, segment_ids, candidate_idx, reduce="amin", include_self=True)
+                    hard_pick = torch.where(first_hit < ray_ids_sorted.shape[0], first_hit, segment_ends)
+
+                    active_ray_ids = ray_ids_sorted[segment_starts]
+                    ray_alpha = 1.0 - composed["final_transmittance"][active_ray_ids]
+                    hard_depth = range_sorted[hard_pick]
+                    hard_depth_per_event = hard_depth[segment_ids]
+                    event_hard_depth = event_range.new_zeros(event_range.shape)
+                    event_hard_depth.scatter_(0, event_sort_order, hard_depth_per_event)
+                    event_normal = viewspace_points.new_zeros((event_alpha.shape[0], 3))
+                    event_normal.scatter_(
+                        0,
+                        event_sort_order.unsqueeze(-1).expand(-1, 3),
+                        composite_weight.unsqueeze(-1) * sorted_normal,
+                    )
+
+                    ray_dist_num = viewspace_points.new_zeros((num_ray_bins,))
+                    ray_dist_num = ray_dist_num.scatter_add(
+                        0,
+                        ray_ids_sorted,
+                        composite_weight * torch.abs(range_sorted - hard_depth_per_event),
+                    )
+                    ray_dist = ray_dist_num[active_ray_ids] / ray_alpha.clamp_min(1e-8)
+
+                    row_float = (hard_depth - float(sonar_config.range_min)) / max(
+                        float(sonar_config.range_max - sonar_config.range_min),
+                        1e-6,
+                    )
+                    hard_rows = torch.clamp(
+                        torch.round(row_float * max(H - 1, 0)).to(dtype=torch.long),
+                        0,
+                        max(H - 1, 0),
+                    )
+                    flat_surface_idx = active_ray_ids * H + hard_rows
+
+                    alpha_surface_flat = viewspace_points.new_zeros((num_ray_bins * H,))
+                    depth_surface_num_flat = viewspace_points.new_zeros((num_ray_bins * H,))
+                    dist_surface_num_flat = viewspace_points.new_zeros((num_ray_bins * H,))
+                    normal_surface_flat = viewspace_points.new_zeros((num_ray_bins * H, 3))
+
+                    alpha_surface_flat = alpha_surface_flat.scatter_add(0, flat_surface_idx, ray_alpha)
+                    depth_surface_num_flat = depth_surface_num_flat.scatter_add(0, flat_surface_idx, ray_alpha * hard_depth)
+                    dist_surface_num_flat = dist_surface_num_flat.scatter_add(0, flat_surface_idx, ray_alpha * ray_dist)
+                    normal_surface_flat = normal_surface_flat.scatter_add(
+                        0,
+                        flat_surface_idx.unsqueeze(-1).expand(-1, 3),
+                        ray_normal[active_ray_ids],
+                    )
+
+                    alpha_surface_aer = alpha_surface_flat.view(W, int(runtime_contract["elev_bins"]), H)
+                    depth_surface_num_aer = depth_surface_num_flat.view(W, int(runtime_contract["elev_bins"]), H)
+                    dist_surface_num_aer = dist_surface_num_flat.view(W, int(runtime_contract["elev_bins"]), H)
+                    normal_surface_aer = normal_surface_flat.view(W, int(runtime_contract["elev_bins"]), H, 3)
+
+                    row_profiles = _build_range_profiles_batch(
+                        row_centers=vis_mu[:, 1],
+                        sigma_rows=torch.sqrt(torch.clamp(vis_sigma[:, 1, 1], min=0.25)),
+                        num_rows=H,
+                        k_sigma=float(runtime_contract["occl_k_sigma"]),
+                    )
+                    reg_alpha_flat = torch.zeros(W * int(runtime_contract["elev_bins"]) * H, device=device, dtype=viewspace_points.dtype)
+                    reg_depth_num_flat = torch.zeros_like(reg_alpha_flat)
+                    reg_dist_num_flat = torch.zeros_like(reg_alpha_flat)
+                    reg_normal_flat = viewspace_points.new_zeros((W * int(runtime_contract["elev_bins"]) * H, 3))
+                    row_coords_reg = torch.arange(H, device=device, dtype=torch.long).unsqueeze(0)
+
+                    event_batch_size = 32768
+                    for start in range(0, int(event_ray_ids.shape[0]), event_batch_size):
+                        end = min(start + event_batch_size, int(event_ray_ids.shape[0]))
+                        cur_surfel = event_surfel_idx[start:end]
+                        cur_row_profiles = row_profiles[cur_surfel]
+                        cur_flat_idx = event_ray_ids[start:end].unsqueeze(1) * H + row_coords_reg
+                        cur_alpha = event_comp_alpha[start:end].unsqueeze(1) * cur_row_profiles
+                        cur_depth = cur_alpha * event_hard_depth[start:end].unsqueeze(1)
+                        cur_dist = cur_alpha * torch.abs(event_range[start:end] - event_hard_depth[start:end]).unsqueeze(1)
+                        cur_normal = event_normal[start:end].unsqueeze(1) * cur_row_profiles.unsqueeze(-1)
+
+                        reg_alpha_flat = reg_alpha_flat.scatter_add(0, cur_flat_idx.reshape(-1), cur_alpha.reshape(-1))
+                        reg_depth_num_flat = reg_depth_num_flat.scatter_add(0, cur_flat_idx.reshape(-1), cur_depth.reshape(-1))
+                        reg_dist_num_flat = reg_dist_num_flat.scatter_add(0, cur_flat_idx.reshape(-1), cur_dist.reshape(-1))
+                        reg_normal_flat = reg_normal_flat.scatter_add(
+                            0,
+                            cur_flat_idx.reshape(-1).unsqueeze(-1).expand(-1, 3),
+                            cur_normal.reshape(-1, 3),
+                        )
+
+                    reg_alpha_aer = reg_alpha_flat.view(W, int(runtime_contract["elev_bins"]), H)
+                    reg_depth_num_aer = reg_depth_num_flat.view(W, int(runtime_contract["elev_bins"]), H)
+                    reg_dist_num_aer = reg_dist_num_flat.view(W, int(runtime_contract["elev_bins"]), H)
+                    reg_normal_aer = reg_normal_flat.view(W, int(runtime_contract["elev_bins"]), H, 3)
 
             if _can_use_sonar_cuda_rasterizer(device):
                 raster_returns, raster_range, raster_support, raster_radii = _rasterize_sonar_event_volume(
@@ -1404,18 +1572,59 @@ def render_sonar(
     rendered_ar = marginalize_elevation_bins(returns_aer, elev_weights=elev_weights)
     range_num_ar = marginalize_elevation_bins(range_aer, elev_weights=elev_weights)
     support_ar = marginalize_elevation_bins(support_aer, elev_weights=elev_weights)
+    reg_alpha_ar = marginalize_elevation_bins(reg_alpha_aer, elev_weights=elev_weights)
+    reg_depth_num_ar = marginalize_elevation_bins(reg_depth_num_aer, elev_weights=elev_weights)
+    reg_dist_num_ar = marginalize_elevation_bins(reg_dist_num_aer, elev_weights=elev_weights)
+    reg_normal_ar = torch.einsum("weh,e->wh", reg_normal_aer[..., 0], elev_weights)
+    reg_normal_ag = torch.einsum("weh,e->wh", reg_normal_aer[..., 1], elev_weights)
+    reg_normal_ab = torch.einsum("weh,e->wh", reg_normal_aer[..., 2], elev_weights)
+    alpha_surface_ar = marginalize_elevation_bins(alpha_surface_aer, elev_weights=elev_weights)
+    depth_surface_num_ar = marginalize_elevation_bins(depth_surface_num_aer, elev_weights=elev_weights)
+    dist_surface_num_ar = marginalize_elevation_bins(dist_surface_num_aer, elev_weights=elev_weights)
+    normal_surface_ar = torch.einsum("weh,e->wh", normal_surface_aer[..., 0], elev_weights)
+    normal_surface_ag = torch.einsum("weh,e->wh", normal_surface_aer[..., 1], elev_weights)
+    normal_surface_ab = torch.einsum("weh,e->wh", normal_surface_aer[..., 2], elev_weights)
 
     rendered_image = rendered_ar.transpose(0, 1).unsqueeze(0)
     range_image = range_num_ar.transpose(0, 1).unsqueeze(0)
     weight_sum = support_ar.transpose(0, 1)
+    render_alpha = reg_alpha_ar.transpose(0, 1).unsqueeze(0)
 
     range_image = torch.where(
         weight_sum.unsqueeze(0) > 1e-6,
         range_image / weight_sum.unsqueeze(0),
         torch.zeros_like(range_image),
     )
+    hard_depth_image = torch.where(
+        alpha_surface_ar.transpose(0, 1).unsqueeze(0) > 1e-6,
+        depth_surface_num_ar.transpose(0, 1).unsqueeze(0) / alpha_surface_ar.transpose(0, 1).unsqueeze(0).clamp_min(1e-8),
+        torch.zeros_like(render_alpha),
+    )
+    surf_depth_image = torch.where(
+        render_alpha > 1e-6,
+        reg_depth_num_ar.transpose(0, 1).unsqueeze(0) / render_alpha.clamp_min(1e-8),
+        torch.zeros_like(render_alpha),
+    )
+    render_dist = torch.where(
+        render_alpha > 1e-6,
+        reg_dist_num_ar.transpose(0, 1).unsqueeze(0) / render_alpha.clamp_min(1e-8),
+        torch.zeros_like(render_alpha),
+    )
+    render_normal = torch.stack(
+        [
+            reg_normal_ar.transpose(0, 1),
+            reg_normal_ag.transpose(0, 1),
+            reg_normal_ab.transpose(0, 1),
+        ],
+        dim=0,
+    )
     rendered_image = torch.nan_to_num(rendered_image, nan=0.0, posinf=0.0, neginf=0.0)
     range_image = torch.nan_to_num(range_image, nan=0.0, posinf=0.0, neginf=0.0)
+    render_alpha = torch.nan_to_num(render_alpha, nan=0.0, posinf=0.0, neginf=0.0)
+    hard_depth_image = torch.nan_to_num(hard_depth_image, nan=0.0, posinf=0.0, neginf=0.0)
+    surf_depth_image = torch.nan_to_num(surf_depth_image, nan=0.0, posinf=0.0, neginf=0.0)
+    render_dist = torch.nan_to_num(render_dist, nan=0.0, posinf=0.0, neginf=0.0)
+    render_normal = torch.nan_to_num(render_normal, nan=0.0, posinf=0.0, neginf=0.0)
 
     rendered_image = torch.clamp(
         rendered_image + 1e-6 * (weight_sum.unsqueeze(0) - weight_sum.detach().unsqueeze(0)),
@@ -1428,13 +1637,19 @@ def render_sonar(
         mask[:, :mask_top_rows, :] = 0
         rendered_image = rendered_image * mask
         range_image = range_image * mask
+        render_alpha = render_alpha * mask
+        hard_depth_image = hard_depth_image * mask
+        surf_depth_image = surf_depth_image * mask
+        render_dist = render_dist * mask
+        render_normal = render_normal * mask.expand(3, -1, -1)
 
     rendered_image = rendered_image.expand(3, -1, -1)
 
     surf_normal = sonar_points_to_normals(
-        sonar_ranges_to_points(viewpoint_camera, range_image, sonar_config, scale_factor),
-        range_image,
+        sonar_ranges_to_points(viewpoint_camera, surf_depth_image, sonar_config, scale_factor),
+        surf_depth_image,
     ).permute(2, 0, 1)
+    surf_normal = surf_normal * render_alpha.detach()
 
     if mass_loss_tensor.numel() > 0:
         mass_loss_mean = float(mass_loss_tensor.mean().detach().item())
@@ -1544,10 +1759,10 @@ def render_sonar(
         "visibility_filter": in_fov,
         "radii": radii,
         "converge": torch.tensor(0.0, device=device),
-        "rend_alpha": (weight_sum > 0).float().unsqueeze(0),
-        "rend_normal": surf_normal,
-        "rend_dist": torch.zeros(1, H, W, device=device),
-        "surf_depth": range_image,
+        "rend_alpha": render_alpha,
+        "rend_normal": render_normal,
+        "rend_dist": render_dist,
+        "surf_depth": surf_depth_image,
         "surf_normal": surf_normal,
         "sonar_diagnostics": sonar_diagnostics,
     }

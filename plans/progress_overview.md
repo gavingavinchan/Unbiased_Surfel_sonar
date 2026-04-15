@@ -1,5 +1,18 @@
 # Progress Overview (Post-Fork, Multi-Branch)
 
+## 2026-04-06 Chunk-5.6 Closeout Validation
+- Added synthetic analytic-surface diagnostics directly to `debug_multiframe.py`: each synthetic run now emits `synthetic_surface_diagnostics.json` with per-stage near-surface residuals, sign-agnostic surfel-vs-ground-truth orientation alignment, near-surface opacity statistics, high-opacity fraction, and explicit `opacity_policy` / `opacity_grad_enabled` labeling so learnable-opacity evidence is not conflated with warmup-fixed behavior.
+- Hardened the active debug script for closeout comparisons: Stage-2 / Stage-3 now skip `backward()` with a warning when a baseline step has no gradient graph instead of crashing, and Poisson export now exits cleanly when opacity filtering removes all points.
+- Retained closeout evidence now comes from the analytic cube comparator with opacity warmup followed by a real learnable phase:
+  - `output/chunk5_6_closeout_probe_cube_active_warm`
+  - `output/chunk5_6_closeout_probe_cube_shadow_warm`
+  - `output/chunk5_6_closeout_probe_cube_off_warm`
+- Active-vs-baseline result on that retained comparator:
+  - active Stage 3 keeps `valid_surfel_count = 1914`, `near_surface.count = 1681`, `near_surface.high_opacity_frac = 1.0000`, and `near_surface.orientation_abs_cos.mean = 0.5089` under `opacity_policy = learnable`;
+  - matched `shadow` and `off` runs collapse to `valid_surfel_count = 0` once opacity becomes learnable, so the restored active Chunk-5.6 path now clearly outperforms the no-applied-loss baselines on the plan's required orientation/geometry comparison axis.
+- Depth-regularizer closeout evidence is now explicit rather than implicit: `output/chunk5_6_closeout_probe_cube_active_warm/chunk5_gate_log.csv` shows nonzero renderer-connected `rend_dist_mean` through the measured phase (for example `0.076989` at Stage-2 iter 220 and `0.082195` at Stage-3 iter 221), so the current hard-depth-plus-spread implementation is retained as the Chunk-5.6 depth term.
+- Exploratory ablation note: `output/chunk5_6_closeout_probe_sphere_active` with `SONAR_OPACITY_WARMUP_ITERS=0` confirms that immediate learnable opacity is too unstable for retained validation; it drives near-surface opacity low and degrades alignment, so the warmup-then-learnable policy remains the closeout posture.
+
 ## 2026-04-06 Chunk-5.6 TDD Tranche
 - Added the first dedicated Chunk-5.6 recovery test file `tests/test_elevation_chunk5_6_tdd_contracts.py` to lock in the renderer/trainer contract needed to restore sonar normal consistency before any implementation rewrite lands.
 - The new red suite targets the current architecture disconnect explicitly: placeholder `render_sonar()` regularizer outputs, missing compositing-state exposure, fixed-opacity default posture, the still-active sparse Stage-1 geometry dependency in `compute_chunk5_normal_for_frame()`, missing renderer-connected diagnostics, and missing depth-regularizer plumbing in `debug_multiframe.py`.

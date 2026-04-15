@@ -5,6 +5,7 @@ import math
 from types import SimpleNamespace
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 try:
@@ -566,4 +567,104 @@ def test_c56_t17_stage2_and_stage3_loss_include_normal_term_once_contract():
 
     assert len(matching) >= 2, (
         "C56-T17: Stage-2 and Stage-3 unified loss expressions must include normal_term_i exactly once"
+    )
+
+
+def test_c56_t18_synthetic_surface_diagnostics_sphere_behavior_contract():
+    fn = _load_function_from_ast(
+        DEBUG_SCRIPT,
+        "compute_synthetic_surface_diagnostics_from_arrays",
+        extra_ns={"np": np},
+    )
+
+    points = np.asarray(
+        [
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, -1.02],
+        ],
+        dtype=np.float64,
+    )
+    normals = np.asarray(
+        [
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, -1.0],
+        ],
+        dtype=np.float64,
+    )
+    opacity = np.asarray([0.95, 0.85, 0.40], dtype=np.float64)
+    geometry = {"shape": "sphere", "sphere_center_m": [0.0, 0.0, 0.0], "sphere_radius_m": 1.0}
+
+    diag = fn(
+        points,
+        normals,
+        opacity,
+        geometry,
+        near_surface_thresh_m=0.05,
+        high_opacity_thresh=0.80,
+        orientation_good_cos=0.95,
+    )
+
+    assert diag["shape"] == "sphere"
+    assert diag["near_surface"]["count"] == 3
+    assert diag["near_surface"]["high_opacity_frac"] == pytest.approx(2.0 / 3.0)
+    assert diag["near_surface"]["good_orientation_frac"] == pytest.approx(1.0)
+    assert diag["near_surface"]["orientation_abs_cos"]["mean"] == pytest.approx(1.0)
+
+
+def test_c56_t19_synthetic_surface_diagnostics_cube_behavior_contract():
+    fn = _load_function_from_ast(
+        DEBUG_SCRIPT,
+        "compute_synthetic_surface_diagnostics_from_arrays",
+        extra_ns={"np": np},
+    )
+
+    points = np.asarray(
+        [
+            [1.02, 0.10, 0.00],
+            [-1.01, 0.00, 0.10],
+            [0.00, 0.00, 1.03],
+            [0.00, 0.00, 0.20],
+        ],
+        dtype=np.float64,
+    )
+    normals = np.asarray(
+        [
+            [1.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 0.0, -1.0],
+            [0.0, 1.0, 0.0],
+        ],
+        dtype=np.float64,
+    )
+    opacity = np.asarray([0.92, 0.88, 0.30, 0.10], dtype=np.float64)
+    geometry = {"shape": "cube", "cube_center_m": [0.0, 0.0, 0.0], "cube_half_extent_m": 1.0}
+
+    diag = fn(
+        points,
+        normals,
+        opacity,
+        geometry,
+        near_surface_thresh_m=0.05,
+        high_opacity_thresh=0.80,
+        orientation_good_cos=0.95,
+    )
+
+    assert diag["shape"] == "cube"
+    assert diag["near_surface"]["count"] == 3
+    assert diag["near_surface"]["high_opacity_frac"] == pytest.approx(2.0 / 3.0)
+    assert diag["near_surface"]["good_orientation_frac"] == pytest.approx(1.0)
+    assert diag["near_surface"]["high_opacity_majority"] is True
+
+
+def test_c56_t20_visualizer_exports_include_synthetic_surface_diagnostics_contract():
+    build_refs = _require_function(DEBUG_SCRIPT, "build_visualizer_metadata_refs", "C56-T20")
+    export_stage = _require_function(DEBUG_SCRIPT, "export_stage_visualizer_state", "C56-T20")
+
+    assert _expr_contains_string_literal(build_refs, "synthetic_surface_diagnostics"), (
+        "C56-T20: build_visualizer_metadata_refs must expose synthetic_surface_diagnostics.json when present"
+    )
+    assert _expr_contains_string_literal(export_stage, "synthetic_surface_diagnostics"), (
+        "C56-T20: export_stage_visualizer_state must carry per-stage synthetic surface diagnostics into the visualizer artifact"
     )

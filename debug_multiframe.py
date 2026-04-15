@@ -27,6 +27,7 @@ import os
 import sys
 import atexit
 import csv
+import json
 import subprocess
 from dataclasses import dataclass
 import torch
@@ -43,14 +44,11 @@ from scene import Scene, GaussianModel
 from scene.dataset_readers import readColmapCameras, readColmapSceneInfo, getNerfppNorm
 from gaussian_renderer import render_sonar, render, quaternion_to_normal, sonar_project_points
 from utils.sonar_utils import (SonarConfig, SonarScaleFactor, SonarExtrinsic,
-                                 sonar_frame_to_points, sonar_frames_to_point_cloud,
-                                 back_project_bins,
-                                 sonar_polar_to_points,
-                                 get_scaled_world_to_view_transform,
-                                 view_points_to_world,
-                                 SONAR_CAMERA_FRAME_CONVENTION, SONAR_IMAGE_CONVENTION,
-                                 SONAR_MOUNT_TRANSLATION_CAM, SONAR_MOUNT_PITCH_DEG,
-                                 run_sonar_convention_asserts)
+                                  sonar_frame_to_points, sonar_frames_to_point_cloud,
+                                  back_project_bins,
+                                  SONAR_CAMERA_FRAME_CONVENTION, SONAR_IMAGE_CONVENTION,
+                                  SONAR_MOUNT_TRANSLATION_CAM, SONAR_MOUNT_PITCH_DEG,
+                                  run_sonar_convention_asserts)
 from utils.graphics_utils import BasicPointCloud
 from utils.loss_utils import l1_loss, ssim
 from utils.mesh_utils import GaussianExtractor
@@ -100,8 +98,6 @@ from utils.elevation_chunk5_helpers import (
     chunk5_renderer_contract_is_active,
     compute_arc_score_contribution,
     compute_confidence_mask,
-    compute_expected_elevation,
-    compute_finite_difference_normals,
     compute_normal_supervision_loss,
     make_high_error_key,
     mode_enables_densify_candidates,
@@ -1247,76 +1243,6 @@ def camera_world_position_tensor(camera, device):
     r_c2w = torch.as_tensor(camera.R, device=device, dtype=torch.float32)
     t_w2c = torch.as_tensor(camera.T, device=device, dtype=torch.float32)
     return -(r_c2w @ t_w2c)
-
-
-def _build_chunk5_neighbor_queries(rows, cols, image_height, image_width):
-    p = int(min(rows.shape[0], cols.shape[0]))
-    rows = rows[:p]
-    cols = cols[:p]
-    device = rows.device
-    anchor_valid = (
-        (rows > 0)
-        & (rows < int(image_height) - 1)
-        & (cols > 0)
-        & (cols < int(image_width) - 1)
-    )
-
-    query_keys = {}
-    query_rows = []
-    query_cols = []
-    neighbor_names = ("left", "right", "up", "down")
-    neighbor_offsets = {
-        "left": (0, -1),
-        "right": (0, 1),
-        "up": (-1, 0),
-        "down": (1, 0),
-    }
-    neighbor_lookup = {
-        name: torch.full((p,), -1, dtype=torch.long, device=device)
-        for name in neighbor_names
-    }
-
-    for i in range(p):
-        if not bool(anchor_valid[i].item()):
-            continue
-        base_row = int(rows[i].item())
-        base_col = int(cols[i].item())
-        for name in neighbor_names:
-            d_row, d_col = neighbor_offsets[name]
-            nbr_row = base_row + d_row
-            nbr_col = base_col + d_col
-            key = (nbr_row, nbr_col)
-            idx = query_keys.get(key)
-            if idx is None:
-                idx = len(query_rows)
-                query_keys[key] = idx
-                query_rows.append(nbr_row)
-                query_cols.append(nbr_col)
-            neighbor_lookup[name][i] = idx
-
-    if query_rows:
-        query_rows_t = torch.tensor(query_rows, dtype=torch.long, device=device)
-        query_cols_t = torch.tensor(query_cols, dtype=torch.long, device=device)
-    else:
-        query_rows_t = torch.empty((0,), dtype=torch.long, device=device)
-        query_cols_t = torch.empty((0,), dtype=torch.long, device=device)
-    return rows, cols, anchor_valid, neighbor_lookup, query_rows_t, query_cols_t
-
-
-def _chunk5_expected_world_points(frame_idx, rows, cols, expected_elevation, training_frames, sonar_config, sonar_scale_factor):
-    row_f = rows.to(dtype=torch.float32)
-    col_f = cols.to(dtype=torch.float32)
-    elev = expected_elevation.to(device=rows.device, dtype=torch.float32)
-    azimuth, range_vals = sonar_config.pixel_to_polar(col_f, row_f)
-    points_view = sonar_polar_to_points(azimuth, elev, range_vals)
-    w2v = get_scaled_world_to_view_transform(
-        training_frames[int(frame_idx)],
-        scale_factor=sonar_scale_factor,
-        sonar_extrinsic=None,
-    )
-    return view_points_to_world(points_view, w2v, scale_factor=sonar_scale_factor)
-
-
 def _compute_chunk5_local_expected_geometry(
     *,
     frame_idx,
@@ -1339,13 +1265,9 @@ def _compute_chunk5_local_expected_geometry(
     out = {
         "supported_mask": torch.zeros((0,), dtype=torch.bool, device=rows.device),
         "confident_mask": torch.zeros((0,), dtype=torch.bool, device=rows.device),
-        "anchor_interior_mask": torch.zeros((0,), dtype=torch.bool, device=rows.device),
-        "neighbor_ready_mask": torch.zeros((0,), dtype=torch.bool, device=rows.device),
+        "geometry_disabled_mask": torch.zeros((0,), dtype=torch.bool, device=rows.device),
         "finite_mask": torch.zeros((0,), dtype=torch.bool, device=rows.device),
         "center_entropy": torch.empty((0,), dtype=torch.float32, device=rows.device),
-        "query_supported_mask": torch.zeros((0,), dtype=torch.bool, device=rows.device),
-        "query_confident_mask": torch.zeros((0,), dtype=torch.bool, device=rows.device),
-        "query_entropy": torch.empty((0,), dtype=torch.float32, device=rows.device),
         "rows_selected": torch.empty((0,), dtype=torch.long, device=rows.device),
         "cols_selected": torch.empty((0,), dtype=torch.long, device=rows.device),
         "pts_center": torch.empty((0, 3), dtype=torch.float32, device=rows.device),
@@ -1371,133 +1293,12 @@ def _compute_chunk5_local_expected_geometry(
     )
     supported_mask = support_mask.any(dim=-1)
     out["center_entropy"] = center_entropy
-
-    rows_bank, cols_bank, anchor_interior, neighbor_lookup, query_rows, query_cols = _build_chunk5_neighbor_queries(
-        rows_bank,
-        cols_bank,
-        image_height=training_frames[int(frame_idx)].image_height,
-        image_width=training_frames[int(frame_idx)].image_width,
-    )
-    neighbor_ready = supported_mask & confident_mask & anchor_interior
     out["supported_mask"] = supported_mask
     out["confident_mask"] = confident_mask
-    out["anchor_interior_mask"] = anchor_interior
-    out["neighbor_ready_mask"] = neighbor_ready.clone()
-    if not bool(neighbor_ready.any().item()) or query_rows.numel() == 0:
-        return out
 
-    query_loglik, query_support = build_stage1_multiview_loglik_for_pixels(
-        frame_idx=frame_idx,
-        frame_key=frame_key,
-        rows=query_rows,
-        cols=query_cols,
-        training_frames=training_frames,
-        frame_key_to_index=frame_key_to_index,
-        overlap_table=overlap_table,
-        gt_frame_cache=gt_frame_cache,
-        frame_stats_cache=frame_stats_cache,
-        elev_angle_bins=elev_angle_bins,
-        sonar_config=sonar_config,
-        sonar_scale_factor=sonar_scale_factor,
-        cfg=stage1_cfg,
-    )
-    query_probs = masked_softmax(
-        query_loglik,
-        query_support,
-        dim=-1,
-        min_support=stage1_cfg.lik_min_support,
-    )
-    query_confident, query_entropy = compute_confidence_mask(
-        probs=query_probs,
-        support_mask=query_support,
-        confidence_thresh=confidence_thresh,
-    )
-    out["query_supported_mask"] = query_support.any(dim=-1)
-    out["query_confident_mask"] = query_confident
-    out["query_entropy"] = query_entropy
-
-    left_idx = neighbor_lookup["left"]
-    right_idx = neighbor_lookup["right"]
-    up_idx = neighbor_lookup["up"]
-    down_idx = neighbor_lookup["down"]
-    for idx_tensor in (left_idx, right_idx, up_idx, down_idx):
-        valid_idx = idx_tensor >= 0
-        ready_i = torch.zeros_like(neighbor_ready)
-        if bool(valid_idx.any().item()):
-            ready_i[valid_idx] = query_confident[idx_tensor[valid_idx]]
-        neighbor_ready &= valid_idx & ready_i
-
-    out["neighbor_ready_mask"] = neighbor_ready.clone()
-    if not bool(neighbor_ready.any().item()):
-        return out
-
-    center_expected = compute_expected_elevation(probs=probs[neighbor_ready], elev_bins=elev_angle_bins)
-    left_expected = compute_expected_elevation(probs=query_probs[left_idx[neighbor_ready]], elev_bins=elev_angle_bins)
-    right_expected = compute_expected_elevation(probs=query_probs[right_idx[neighbor_ready]], elev_bins=elev_angle_bins)
-    up_expected = compute_expected_elevation(probs=query_probs[up_idx[neighbor_ready]], elev_bins=elev_angle_bins)
-    down_expected = compute_expected_elevation(probs=query_probs[down_idx[neighbor_ready]], elev_bins=elev_angle_bins)
-
-    rows_sel = rows_bank[neighbor_ready]
-    cols_sel = cols_bank[neighbor_ready]
-    pts_center = _chunk5_expected_world_points(
-        frame_idx,
-        rows_sel,
-        cols_sel,
-        center_expected,
-        training_frames,
-        sonar_config,
-        sonar_scale_factor,
-    )
-    pts_left = _chunk5_expected_world_points(
-        frame_idx,
-        query_rows[left_idx[neighbor_ready]],
-        query_cols[left_idx[neighbor_ready]],
-        left_expected,
-        training_frames,
-        sonar_config,
-        sonar_scale_factor,
-    )
-    pts_right = _chunk5_expected_world_points(
-        frame_idx,
-        query_rows[right_idx[neighbor_ready]],
-        query_cols[right_idx[neighbor_ready]],
-        right_expected,
-        training_frames,
-        sonar_config,
-        sonar_scale_factor,
-    )
-    pts_up = _chunk5_expected_world_points(
-        frame_idx,
-        query_rows[up_idx[neighbor_ready]],
-        query_cols[up_idx[neighbor_ready]],
-        up_expected,
-        training_frames,
-        sonar_config,
-        sonar_scale_factor,
-    )
-    pts_down = _chunk5_expected_world_points(
-        frame_idx,
-        query_rows[down_idx[neighbor_ready]],
-        query_cols[down_idx[neighbor_ready]],
-        down_expected,
-        training_frames,
-        sonar_config,
-        sonar_scale_factor,
-    )
-    normals_expected = compute_finite_difference_normals(
-        pts_left=pts_left,
-        pts_right=pts_right,
-        pts_up=pts_up,
-        pts_down=pts_down,
-        eps=1e-8,
-    )
-    finite_mask = torch.isfinite(normals_expected).all(dim=-1)
-
-    out["finite_mask"] = finite_mask
-    out["rows_selected"] = rows_sel[finite_mask]
-    out["cols_selected"] = cols_sel[finite_mask]
-    out["pts_center"] = pts_center[finite_mask]
-    out["normals_expected"] = normals_expected[finite_mask]
+    # Phase A diagnostic stop: sonar-pixel neighbor readiness is not physically
+    # meaningful once elevation is collapsed into the 2D sonar image.
+    out["geometry_disabled_mask"] = supported_mask & confident_mask
     return out
 
 
@@ -1526,35 +1327,41 @@ def compute_chunk5_normal_for_frame(
 ):
     out = {
         "loss": zero,
+        "loss_depth": zero,
         "loss_value": 0.0,
+        "loss_depth_value": 0.0,
         "weight": 0.0,
+        "depth_weight": 0.0,
         "expected_coverage": 0.0,
         "confidence_coverage": 0.0,
         "anchor_count": 0,
         "center_supported_count": 0,
         "center_confident_count": 0,
-        "interior_anchor_count": 0,
-        "all_neighbors_confident_count": 0,
-        "neighbor_query_count": 0,
-        "neighbor_supported_count": 0,
-        "neighbor_confident_count": 0,
         "finite_count": 0,
         "match_count": 0,
         "applied_count": 0,
         "applied_loss_value": 0.0,
         "skip_unsupported_count": 0,
         "skip_center_confidence_count": 0,
-        "skip_border_count": 0,
-        "skip_neighbor_confidence_count": 0,
+        "skip_geometry_disabled_count": 0,
         "skip_nonfinite_count": 0,
         "skip_unmatched_count": 0,
         "skipped_count": 0,
         "center_entropy_values": zero.new_empty((0,), dtype=torch.float32),
-        "neighbor_entropy_values": zero.new_empty((0,), dtype=torch.float32),
+        "rend_normal_valid_count": 0,
+        "rend_normal_valid_frac": 0.0,
+        "surf_depth_valid_count": 0,
+        "surf_depth_valid_frac": 0.0,
+        "surf_normal_valid_count": 0,
+        "surf_normal_valid_frac": 0.0,
+        "rend_alpha_mean": 0.0,
+        "surf_depth_mean": 0.0,
+        "rend_dist_mean": 0.0,
+        "normal_mode": str(cfg.effective_normal_mode),
+        "opacity_fixed": float(not bool(getattr(gaussians._opacity, "requires_grad", False))),
+        "opacity_grad_enabled": float(bool(getattr(gaussians._opacity, "requires_grad", False))),
     }
 
-    if p_post_frame is None or support_mask_frame is None:
-        return out
     if str(cfg.effective_normal_mode) == "off":
         return out
 
@@ -1567,140 +1374,95 @@ def compute_chunk5_normal_for_frame(
             weight_late=cfg.normal_weight_late,
         )
     )
+    out["depth_weight"] = out["weight"] * float(cfg.depth_weight_scale)
     if int(global_iter) < int(cfg.normal_elev_start_iter):
         return out
 
-    bank_entry = pixel_bank.get(str(frame_key)) if isinstance(pixel_bank, dict) else None
-    if not isinstance(bank_entry, dict):
+    if not isinstance(render_pkg, dict):
         return out
 
-    probs = p_post_frame.detach().to(dtype=torch.float32)
-    support_mask = support_mask_frame.detach().to(dtype=torch.bool)
-    if probs.ndim != 2 or support_mask.ndim != 2:
+    rend_alpha = render_pkg["rend_alpha"].detach()
+    rend_normal = render_pkg["rend_normal"]
+    surf_depth = render_pkg["surf_depth"]
+    surf_normal = render_pkg["surf_normal"]
+    rend_dist = render_pkg["rend_dist"]
+
+    if any(t is None for t in (rend_alpha, rend_normal, surf_depth, surf_normal, rend_dist)):
         return out
-    rows_bank = bank_entry["rows"]
-    cols_bank = bank_entry["cols"]
-    rows_total = int(min(probs.shape[0], support_mask.shape[0], rows_bank.shape[0], cols_bank.shape[0]))
-    if rows_total <= 0:
+    if rend_alpha.ndim != 3 or surf_depth.ndim != 3 or rend_dist.ndim != 3:
         return out
-    out["anchor_count"] = rows_total
-    geometry = _compute_chunk5_local_expected_geometry(
-        frame_idx=frame_idx,
-        frame_key=frame_key,
-        rows=rows_bank[:rows_total],
-        cols=cols_bank[:rows_total],
-        center_probs=probs[:rows_total],
-        center_support_mask=support_mask[:rows_total],
-        training_frames=training_frames,
-        frame_key_to_index=frame_key_to_index,
-        overlap_table=overlap_table,
-        gt_frame_cache=gt_frame_cache,
-        frame_stats_cache=frame_stats_cache,
-        elev_angle_bins=elev_angle_bins,
-        sonar_config=sonar_config,
-        sonar_scale_factor=sonar_scale_factor,
-        stage1_cfg=stage1_cfg,
-        confidence_thresh=cfg.normal_confidence_thresh,
+    if rend_normal.ndim != 3 or surf_normal.ndim != 3:
+        return out
+
+    pixel_count = int(surf_depth.shape[-2] * surf_depth.shape[-1])
+    if pixel_count <= 0:
+        return out
+
+    out["anchor_count"] = pixel_count
+    surf_depth_valid = torch.isfinite(surf_depth) & (surf_depth > 0)
+    rend_alpha_valid = torch.isfinite(rend_alpha) & (rend_alpha > 0)
+    rend_normal_valid = (
+        torch.isfinite(rend_normal).all(dim=0, keepdim=True)
+        & (torch.linalg.norm(rend_normal, dim=0, keepdim=True) > 1e-8)
+        & rend_alpha_valid
     )
-    supported_mask = geometry["supported_mask"]
-    confident_mask = geometry["confident_mask"]
-    anchor_interior_mask = geometry["anchor_interior_mask"]
-    out["expected_coverage"] = float(supported_mask.float().mean().item()) if supported_mask.numel() > 0 else 0.0
-    out["center_supported_count"] = int(supported_mask.sum().item())
-    out["center_confident_count"] = int(confident_mask.sum().item())
-    interior_anchor_mask = supported_mask & confident_mask & anchor_interior_mask
-    out["interior_anchor_count"] = int(interior_anchor_mask.sum().item())
+    surf_normal_valid = (
+        torch.isfinite(surf_normal).all(dim=0, keepdim=True)
+        & (torch.linalg.norm(surf_normal, dim=0, keepdim=True) > 1e-8)
+        & surf_depth_valid
+    )
+    compare_valid = (rend_normal_valid & surf_normal_valid).squeeze(0)
+
+    out["center_supported_count"] = int(surf_depth_valid.sum().item())
+    out["center_confident_count"] = int(surf_normal_valid.sum().item())
     out["skip_unsupported_count"] = max(0, out["anchor_count"] - out["center_supported_count"])
     out["skip_center_confidence_count"] = max(0, out["center_supported_count"] - out["center_confident_count"])
-    out["skip_border_count"] = max(0, out["center_confident_count"] - out["interior_anchor_count"])
-    center_entropy = geometry["center_entropy"]
-    if center_entropy.numel() > 0 and supported_mask.numel() == center_entropy.numel():
-        out["center_entropy_values"] = center_entropy[supported_mask].detach()
+    out["rend_normal_valid_count"] = int(rend_normal_valid.sum().item())
+    out["surf_depth_valid_count"] = int(surf_depth_valid.sum().item())
+    out["surf_normal_valid_count"] = int(surf_normal_valid.sum().item())
+    out["rend_normal_valid_frac"] = float(out["rend_normal_valid_count"] / max(1, pixel_count))
+    out["surf_depth_valid_frac"] = float(out["surf_depth_valid_count"] / max(1, pixel_count))
+    out["surf_normal_valid_frac"] = float(out["surf_normal_valid_count"] / max(1, pixel_count))
+    out["expected_coverage"] = out["surf_normal_valid_frac"]
+    out["confidence_coverage"] = float(compare_valid.float().mean().item()) if compare_valid.numel() > 0 else 0.0
+    out["finite_count"] = int(compare_valid.sum().item())
+    out["match_count"] = out["finite_count"]
+    out["skip_unmatched_count"] = max(0, out["anchor_count"] - out["match_count"])
+    out["skipped_count"] = out["skip_unmatched_count"]
 
-    query_supported_mask = geometry["query_supported_mask"]
-    query_confident_mask = geometry["query_confident_mask"]
-    out["neighbor_query_count"] = int(query_supported_mask.shape[0])
-    out["neighbor_supported_count"] = int(query_supported_mask.sum().item())
-    out["neighbor_confident_count"] = int(query_confident_mask.sum().item())
-    query_entropy = geometry["query_entropy"]
-    if query_entropy.numel() > 0 and query_supported_mask.numel() == query_entropy.numel():
-        out["neighbor_entropy_values"] = query_entropy[query_supported_mask].detach()
+    finite_alpha = rend_alpha[torch.isfinite(rend_alpha)]
+    finite_depth = surf_depth[surf_depth_valid]
+    finite_dist = rend_dist[torch.isfinite(rend_dist)]
+    out["rend_alpha_mean"] = float(finite_alpha.mean().item()) if finite_alpha.numel() > 0 else 0.0
+    out["surf_depth_mean"] = float(finite_depth.mean().item()) if finite_depth.numel() > 0 else 0.0
+    out["rend_dist_mean"] = float(finite_dist.mean().item()) if finite_dist.numel() > 0 else 0.0
 
-    neighbor_ready = geometry["neighbor_ready_mask"]
-    out["confidence_coverage"] = float(neighbor_ready.float().mean().item()) if neighbor_ready.numel() > 0 else 0.0
-    out["all_neighbors_confident_count"] = int(neighbor_ready.sum().item())
-    out["skip_neighbor_confidence_count"] = max(0, out["interior_anchor_count"] - out["all_neighbors_confident_count"])
-    finite_normals = geometry["finite_mask"]
-    out["finite_count"] = int(finite_normals.sum().item())
-    out["skip_nonfinite_count"] = max(0, out["all_neighbors_confident_count"] - out["finite_count"])
-    out["skipped_count"] = out["skip_nonfinite_count"]
-    if geometry["pts_center"].numel() == 0 or geometry["normals_expected"].numel() == 0:
-        out["skip_unmatched_count"] = out["finite_count"]
+    if not bool(compare_valid.any().item()):
+        out["loss_depth"] = finite_dist.mean() if finite_dist.numel() > 0 else zero
+        out["loss_depth_value"] = float(out["loss_depth"].item()) if torch.is_tensor(out["loss_depth"]) else 0.0
+        if str(cfg.effective_normal_mode) == "active" and out["depth_weight"] > 0.0:
+            out["applied_count"] = out["surf_depth_valid_count"]
+            out["applied_depth_loss_value"] = float(out["depth_weight"] * out["loss_depth_value"])
         return out
 
-    pts_center = geometry["pts_center"]
-    normals_expected = geometry["normals_expected"]
-    exp_proj = sonar_project_points(
-        pts_center,
-        training_frames[int(frame_idx)],
-        sonar_config,
-        scale_factor=sonar_scale_factor,
-    )
-
-    visible_mask = render_pkg["visibility_filter"].to(dtype=torch.bool)
-    candidate_rows = torch.where(visible_mask)[0]
-    max_candidates = int(chunk4_cfg.couple_max_candidates)
-    if max_candidates > 0 and candidate_rows.numel() > max_candidates:
-        pick = torch.linspace(
-            0,
-            candidate_rows.numel() - 1,
-            steps=max_candidates,
-            device=candidate_rows.device,
-        ).round().to(dtype=torch.long)
-        candidate_rows = candidate_rows[pick]
-    if candidate_rows.numel() == 0:
-        out["skip_unmatched_count"] = out["finite_count"]
-        return out
-
-    surfel_xyz = gaussians.get_xyz[candidate_rows]
-    surf_proj = sonar_project_points(
-        surfel_xyz,
-        training_frames[int(frame_idx)],
-        sonar_config,
-        scale_factor=sonar_scale_factor,
-    )
-    surf_idx, assoc_w, match_valid = associate_expected_points_to_surfels(
-        exp_row=exp_proj.row,
-        exp_col=exp_proj.col,
-        exp_depth=exp_proj.range_vals,
-        exp_valid=exp_proj.valid,
-        surf_row=surf_proj.row,
-        surf_col=surf_proj.col,
-        surf_depth=surf_proj.range_vals,
-        surf_valid=surf_proj.valid,
-        max_pix_err=chunk4_cfg.couple_max_pix_err,
-        max_depth_err=chunk4_cfg.couple_max_depth_err,
-        sigma_pix=chunk4_cfg.couple_sigma_pix,
-        sigma_depth=chunk4_cfg.couple_sigma_depth,
-        min_w=chunk4_cfg.couple_min_w,
-    )
-    if not bool(match_valid.any().item()):
-        out["skip_unmatched_count"] = out["finite_count"]
-        return out
-
-    surfel_normals = quaternion_to_normal(gaussians.get_rotation[candidate_rows])
-    out["match_count"] = int(match_valid.sum().item())
-    out["skip_unmatched_count"] = max(0, out["finite_count"] - out["match_count"])
+    surf_normal_target = surf_normal * render_pkg["rend_alpha"].detach()
+    rend_normal_comp = torch.nn.functional.normalize(rend_normal[:, compare_valid].transpose(0, 1), dim=-1)
+    surf_normal_comp = torch.nn.functional.normalize(surf_normal_target[:, compare_valid].transpose(0, 1), dim=-1)
     loss_normal = compute_normal_supervision_loss(
-        n_quat=surfel_normals[surf_idx[match_valid]],
-        n_expected=normals_expected[match_valid],
+        n_quat=rend_normal_comp,
+        n_expected=surf_normal_comp,
     )
+    loss_depth = finite_dist.mean() if finite_dist.numel() > 0 else zero
     if bool(torch.isfinite(loss_normal).item()):
         out["loss"] = loss_normal
         out["loss_value"] = float(loss_normal.item())
-        if str(cfg.effective_normal_mode) == "active" and out["weight"] > 0.0:
-            out["applied_count"] = out["match_count"]
-            out["applied_loss_value"] = float(out["weight"] * out["loss_value"])
+    if bool(torch.isfinite(loss_depth).item()):
+        out["loss_depth"] = loss_depth
+        out["loss_depth_value"] = float(loss_depth.item())
+    if str(cfg.effective_normal_mode) == "active" and (out["weight"] > 0.0 or out["depth_weight"] > 0.0):
+        out["applied_count"] = out["match_count"]
+        out["applied_loss_value"] = float(out["weight"] * out["loss_value"])
+        out["applied_depth_loss_value"] = float(out["depth_weight"] * out["loss_depth_value"])
     return out
 
 
@@ -1754,16 +1516,18 @@ def summarize_chunk5_batch_diagnostics(batch_stats):
             return torch.empty((0,), dtype=torch.float32)
         return torch.cat(tensors, dim=0)
 
+    def first_value(key, default):
+        if not batch_stats:
+            return default
+        return batch_stats[0].get(key, default)
+
     anchor_count = sum_int("anchor_count")
     center_supported_count = sum_int("center_supported_count")
     center_confident_count = sum_int("center_confident_count")
-    interior_anchor_count = sum_int("interior_anchor_count")
-    all_neighbors_confident_count = sum_int("all_neighbors_confident_count")
     finite_count = sum_int("finite_count")
     match_count = sum_int("match_count")
 
     center_entropy_summary = summarize_chunk5_entropy(cat_entropy("center_entropy_values"))
-    neighbor_entropy_summary = summarize_chunk5_entropy(cat_entropy("neighbor_entropy_values"))
 
     denom = max(1, anchor_count)
     return {
@@ -1772,10 +1536,6 @@ def summarize_chunk5_batch_diagnostics(batch_stats):
         "center_supported_frac": float(center_supported_count / denom),
         "center_confident_count": center_confident_count,
         "center_confident_frac": float(center_confident_count / denom),
-        "interior_anchor_count": interior_anchor_count,
-        "interior_anchor_frac": float(interior_anchor_count / denom),
-        "all_neighbors_confident_count": all_neighbors_confident_count,
-        "all_neighbors_confident_frac": float(all_neighbors_confident_count / denom),
         "finite_count": finite_count,
         "finite_frac": float(finite_count / denom),
         "match_count": match_count,
@@ -1783,17 +1543,25 @@ def summarize_chunk5_batch_diagnostics(batch_stats):
         "applied_count": sum_int("applied_count"),
         "skip_unsupported_count": sum_int("skip_unsupported_count"),
         "skip_center_confidence_count": sum_int("skip_center_confidence_count"),
-        "skip_border_count": sum_int("skip_border_count"),
-        "skip_neighbor_confidence_count": sum_int("skip_neighbor_confidence_count"),
+        "skip_geometry_disabled_count": sum_int("skip_geometry_disabled_count"),
         "skip_nonfinite_count": sum_int("skip_nonfinite_count"),
         "skip_unmatched_count": sum_int("skip_unmatched_count"),
-        "neighbor_query_count": sum_int("neighbor_query_count"),
-        "neighbor_supported_count": sum_int("neighbor_supported_count"),
-        "neighbor_confident_count": sum_int("neighbor_confident_count"),
         "loss_mean": mean_float("loss_value"),
         "applied_loss_mean": mean_float("applied_loss_value"),
+        "w_normal_mean": mean_float("weight"),
+        "rend_normal_valid_count": sum_int("rend_normal_valid_count"),
+        "rend_normal_valid_frac": mean_float("rend_normal_valid_frac"),
+        "surf_depth_valid_count": sum_int("surf_depth_valid_count"),
+        "surf_depth_valid_frac": mean_float("surf_depth_valid_frac"),
+        "surf_normal_valid_count": sum_int("surf_normal_valid_count"),
+        "surf_normal_valid_frac": mean_float("surf_normal_valid_frac"),
+        "rend_alpha_mean": mean_float("rend_alpha_mean"),
+        "surf_depth_mean": mean_float("surf_depth_mean"),
+        "rend_dist_mean": mean_float("rend_dist_mean"),
+        "normal_mode": first_value("normal_mode", "off"),
+        "opacity_fixed": first_value("opacity_fixed", 0.0),
+        "opacity_grad_enabled": first_value("opacity_grad_enabled", 0.0),
         "center_entropy_summary": center_entropy_summary,
-        "neighbor_entropy_summary": neighbor_entropy_summary,
     }
 
 
@@ -2888,7 +2656,9 @@ def init_loss_log(output_dir):
     global LOSS_LOG_HANDLE, LOSS_LOG_PATH
     LOSS_LOG_PATH = os.path.join(output_dir, "loss_log.csv")
     LOSS_LOG_HANDLE = open(LOSS_LOG_PATH, "w")
-    LOSS_LOG_HANDLE.write("iter,stage,L1,SSIM,base_loss,bright_loss,total_loss,scale,num_points\n")
+    LOSS_LOG_HANDLE.write(
+        "iter,stage,L1,SSIM,base_loss,bright_loss,photometric_loss,normal_term,depth_term,total_loss,scale,num_points\n"
+    )
     LOSS_LOG_HANDLE.flush()
 
 
@@ -2898,25 +2668,36 @@ def init_chunk5_diag_log(output_dir):
     CHUNK5_DIAG_LOG_HANDLE = open(CHUNK5_DIAG_LOG_PATH, "w")
     CHUNK5_DIAG_LOG_HANDLE.write(
         "iter,stage,anchors,center_supported_count,center_supported_frac,center_confident_count,center_confident_frac,"
-        "interior_anchor_count,interior_anchor_frac,all_neighbors_confident_count,all_neighbors_confident_frac,"
         "finite_count,finite_frac,match_count,match_frac,applied_count,skip_unsupported_count,"
-        "skip_center_confidence_count,skip_border_count,skip_neighbor_confidence_count,skip_nonfinite_count,"
-        "skip_unmatched_count,neighbor_query_count,neighbor_supported_count,neighbor_confident_count,loss_mean,"
-        "applied_loss_mean,center_entropy_count,center_entropy_mean,center_entropy_median,center_entropy_p95,"
-        "center_entropy_max,neighbor_entropy_count,neighbor_entropy_mean,neighbor_entropy_median,neighbor_entropy_p95,"
-        "neighbor_entropy_max\n"
+        "skip_center_confidence_count,skip_geometry_disabled_count,skip_nonfinite_count,skip_unmatched_count,"
+        "loss_mean,applied_loss_mean,center_entropy_count,center_entropy_mean,center_entropy_median,center_entropy_p95,"
+        "center_entropy_max,normal_mode,w_normal_mean,rend_normal_valid_frac,surf_normal_valid_frac,"
+        "surf_depth_valid_frac,rend_alpha_mean,surf_depth_mean,rend_dist_mean,opacity_fixed,opacity_grad_enabled\n"
     )
     CHUNK5_DIAG_LOG_HANDLE.flush()
 
 
-def log_loss(iteration, stage_name, l1_value, ssim_value, base_loss, bright_loss, total_loss,
-             scale_value, num_points):
+def log_loss(
+    iteration,
+    stage_name,
+    l1_value,
+    ssim_value,
+    base_loss,
+    bright_loss,
+    photometric_loss,
+    normal_term,
+    depth_term,
+    total_loss,
+    scale_value,
+    num_points,
+):
     if LOSS_LOG_HANDLE is None:
         return
 
     LOSS_LOG_HANDLE.write(
         f"{iteration},{stage_name},{l1_value:.6f},{ssim_value:.6f},{base_loss:.6f},"
-        f"{bright_loss:.6f},{total_loss:.6f},{scale_value:.6f},{num_points}\n"
+        f"{bright_loss:.6f},{photometric_loss:.6f},{normal_term:.6f},{depth_term:.6f},"
+        f"{total_loss:.6f},{scale_value:.6f},{num_points}\n"
     )
 
     if LOSS_LOG_FLUSH_INTERVAL > 0 and iteration % LOSS_LOG_FLUSH_INTERVAL == 0:
@@ -2928,26 +2709,24 @@ def log_chunk5_diag(iteration, stage_name, diag):
         return
 
     center_entropy = diag.get("center_entropy_summary", {})
-    neighbor_entropy = diag.get("neighbor_entropy_summary", {})
     CHUNK5_DIAG_LOG_HANDLE.write(
         f"{iteration},{stage_name},{int(diag.get('anchor_count', 0))},"
         f"{int(diag.get('center_supported_count', 0))},{float(diag.get('center_supported_frac', 0.0)):.6f},"
         f"{int(diag.get('center_confident_count', 0))},{float(diag.get('center_confident_frac', 0.0)):.6f},"
-        f"{int(diag.get('interior_anchor_count', 0))},{float(diag.get('interior_anchor_frac', 0.0)):.6f},"
-        f"{int(diag.get('all_neighbors_confident_count', 0))},{float(diag.get('all_neighbors_confident_frac', 0.0)):.6f},"
         f"{int(diag.get('finite_count', 0))},{float(diag.get('finite_frac', 0.0)):.6f},"
         f"{int(diag.get('match_count', 0))},{float(diag.get('match_frac', 0.0)):.6f},"
         f"{int(diag.get('applied_count', 0))},{int(diag.get('skip_unsupported_count', 0))},"
-        f"{int(diag.get('skip_center_confidence_count', 0))},{int(diag.get('skip_border_count', 0))},"
-        f"{int(diag.get('skip_neighbor_confidence_count', 0))},{int(diag.get('skip_nonfinite_count', 0))},"
-        f"{int(diag.get('skip_unmatched_count', 0))},{int(diag.get('neighbor_query_count', 0))},"
-        f"{int(diag.get('neighbor_supported_count', 0))},{int(diag.get('neighbor_confident_count', 0))},"
+        f"{int(diag.get('skip_center_confidence_count', 0))},{int(diag.get('skip_geometry_disabled_count', 0))},"
+        f"{int(diag.get('skip_nonfinite_count', 0))},{int(diag.get('skip_unmatched_count', 0))},"
         f"{float(diag.get('loss_mean', 0.0)):.6f},{float(diag.get('applied_loss_mean', 0.0)):.6f},"
         f"{int(center_entropy.get('count', 0))},{float(center_entropy.get('mean', 0.0)):.6f},"
         f"{float(center_entropy.get('median', 0.0)):.6f},{float(center_entropy.get('p95', 0.0)):.6f},"
-        f"{float(center_entropy.get('max', 0.0)):.6f},{int(neighbor_entropy.get('count', 0))},"
-        f"{float(neighbor_entropy.get('mean', 0.0)):.6f},{float(neighbor_entropy.get('median', 0.0)):.6f},"
-        f"{float(neighbor_entropy.get('p95', 0.0)):.6f},{float(neighbor_entropy.get('max', 0.0)):.6f}\n"
+        f"{float(center_entropy.get('max', 0.0)):.6f},{diag.get('normal_mode', 'off')},"
+        f"{float(diag.get('w_normal_mean', 0.0)):.6f},{float(diag.get('rend_normal_valid_frac', 0.0)):.6f},"
+        f"{float(diag.get('surf_normal_valid_frac', 0.0)):.6f},{float(diag.get('surf_depth_valid_frac', 0.0)):.6f},"
+        f"{float(diag.get('rend_alpha_mean', 0.0)):.6f},{float(diag.get('surf_depth_mean', 0.0)):.6f},"
+        f"{float(diag.get('rend_dist_mean', 0.0)):.6f},{float(diag.get('opacity_fixed', 0.0)):.0f},"
+        f"{float(diag.get('opacity_grad_enabled', 0.0)):.0f}\n"
     )
 
     if LOSS_LOG_FLUSH_INTERVAL > 0 and iteration % LOSS_LOG_FLUSH_INTERVAL == 0:
@@ -3053,6 +2832,10 @@ def save_poisson_mesh(points, normals, output_dir, filename, opacities=None, sca
         if scales is not None:
             scales = scales[keep_mask]
         print(f"  Poisson filter: opacity >= {opacity_cutoff:.4f} (kept {keep_mask.sum()}/{len(keep_mask)})")
+
+    if points.size == 0:
+        print("  Skipping Poisson mesh (opacity filter removed all points)")
+        return
 
     if scales is not None:
         if scales.ndim == 2:
@@ -3261,11 +3044,211 @@ def build_visualizer_metadata_refs(output_dir, visualizer_dir, dataset_path):
         "dataset_manifest": os.path.join(dataset_path, "manifest.json"),
         "dataset_settings": os.path.join(dataset_path, "DATASET_SETTINGS.md"),
         "dataset_consistency_gate": os.path.join(dataset_path, "consistency_gate.json"),
+        "synthetic_surface_diagnostics": os.path.join(output_dir, "synthetic_surface_diagnostics.json"),
     }
     for key, candidate in candidate_paths.items():
         if os.path.exists(candidate):
             refs[key] = relative_visualizer_path(candidate, visualizer_dir)
     return refs
+
+
+def write_json_artifact(path, payload):
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+
+
+def load_synthetic_dataset_geometry(dataset_path):
+    manifest_path = os.path.join(dataset_path, "manifest.json")
+    if not os.path.exists(manifest_path):
+        return None
+
+    try:
+        with open(manifest_path, "r", encoding="utf-8") as handle:
+            manifest = json.load(handle)
+    except Exception as exc:
+        print(f"[Synthetic Diagnostics] Failed to read manifest: {manifest_path} ({exc})")
+        return None
+
+    geometry = manifest.get("geometry")
+    if not isinstance(geometry, dict):
+        return None
+    if geometry.get("shape") not in {"sphere", "cube"}:
+        return None
+    return geometry
+
+
+def summarize_numeric_array(values):
+    vals = np.asarray(values, dtype=np.float64).reshape(-1)
+    vals = vals[np.isfinite(vals)]
+    if vals.size == 0:
+        return {
+            "count": 0,
+            "min": 0.0,
+            "max": 0.0,
+            "mean": 0.0,
+            "median": 0.0,
+            "p95": 0.0,
+        }
+    return {
+        "count": int(vals.size),
+        "min": float(vals.min()),
+        "max": float(vals.max()),
+        "mean": float(vals.mean()),
+        "median": float(np.median(vals)),
+        "p95": float(np.percentile(vals, 95.0)),
+    }
+
+
+def compute_sphere_surface_residual_and_normal(points_world, center, radius, eps=1e-8):
+    pts = np.asarray(points_world, dtype=np.float64).reshape(-1, 3)
+    center_np = np.asarray(center, dtype=np.float64).reshape(1, 3)
+    radius_val = float(radius)
+    centered = pts - center_np
+    norms = np.linalg.norm(centered, axis=1)
+    residual = np.abs(norms - radius_val)
+    safe_norms = np.maximum(norms, float(eps))
+    normals = centered / safe_norms[:, None]
+    valid = norms > float(eps)
+    return residual, normals, valid
+
+
+def compute_cube_signed_distance(points_world, cube_center, cube_half_extent):
+    pts = np.asarray(points_world, dtype=np.float64).reshape(-1, 3)
+    center_np = np.asarray(cube_center, dtype=np.float64).reshape(1, 3)
+    q = np.abs(pts - center_np) - float(cube_half_extent)
+    outside = np.linalg.norm(np.maximum(q, 0.0), axis=1)
+    inside = np.minimum(np.max(q, axis=1), 0.0)
+    return outside + inside
+
+
+def compute_cube_surface_residual_and_normal(points_world, center, half_extent, eps=1e-8):
+    pts = np.asarray(points_world, dtype=np.float64).reshape(-1, 3)
+    center_np = np.asarray(center, dtype=np.float64).reshape(1, 3)
+    local = pts - center_np
+    abs_local = np.abs(local)
+    face_gap = np.abs(abs_local - float(half_extent))
+    axis_idx = np.argmin(face_gap, axis=1)
+    normals = np.zeros_like(local)
+    signs = np.sign(local[np.arange(local.shape[0]), axis_idx])
+    signs[np.abs(signs) < float(eps)] = 1.0
+    normals[np.arange(local.shape[0]), axis_idx] = signs
+    residual = np.abs(compute_cube_signed_distance(pts, center_np.reshape(3), float(half_extent)))
+    valid = np.isfinite(residual)
+    return residual, normals, valid
+
+
+def compute_synthetic_surface_diagnostics_from_arrays(
+    points_world,
+    normals_world,
+    opacity,
+    geometry,
+    *,
+    near_surface_thresh_m,
+    high_opacity_thresh,
+    orientation_good_cos,
+):
+    pts = np.asarray(points_world, dtype=np.float64).reshape(-1, 3)
+    surfel_normals = np.asarray(normals_world, dtype=np.float64).reshape(-1, 3)
+    opacity_np = np.asarray(opacity, dtype=np.float64).reshape(-1)
+    if pts.shape[0] != surfel_normals.shape[0] or pts.shape[0] != opacity_np.shape[0]:
+        raise ValueError("points, normals, and opacity must have matching first dimensions")
+
+    shape = str(geometry.get("shape", "")).strip().lower()
+    if shape == "sphere":
+        residual, gt_normals, surface_valid = compute_sphere_surface_residual_and_normal(
+            pts,
+            geometry["sphere_center_m"],
+            geometry["sphere_radius_m"],
+        )
+    elif shape == "cube":
+        residual, gt_normals, surface_valid = compute_cube_surface_residual_and_normal(
+            pts,
+            geometry["cube_center_m"],
+            geometry["cube_half_extent_m"],
+        )
+    else:
+        raise ValueError(f"Unsupported synthetic shape: {shape}")
+
+    surfel_norm = np.linalg.norm(surfel_normals, axis=1)
+    surfel_valid = np.isfinite(surfel_norm) & (surfel_norm > 1e-8)
+    surfel_normals_unit = np.zeros_like(surfel_normals)
+    surfel_normals_unit[surfel_valid] = surfel_normals[surfel_valid] / surfel_norm[surfel_valid, None]
+    valid = surface_valid & surfel_valid & np.isfinite(opacity_np) & np.isfinite(residual)
+
+    orientation_abs_cos = np.zeros((pts.shape[0],), dtype=np.float64)
+    if np.any(valid):
+        orientation_abs_cos[valid] = np.abs(np.sum(surfel_normals_unit[valid] * gt_normals[valid], axis=1))
+
+    near_surface_mask = valid & (residual <= float(near_surface_thresh_m))
+    high_opacity_mask = opacity_np >= float(high_opacity_thresh)
+    good_orientation_mask = orientation_abs_cos >= float(orientation_good_cos)
+
+    near_surface_count = int(near_surface_mask.sum())
+    valid_count = int(valid.sum())
+
+    out = {
+        "shape": shape,
+        "surfel_count": int(pts.shape[0]),
+        "valid_surfel_count": valid_count,
+        "near_surface_threshold_m": float(near_surface_thresh_m),
+        "high_opacity_threshold": float(high_opacity_thresh),
+        "orientation_good_cos_threshold": float(orientation_good_cos),
+        "surface_residual_m": summarize_numeric_array(residual[valid]),
+        "opacity": summarize_numeric_array(opacity_np[np.isfinite(opacity_np)]),
+        "orientation_abs_cos": summarize_numeric_array(orientation_abs_cos[valid]),
+        "near_surface": {
+            "count": near_surface_count,
+            "frac_of_valid": float(near_surface_count / max(1, valid_count)),
+            "surface_residual_m": summarize_numeric_array(residual[near_surface_mask]),
+            "opacity": summarize_numeric_array(opacity_np[near_surface_mask]),
+            "orientation_abs_cos": summarize_numeric_array(orientation_abs_cos[near_surface_mask]),
+            "high_opacity_frac": float(high_opacity_mask[near_surface_mask].mean()) if near_surface_count > 0 else 0.0,
+            "good_orientation_frac": float(good_orientation_mask[near_surface_mask].mean()) if near_surface_count > 0 else 0.0,
+            "high_opacity_majority": bool(high_opacity_mask[near_surface_mask].mean() >= 0.5) if near_surface_count > 0 else False,
+        },
+    }
+    return out
+
+
+def compute_synthetic_surface_diagnostics(
+    gaussians,
+    geometry,
+    *,
+    near_surface_thresh_m,
+    high_opacity_thresh,
+    orientation_good_cos,
+):
+    xyz = gaussians.get_xyz.detach().cpu().numpy()
+    normals = quaternion_to_normal(gaussians.get_rotation.detach()).cpu().numpy()
+    opacity = gaussians.get_opacity.detach().cpu().numpy().reshape(-1)
+    return compute_synthetic_surface_diagnostics_from_arrays(
+        xyz,
+        normals,
+        opacity,
+        geometry,
+        near_surface_thresh_m=near_surface_thresh_m,
+        high_opacity_thresh=high_opacity_thresh,
+        orientation_good_cos=orientation_good_cos,
+    )
+
+
+def print_synthetic_surface_diagnostics(diag, label):
+    if not isinstance(diag, dict):
+        return
+    near = diag.get("near_surface", {})
+    near_opacity = near.get("opacity", {})
+    near_align = near.get("orientation_abs_cos", {})
+    print(
+        f"[Synthetic Diagnostics] {label}: "
+        f"shape={diag.get('shape', 'unknown')}, valid={int(diag.get('valid_surfel_count', 0))}, "
+        f"opacity_mode={diag.get('opacity_policy', 'unknown')}, "
+        f"near_surface={int(near.get('count', 0))}, "
+        f"near_opacity_mean={float(near_opacity.get('mean', 0.0)):.4f}, "
+        f"near_high_opacity_frac={float(near.get('high_opacity_frac', 0.0)):.4f}, "
+        f"near_align_mean={float(near_align.get('mean', 0.0)):.4f}, "
+        f"near_good_align_frac={float(near.get('good_orientation_frac', 0.0)):.4f}"
+    )
 
 
 def get_gaussian_visualization_state(gaussians):
@@ -3388,6 +3371,7 @@ def export_stage_visualizer_state(
     stage_status,
     glyph_prefix=None,
     include_centers_full=False,
+    synthetic_surface_diagnostics=None,
 ):
     state_path = os.path.join(visualizer_dir, stage_filename)
     gaussians.save_ply(state_path)
@@ -3395,6 +3379,8 @@ def export_stage_visualizer_state(
         "status": stage_status,
         "state_ply": relative_visualizer_path(state_path, visualizer_dir),
     }
+    if synthetic_surface_diagnostics is not None:
+        artifact["synthetic_surface_diagnostics"] = synthetic_surface_diagnostics
     if glyph_prefix is not None:
         artifact["glyphs"] = export_sampled_glyph_artifacts(
             gaussians,
@@ -3776,15 +3762,29 @@ metric_step = 0
 metric_iters = []
 metric_scale = []
 metric_loss = []
+metric_photometric = []
+metric_normal_term = []
+metric_depth_term = []
 metric_stage = []
 
 
-def record_metrics(loss_value, scale_value, stage_name):
+def record_metrics(
+    loss_value,
+    scale_value,
+    stage_name,
+    *,
+    photometric_value=None,
+    normal_term_value=0.0,
+    depth_term_value=0.0,
+):
     global metric_step
     metric_step += 1
     metric_iters.append(metric_step)
     metric_loss.append(loss_value)
     metric_scale.append(scale_value)
+    metric_photometric.append(loss_value if photometric_value is None else photometric_value)
+    metric_normal_term.append(normal_term_value)
+    metric_depth_term.append(depth_term_value)
     metric_stage.append(stage_name)
 
 
@@ -3809,26 +3809,56 @@ def plot_training_metrics(output_dir, stage_boundaries):
     if not metric_iters:
         return
 
-    fig, axes = plt.subplots(2, 1, figsize=(10, 6), sharex=True)
+    fig, axes = plt.subplots(5, 1, figsize=(12, 12), sharex=True)
     axes[0].plot(metric_iters, metric_scale, color="tab:blue", linewidth=1.5)
     axes[0].set_ylabel("Scale")
-    axes[0].set_title("Scale Factor and Loss")
+    axes[0].set_title("Scale Factor and Loss Components")
 
-    axes[1].plot(metric_iters, metric_loss, color="tab:orange", linewidth=1.0, alpha=0.4, label="Loss")
+    axes[1].plot(metric_iters, metric_loss, color="tab:orange", linewidth=1.0, alpha=0.4, label="Total")
+    axes[1].set_ylabel("Total")
 
     if LOSS_SMOOTH_WINDOW > 1:
-        smoothed_loss, smoothed_iters = smooth_series(metric_loss, LOSS_SMOOTH_WINDOW, metric_iters)
-        if smoothed_loss.size > 0:
-            axes[1].plot(smoothed_iters, smoothed_loss, color="tab:red", linewidth=2.0,
-                         label=f"Loss (MA {LOSS_SMOOTH_WINDOW})")
-
-    axes[1].set_ylabel("Loss")
-    axes[1].set_xlabel("Iteration")
+        smoothed_total, smoothed_iters = smooth_series(metric_loss, LOSS_SMOOTH_WINDOW, metric_iters)
+        if smoothed_total.size > 0:
+            axes[1].plot(smoothed_iters, smoothed_total, color="tab:red", linewidth=2.0,
+                         label=f"Total (MA {LOSS_SMOOTH_WINDOW})")
     axes[1].legend(loc="upper right")
 
+    axes[2].plot(metric_iters, metric_photometric, color="tab:green", linewidth=1.0, alpha=0.4, label="Photometric")
+    axes[2].set_ylabel("Photo")
+
+    if LOSS_SMOOTH_WINDOW > 1:
+        smoothed_photo, smoothed_photo_iters = smooth_series(metric_photometric, LOSS_SMOOTH_WINDOW, metric_iters)
+        if smoothed_photo.size > 0:
+            axes[2].plot(smoothed_photo_iters, smoothed_photo, color="tab:olive", linewidth=2.0,
+                         label=f"Photometric (MA {LOSS_SMOOTH_WINDOW})")
+    axes[2].legend(loc="upper right")
+
+    axes[3].plot(metric_iters, metric_normal_term, color="tab:purple", linewidth=1.0, alpha=0.4, label="Normal term")
+    axes[3].set_ylabel("Normal")
+    if LOSS_SMOOTH_WINDOW > 1:
+        smoothed_normal, smoothed_normal_iters = smooth_series(metric_normal_term, LOSS_SMOOTH_WINDOW, metric_iters)
+        if smoothed_normal.size > 0:
+            axes[3].plot(smoothed_normal_iters, smoothed_normal, color="tab:pink", linewidth=2.0,
+                         label=f"Normal (MA {LOSS_SMOOTH_WINDOW})")
+    axes[3].legend(loc="upper right")
+
+    axes[4].plot(metric_iters, metric_depth_term, color="tab:brown", linewidth=1.0, alpha=0.4, label="Depth term")
+    axes[4].set_ylabel("Depth")
+    axes[4].set_xlabel("Iteration")
+    if LOSS_SMOOTH_WINDOW > 1:
+        smoothed_depth, smoothed_depth_iters = smooth_series(metric_depth_term, LOSS_SMOOTH_WINDOW, metric_iters)
+        if smoothed_depth.size > 0:
+            axes[4].plot(smoothed_depth_iters, smoothed_depth, color="tab:gray", linewidth=2.0,
+                         label=f"Depth (MA {LOSS_SMOOTH_WINDOW})")
+    axes[4].legend(loc="upper right")
+
+    for ax in axes:
+        ax.grid(True, which="major", linestyle=":", linewidth=0.7, alpha=0.7)
+
     for boundary, label in stage_boundaries:
-        axes[0].axvline(boundary, color="gray", linestyle="--", linewidth=0.8)
-        axes[1].axvline(boundary, color="gray", linestyle="--", linewidth=0.8)
+        for ax in axes:
+            ax.axvline(boundary, color="gray", linestyle="--", linewidth=0.8)
         axes[0].text(boundary + 0.5, axes[0].get_ylim()[1], label, rotation=90,
                      va="top", ha="left", fontsize=8, color="gray")
 
@@ -3889,6 +3919,9 @@ INIT_SCALE_FACTORS = {
 is_synthetic_key = DATASET_KEY in SYNTHETIC_DATASET_KEYS or DATASET_KEY.startswith("synthetic")
 is_synthetic_path = "synthetic" in os.path.basename(DATASET_PATH).lower()
 IS_SYNTHETIC_DATASET = is_synthetic_key or is_synthetic_path
+IS_CLEAN_SYNTHETIC_DATASET = IS_SYNTHETIC_DATASET and (
+    "clean" in DATASET_KEY or "clean" in os.path.basename(DATASET_PATH).lower()
+)
 
 INIT_SCALE_FACTOR_DEFAULT = INIT_SCALE_FACTORS.get(
     DATASET_KEY,
@@ -3949,6 +3982,11 @@ def env_int_list(name):
             continue
         items.append(int(token))
     return items
+
+
+SYNTHETIC_NEAR_SURFACE_THRESH_M = env_float("SYNTHETIC_NEAR_SURFACE_THRESH_M", 0.05)
+SYNTHETIC_HIGH_OPACITY_THRESH = env_float("SYNTHETIC_HIGH_OPACITY_THRESH", 0.8)
+SYNTHETIC_GOOD_ALIGNMENT_COS = env_float("SYNTHETIC_GOOD_ALIGNMENT_COS", 0.9)
 
 
 @dataclass(frozen=True)
@@ -4192,6 +4230,7 @@ class ElevationChunk5Config:
     normal_ramp_end_iter: int
     normal_weight_early: float
     normal_weight_late: float
+    depth_weight_scale: float
     normal_elev_start_iter: int
     normal_confidence_thresh: float
     densify_enabled: bool
@@ -4373,8 +4412,10 @@ def parse_elevation_chunk5_config(elevation_aware, stage2_iters):
     normal_ramp_end_iter = env_int("ELEV_NORMAL_RAMP_END_ITER", 8000)
     normal_weight_early = env_float("ELEV_NORMAL_WEIGHT_EARLY", 0.01)
     normal_weight_late = env_float("ELEV_NORMAL_WEIGHT_LATE", 0.10)
+    depth_weight_scale = env_float("ELEV_DEPTH_WEIGHT_SCALE", 1.0)
     normal_elev_start_iter = env_int("ELEV_NORMAL_ELEV_START_ITER", 4000)
-    normal_confidence_thresh = env_float("ELEV_NORMAL_CONFIDENCE_THRESH", 0.5)
+    normal_confidence_thresh_default = 1.0 if IS_CLEAN_SYNTHETIC_DATASET else 0.5
+    normal_confidence_thresh = env_float("ELEV_NORMAL_CONFIDENCE_THRESH", normal_confidence_thresh_default)
     stage2_start_default = resolve_chunk5_stage2_start_default(stage2_iters=stage2_iters)
     stage2_start_iter = env_int("ELEV_STAGE2_START_ITER", stage2_start_default)
     densify_interval = env_int("ELEV_DENSIFY_INTERVAL", 1500)
@@ -4392,6 +4433,7 @@ def parse_elevation_chunk5_config(elevation_aware, stage2_iters):
     _require_config("ELEV_NORMAL_RAMP_END_ITER", normal_ramp_end_iter >= normal_ramp_start_iter, "must be >= start")
     _require_config("ELEV_NORMAL_WEIGHT_EARLY", normal_weight_early >= 0.0, "must be >= 0")
     _require_config("ELEV_NORMAL_WEIGHT_LATE", normal_weight_late >= 0.0, "must be >= 0")
+    _require_config("ELEV_DEPTH_WEIGHT_SCALE", depth_weight_scale >= 0.0, "must be >= 0")
     _require_config("ELEV_NORMAL_ELEV_START_ITER", normal_elev_start_iter >= 0, "must be >= 0")
     _require_config(
         "ELEV_NORMAL_CONFIDENCE_THRESH",
@@ -4412,6 +4454,7 @@ def parse_elevation_chunk5_config(elevation_aware, stage2_iters):
         normal_ramp_end_iter=normal_ramp_end_iter,
         normal_weight_early=normal_weight_early,
         normal_weight_late=normal_weight_late,
+        depth_weight_scale=depth_weight_scale,
         normal_elev_start_iter=normal_elev_start_iter,
         normal_confidence_thresh=normal_confidence_thresh,
         densify_enabled=densify_enabled,
@@ -4469,7 +4512,7 @@ SONAR_RANGE_ATTEN_EPS = env_float("SONAR_RANGE_ATTEN_EPS", 1e-6)
 SONAR_RANGE_ATTEN_AUTO_GAIN_ENV = os.environ.get("SONAR_RANGE_ATTEN_AUTO_GAIN")
 SONAR_RANGE_ATTEN_AUTO_GAIN = env_bool("SONAR_RANGE_ATTEN_AUTO_GAIN", False)
 ELEV_INIT_MODE = env_choice("ELEV_INIT_MODE", "random", {"random", "zero"})
-SONAR_FIXED_OPACITY = env_bool("SONAR_FIXED_OPACITY", True)
+SONAR_FIXED_OPACITY = env_bool("SONAR_FIXED_OPACITY", False)
 SONAR_OPACITY_WARMUP_ITERS = max(0, env_int("SONAR_OPACITY_WARMUP_ITERS", 200))
 SONAR_SURFEL_STATS_EVERY = max(1, env_int("SONAR_SURFEL_STATS_EVERY", 50))
 SONAR_LOAD_CHECKPOINT = os.environ.get("SONAR_LOAD_CHECKPOINT", "").strip()
@@ -4534,6 +4577,8 @@ def main():
     visualizer_dir, visualizer_rendered_dir = ensure_visualizer_dirs(OUTPUT_DIR)
     visualizer_stage_artifacts = {}
     visualizer_frame_artifacts = []
+    synthetic_geometry = load_synthetic_dataset_geometry(DATASET_PATH) if IS_SYNTHETIC_DATASET else None
+    synthetic_stage_diagnostics = {}
 
     setup_logging(OUTPUT_DIR)
     init_loss_log(OUTPUT_DIR)
@@ -4549,6 +4594,14 @@ def main():
     if DATASET_PATH_OVERRIDE:
         print(f"Dataset path override: {DATASET_PATH_OVERRIDE}")
     print(f"Synthetic dataset mode: {IS_SYNTHETIC_DATASET}")
+    if synthetic_geometry is not None:
+        print(
+            "[Synthetic Diagnostics] "
+            f"shape={synthetic_geometry.get('shape', 'unknown')}, "
+            f"near_surface_thresh={SYNTHETIC_NEAR_SURFACE_THRESH_M:.4f}m, "
+            f"high_opacity_thresh={SYNTHETIC_HIGH_OPACITY_THRESH:.3f}, "
+            f"good_alignment_cos={SYNTHETIC_GOOD_ALIGNMENT_COS:.3f}"
+        )
     print(f"Init scale: {INIT_SCALE_FACTOR}")
     print(f"Scale frozen: {SONAR_FREEZE_SCALE}")
     print(f"Num training frames: {NUM_TRAINING_FRAMES}")
@@ -4647,10 +4700,29 @@ def main():
         f"normal_mode={ELEV_CHUNK5_CFG.normal_mode}, "
         f"effective_normal={ELEV_CHUNK5_CFG.effective_normal_mode}, "
         f"w_normal={ELEV_CHUNK5_CFG.normal_weight_early:.3f}->{ELEV_CHUNK5_CFG.normal_weight_late:.3f}, "
+        f"depth_scale={ELEV_CHUNK5_CFG.depth_weight_scale:.3f}, "
         f"ramp={ELEV_CHUNK5_CFG.normal_ramp_start_iter}->{ELEV_CHUNK5_CFG.normal_ramp_end_iter}, "
         f"elev_start={ELEV_CHUNK5_CFG.normal_elev_start_iter}, "
         f"conf_thresh={ELEV_CHUNK5_CFG.normal_confidence_thresh:.2f}"
     )
+
+    def record_synthetic_stage_diagnostics(stage_name):
+        if synthetic_geometry is None:
+            return None
+        opacity_grad_enabled = bool(getattr(gaussians._opacity, "requires_grad", False))
+        diag = compute_synthetic_surface_diagnostics(
+            gaussians,
+            synthetic_geometry,
+            near_surface_thresh_m=SYNTHETIC_NEAR_SURFACE_THRESH_M,
+            high_opacity_thresh=SYNTHETIC_HIGH_OPACITY_THRESH,
+            orientation_good_cos=SYNTHETIC_GOOD_ALIGNMENT_COS,
+        )
+        diag["opacity_fixed"] = float(not opacity_grad_enabled)
+        diag["opacity_grad_enabled"] = float(opacity_grad_enabled)
+        diag["opacity_policy"] = "learnable" if opacity_grad_enabled else "fixed"
+        synthetic_stage_diagnostics[stage_name] = diag
+        print_synthetic_surface_diagnostics(diag, stage_name)
+        return diag
     print(
         "[Elevation Chunk 5] "
         f"densify={int(ELEV_CHUNK5_CFG.densify_enabled)}, "
@@ -5074,6 +5146,7 @@ def main():
         stage_status="executed",
         glyph_prefix="initial",
         include_centers_full=True,
+        synthetic_surface_diagnostics=record_synthetic_stage_diagnostics("initial"),
     )
 
     # Diagnostic: Check initial FOV visibility with temporary scale factor
@@ -5624,7 +5697,14 @@ def main():
                 gaussians.optimizer.zero_grad(set_to_none=True)
 
             scale_value = sonar_scale_factor.get_scale_value()
-            record_metrics(loss.item(), scale_value, "stage1")
+            record_metrics(
+                loss.item(),
+                scale_value,
+                "stage1",
+                photometric_value=loss.item(),
+                normal_term_value=0.0,
+                depth_term_value=0.0,
+            )
             log_loss(
                 metric_step,
                 "stage1",
@@ -5632,6 +5712,9 @@ def main():
                 ssim_val.item(),
                 base_loss.item(),
                 bright_loss.item(),
+                loss.item(),
+                0.0,
+                0.0,
                 loss.item(),
                 scale_value,
                 len(gaussians.get_xyz)
@@ -5694,6 +5777,7 @@ def main():
             visualizer_dir,
             stage_filename="surfels_after_stage1.ply",
             stage_status="executed",
+            synthetic_surface_diagnostics=record_synthetic_stage_diagnostics("stage1"),
         )
     else:
         visualizer_stage_artifacts["stage1"] = export_stage_visualizer_state(
@@ -5701,6 +5785,7 @@ def main():
             visualizer_dir,
             stage_filename="surfels_after_stage1.ply",
             stage_status="skipped_alias_to_initial",
+            synthetic_surface_diagnostics=record_synthetic_stage_diagnostics("stage1"),
         )
 
     elev_angle_bins = torch.linspace(
@@ -5810,12 +5895,15 @@ def main():
             batch_ssim = []
             batch_base = []
             batch_bright = []
+            batch_photometric = []
             batch_loss = []
             batch_loss_lik = []
             batch_loss_ent = []
             batch_stage1 = []
             batch_loss_couple = []
             batch_loss_normal = []
+            batch_normal_term = []
+            batch_depth_term = []
             batch_match_rate = []
             batch_residual_p95 = []
             batch_assoc_w = []
@@ -5948,13 +6036,20 @@ def main():
                     zero=photometric_i.new_tensor(0.0),
                 )
                 loss_normal_i = chunk5_stats["loss"]
+                loss_depth_i = chunk5_stats["loss_depth"]
                 normal_weight_iter = float(chunk5_stats["weight"])
+                depth_weight_iter = float(chunk5_stats["depth_weight"])
                 normal_term_i = (
                     photometric_i.new_tensor(normal_weight_iter) * loss_normal_i
                     if normal_loss_enabled
                     else photometric_i.new_tensor(0.0)
                 )
-                loss_i = photometric_i + stage1_out["stage1_total_loss"] + (couple_weight_iter * loss_couple_i) + normal_term_i
+                depth_term_i = (
+                    photometric_i.new_tensor(depth_weight_iter) * loss_depth_i
+                    if normal_loss_enabled
+                    else photometric_i.new_tensor(0.0)
+                )
+                loss_i = photometric_i + stage1_out["stage1_total_loss"] + (couple_weight_iter * loss_couple_i) + normal_term_i + depth_term_i
 
                 frame_loss_sums[frame_idx] += float(loss_i.item())
                 frame_loss_counts[frame_idx] += 1
@@ -5962,12 +6057,15 @@ def main():
                 batch_ssim.append(ssim_i)
                 batch_base.append(base_i)
                 batch_bright.append(bright_i)
+                batch_photometric.append(photometric_i)
                 batch_loss.append(loss_i)
                 batch_loss_lik.append(stage1_out["loss_lik"])
                 batch_loss_ent.append(stage1_out["loss_ent"])
                 batch_stage1.append(stage1_out["stage1_total_loss"])
                 batch_loss_couple.append(loss_couple_i)
                 batch_loss_normal.append(loss_normal_i)
+                batch_normal_term.append(normal_term_i)
+                batch_depth_term.append(depth_term_i)
                 batch_match_rate.append(float(coupling_stats["match_rate"]))
                 batch_residual_p95.append(float(coupling_stats["residual_p95"]))
                 batch_assoc_w.append(float(coupling_stats["assoc_w_mean"]))
@@ -6022,12 +6120,15 @@ def main():
             ssim_val = torch.stack(batch_ssim).mean()
             base_loss = torch.stack(batch_base).mean()
             bright_loss = torch.stack(batch_bright).mean()
+            photometric_loss = torch.stack(batch_photometric).mean()
             loss = torch.stack(batch_loss).mean()
             loss_lik = torch.stack(batch_loss_lik).mean()
             loss_ent = torch.stack(batch_loss_ent).mean()
             loss_stage1 = torch.stack(batch_stage1).mean()
             loss_couple = torch.stack(batch_loss_couple).mean()
             loss_normal = torch.stack(batch_loss_normal).mean()
+            normal_term = torch.stack(batch_normal_term).mean()
+            depth_term = torch.stack(batch_depth_term).mean()
             couple_match_rate = float(np.mean(batch_match_rate)) if batch_match_rate else 0.0
             couple_residual_p95 = float(np.mean(batch_residual_p95)) if batch_residual_p95 else 0.0
             couple_assoc_w = float(np.mean(batch_assoc_w)) if batch_assoc_w else 0.0
@@ -6059,8 +6160,15 @@ def main():
                 "post_densify_invalid_id_to_row": 0,
             }
 
-            # Backward
-            loss.backward()
+            # Some synthetic shadow/off steps can legitimately end up with a fully detached
+            # loss tensor; skip backward for those steps instead of crashing the run.
+            if loss.requires_grad:
+                loss.backward()
+            else:
+                print(
+                    f"[Warning] Stage 2 iter {iteration}: loss has no grad_fn; skipping backward "
+                    f"(normal_mode={ELEV_CHUNK5_CFG.effective_normal_mode})"
+                )
 
             chunk4_support_stats = {
                 "match_frames": 0,
@@ -6151,7 +6259,14 @@ def main():
                     assert_surfel_id_integrity(chunk4_runtime_state["persistent_state"])
 
             scale_value = sonar_scale_factor.get_scale_value()
-            record_metrics(loss.item(), scale_value, "stage2")
+            record_metrics(
+                loss.item(),
+                scale_value,
+                "stage2",
+                photometric_value=photometric_loss.item(),
+                normal_term_value=normal_term.item(),
+                depth_term_value=depth_term.item(),
+            )
             log_loss(
                 metric_step,
                 "stage2",
@@ -6159,6 +6274,9 @@ def main():
                 ssim_val.item(),
                 base_loss.item(),
                 bright_loss.item(),
+                photometric_loss.item(),
+                normal_term.item(),
+                depth_term.item(),
                 loss.item(),
                 scale_value,
                 len(gaussians.get_xyz)
@@ -6181,15 +6299,13 @@ def main():
                         )
                     if ELEV_CHUNK5_CFG.effective_normal_mode != "off":
                         center_entropy = chunk5_diag_summary["center_entropy_summary"]
-                        neighbor_entropy = chunk5_diag_summary["neighbor_entropy_summary"]
                         sampler_tail += (
                             f", normal={loss_normal.item():.6f}, w_normal={normal_weight_mean:.3f}, "
                             f"cov={normal_cov:.4f}, conf_cov={normal_conf_cov:.4f}, "
                             f"finite={normal_finite_mean:.1f}, match={normal_match_mean:.1f}, skip={normal_skipped_mean:.1f}, "
                             f"anchors={chunk5_diag_summary['anchor_count']}, supp={chunk5_diag_summary['center_supported_count']}, "
-                            f"cconf={chunk5_diag_summary['center_confident_count']}, interior={chunk5_diag_summary['interior_anchor_count']}, "
-                            f"nconf={chunk5_diag_summary['all_neighbors_confident_count']}, unmatched={chunk5_diag_summary['skip_unmatched_count']}, "
-                            f"Hc={center_entropy['mean']:.3f}/{center_entropy['p95']:.3f}, Hn={neighbor_entropy['mean']:.3f}/{neighbor_entropy['p95']:.3f}"
+                            f"cconf={chunk5_diag_summary['center_confident_count']}, geom_off={chunk5_diag_summary['skip_geometry_disabled_count']}, "
+                            f"unmatched={chunk5_diag_summary['skip_unmatched_count']}, Hc={center_entropy['mean']:.3f}/{center_entropy['p95']:.3f}"
                         )
                     if densify_candidate_enabled:
                         sampler_tail += (
@@ -6248,6 +6364,7 @@ def main():
             stage_filename="surfels_after_stage2.ply",
             stage_status="executed",
             glyph_prefix="stage2",
+            synthetic_surface_diagnostics=record_synthetic_stage_diagnostics("stage2"),
         )
     else:
         visualizer_stage_artifacts["stage2"] = export_stage_visualizer_state(
@@ -6256,6 +6373,7 @@ def main():
             stage_filename="surfels_after_stage2.ply",
             stage_status="skipped_alias_to_stage1",
             glyph_prefix="stage2",
+            synthetic_surface_diagnostics=record_synthetic_stage_diagnostics("stage2"),
         )
 
     # =============================================================================
@@ -6353,12 +6471,15 @@ def main():
             batch_ssim = []
             batch_base = []
             batch_bright = []
+            batch_photometric = []
             batch_loss = []
             batch_loss_lik = []
             batch_loss_ent = []
             batch_stage1 = []
             batch_loss_couple = []
             batch_loss_normal = []
+            batch_normal_term = []
+            batch_depth_term = []
             batch_match_rate = []
             batch_residual_p95 = []
             batch_assoc_w = []
@@ -6489,13 +6610,20 @@ def main():
                     zero=photometric_i.new_tensor(0.0),
                 )
                 loss_normal_i = chunk5_stats["loss"]
+                loss_depth_i = chunk5_stats["loss_depth"]
                 normal_weight_iter = float(chunk5_stats["weight"])
+                depth_weight_iter = float(chunk5_stats["depth_weight"])
                 normal_term_i = (
                     photometric_i.new_tensor(normal_weight_iter) * loss_normal_i
                     if normal_loss_enabled
                     else photometric_i.new_tensor(0.0)
                 )
-                loss_i = photometric_i + stage1_out["stage1_total_loss"] + (couple_weight_iter * loss_couple_i) + normal_term_i
+                depth_term_i = (
+                    photometric_i.new_tensor(depth_weight_iter) * loss_depth_i
+                    if normal_loss_enabled
+                    else photometric_i.new_tensor(0.0)
+                )
+                loss_i = photometric_i + stage1_out["stage1_total_loss"] + (couple_weight_iter * loss_couple_i) + normal_term_i + depth_term_i
 
                 frame_loss_sums[frame_idx] += float(loss_i.item())
                 frame_loss_counts[frame_idx] += 1
@@ -6503,12 +6631,15 @@ def main():
                 batch_ssim.append(ssim_i)
                 batch_base.append(base_i)
                 batch_bright.append(bright_i)
+                batch_photometric.append(photometric_i)
                 batch_loss.append(loss_i)
                 batch_loss_lik.append(stage1_out["loss_lik"])
                 batch_loss_ent.append(stage1_out["loss_ent"])
                 batch_stage1.append(stage1_out["stage1_total_loss"])
                 batch_loss_couple.append(loss_couple_i)
                 batch_loss_normal.append(loss_normal_i)
+                batch_normal_term.append(normal_term_i)
+                batch_depth_term.append(depth_term_i)
                 batch_match_rate.append(float(coupling_stats["match_rate"]))
                 batch_residual_p95.append(float(coupling_stats["residual_p95"]))
                 batch_assoc_w.append(float(coupling_stats["assoc_w_mean"]))
@@ -6563,12 +6694,15 @@ def main():
             ssim_val = torch.stack(batch_ssim).mean()
             base_loss = torch.stack(batch_base).mean()
             bright_loss = torch.stack(batch_bright).mean()
+            photometric_loss = torch.stack(batch_photometric).mean()
             loss = torch.stack(batch_loss).mean()
             loss_lik = torch.stack(batch_loss_lik).mean()
             loss_ent = torch.stack(batch_loss_ent).mean()
             loss_stage1 = torch.stack(batch_stage1).mean()
             loss_couple = torch.stack(batch_loss_couple).mean()
             loss_normal = torch.stack(batch_loss_normal).mean()
+            normal_term = torch.stack(batch_normal_term).mean()
+            depth_term = torch.stack(batch_depth_term).mean()
             couple_match_rate = float(np.mean(batch_match_rate)) if batch_match_rate else 0.0
             couple_residual_p95 = float(np.mean(batch_residual_p95)) if batch_residual_p95 else 0.0
             couple_assoc_w = float(np.mean(batch_assoc_w)) if batch_assoc_w else 0.0
@@ -6600,7 +6734,13 @@ def main():
                 "post_densify_invalid_id_to_row": 0,
             }
 
-            loss.backward()
+            if loss.requires_grad:
+                loss.backward()
+            else:
+                print(
+                    f"[Warning] Stage 3 iter {iteration}: loss has no grad_fn; skipping backward "
+                    f"(normal_mode={ELEV_CHUNK5_CFG.effective_normal_mode})"
+                )
 
             chunk4_support_stats = {
                 "match_frames": 0,
@@ -6691,7 +6831,14 @@ def main():
                     assert_surfel_id_integrity(chunk4_runtime_state["persistent_state"])
 
             scale_value = sonar_scale_factor.get_scale_value()
-            record_metrics(loss.item(), scale_value, "stage3")
+            record_metrics(
+                loss.item(),
+                scale_value,
+                "stage3",
+                photometric_value=photometric_loss.item(),
+                normal_term_value=normal_term.item(),
+                depth_term_value=depth_term.item(),
+            )
             log_loss(
                 metric_step,
                 "stage3",
@@ -6699,6 +6846,9 @@ def main():
                 ssim_val.item(),
                 base_loss.item(),
                 bright_loss.item(),
+                photometric_loss.item(),
+                normal_term.item(),
+                depth_term.item(),
                 loss.item(),
                 scale_value,
                 len(gaussians.get_xyz)
@@ -6721,15 +6871,13 @@ def main():
                         )
                     if ELEV_CHUNK5_CFG.effective_normal_mode != "off":
                         center_entropy = chunk5_diag_summary["center_entropy_summary"]
-                        neighbor_entropy = chunk5_diag_summary["neighbor_entropy_summary"]
                         sampler_tail += (
                             f", normal={loss_normal.item():.6f}, w_normal={normal_weight_mean:.3f}, "
                             f"cov={normal_cov:.4f}, conf_cov={normal_conf_cov:.4f}, "
                             f"finite={normal_finite_mean:.1f}, match={normal_match_mean:.1f}, skip={normal_skipped_mean:.1f}, "
                             f"anchors={chunk5_diag_summary['anchor_count']}, supp={chunk5_diag_summary['center_supported_count']}, "
-                            f"cconf={chunk5_diag_summary['center_confident_count']}, interior={chunk5_diag_summary['interior_anchor_count']}, "
-                            f"nconf={chunk5_diag_summary['all_neighbors_confident_count']}, unmatched={chunk5_diag_summary['skip_unmatched_count']}, "
-                            f"Hc={center_entropy['mean']:.3f}/{center_entropy['p95']:.3f}, Hn={neighbor_entropy['mean']:.3f}/{neighbor_entropy['p95']:.3f}"
+                            f"cconf={chunk5_diag_summary['center_confident_count']}, geom_off={chunk5_diag_summary['skip_geometry_disabled_count']}, "
+                            f"unmatched={chunk5_diag_summary['skip_unmatched_count']}, Hc={center_entropy['mean']:.3f}/{center_entropy['p95']:.3f}"
                         )
                     if densify_candidate_enabled:
                         sampler_tail += (
@@ -6836,6 +6984,7 @@ def main():
         stage_filename="surfels_after_stage3.ply",
         stage_status="executed" if STAGE3_ITERATIONS > 0 else "skipped_alias_to_stage2",
         glyph_prefix="stage3",
+        synthetic_surface_diagnostics=record_synthetic_stage_diagnostics("stage3"),
     )
     visualizer_frame_artifacts = export_frame_visualizer_artifacts(
         training_frames,
@@ -6927,6 +7076,22 @@ def main():
     plot_training_metrics(OUTPUT_DIR, stage_boundaries)
 
     print(f"\nFinal scale factor: {sonar_scale_factor.get_scale_value():.6f}")
+
+    synthetic_surface_diag_path = None
+    if synthetic_stage_diagnostics:
+        synthetic_surface_diag_path = os.path.join(OUTPUT_DIR, "synthetic_surface_diagnostics.json")
+        synthetic_payload = {
+            "dataset_key": DATASET_KEY,
+            "dataset_path": DATASET_PATH,
+            "thresholds": {
+                "near_surface_threshold_m": float(SYNTHETIC_NEAR_SURFACE_THRESH_M),
+                "high_opacity_threshold": float(SYNTHETIC_HIGH_OPACITY_THRESH),
+                "orientation_good_cos_threshold": float(SYNTHETIC_GOOD_ALIGNMENT_COS),
+            },
+            "stages": synthetic_stage_diagnostics,
+        }
+        write_json_artifact(synthetic_surface_diag_path, synthetic_payload)
+        print(f"[Synthetic Diagnostics] Wrote: {synthetic_surface_diag_path}")
 
     # =============================================================================
     # Summary
@@ -7124,6 +7289,8 @@ def main():
     print(f"  - chunk5_gate_log.csv                  (Chunk-5 gate-by-gate diagnostics)")
     print(f"  - frame_training_visits.csv             (Per-frame optimizer visit coverage)")
     print(f"  - final_eval_train_frames.csv           (Per-frame final train losses)")
+    if synthetic_stage_diagnostics:
+        print(f"  - synthetic_surface_diagnostics.json    (Near-surface opacity + orientation diagnostics)")
     if holdout_frames:
         print(f"  - final_eval_holdout_frames.csv         (Per-frame final holdout losses)")
     print(f"  - support_metrics_train.csv             (Surfel support diagnostics)")

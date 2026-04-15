@@ -442,6 +442,236 @@ The finite-difference stencil was borrowed from a context (dense regular depth g
 
 Even if we relaxed the confidence gate enough to produce nonzero signal, the underlying normals would be unreliable because of this geometric mismatch. The problem is not just the gate calibration -- it is the approach.
 
+### Phase A Execution: Pixel-Neighbor Gate Removed (2026-04-01)
+
+Phase A was tightened after review.
+
+The first Phase-A pass removed only the downstream sonar-pixel finite-difference normal construction while still logging the old 4-neighbor readiness gate. That preserved more of the old diagnostic chain than intended.
+
+The stronger and now-current Phase-A implementation in `debug_multiframe.py` does the following:
+
+- removes the sonar-pixel `left/right/up/down -> cross product` normal construction from the active Chunk-5 path,
+- removes the pixel-level 4-neighbor readiness check itself,
+- removes neighbor-posterior querying and neighbor-entropy logging from the active Phase-A diagnostics,
+- stops the path at center support/confidence and records `skip_geometry_disabled_count` as the number of center-confident anchors for which no replacement local-geometry path exists.
+
+This better matches the physical reading for sonar: pixel neighbors in the collapsed `(azimuth, range)` image are not trustworthy local surface neighbors in 3D once elevation has been integrated away.
+
+### Current Phase A Command Used
+
+```bash
+source ~/anaconda3/etc/profile.d/conda.sh && conda activate unbiased_surfel_sonar && \
+SONAR_DATASET=synthetic_c_clean \
+SONAR_DATASET_PATH=/home/gavin/Unbiased_Surfel_sonar/synthetic_datasets/synthetic_cube_C_azimuth45_fixedpos \
+SONAR_OUTPUT_DIR=./output/chunk5_5_diag_cube20_short_active_phaseA_v2_nonneighbor \
+SONAR_NUM_FRAMES=20 \
+SONAR_FRAME_INDICES=0,25,50,75,100,125,150,175,200,225,250,275,300,325,350,375,400,425,450,475 \
+SONAR_STAGE2_ITERS=40 \
+SONAR_STAGE3_ITERS=1 \
+SONAR_FREEZE_SCALE=1 \
+ELEV_STAGE1_MODE=shadow \
+ELEV_COUPLE_MODE=shadow \
+ELEV_SUPPORT_MODE=shadow \
+ELEV_NORMAL_MODE=active \
+ELEV_DENSIFY=0 \
+ELEV_DENSIFY_MODE=off \
+ELEV_NORMAL_RAMP_START_ITER=1 \
+ELEV_NORMAL_RAMP_END_ITER=20 \
+ELEV_NORMAL_ELEV_START_ITER=1 \
+ELEV_NORMAL_CONFIDENCE_THRESH=0.5 \
+SONAR_RENDER_MODE=2dgs \
+SONAR_OCCLUSION_MODE=ray_binned \
+SONAR_LAMBERTIAN_MODE=leaky \
+python debug_multiframe.py
+```
+
+### Current Phase A Output Path
+
+- Run directory: `output/chunk5_5_diag_cube20_short_active_phaseA_v2_nonneighbor/`
+- Main log: `output/chunk5_5_diag_cube20_short_active_phaseA_v2_nonneighbor/run.log`
+- Gate log: `output/chunk5_5_diag_cube20_short_active_phaseA_v2_nonneighbor/chunk5_gate_log.csv`
+
+### Current Phase A Gate Summary
+
+Across the 40 Stage-2 steps, the remaining meaningful diagnostics are now center-side only:
+
+- anchors: `18054` total (`394` to `496` per step),
+- center-supported: `18054 / 18054` (`1.0000` support coverage on every step),
+- center-confident: `156 / 18054` total (`0` to `16` per step; mean fraction `0.008928`),
+- center entropy mean range: `1.767848` to `1.905852`.
+
+Because the pixel-neighbor geometry path is now fully disabled, every center-confident anchor is recorded directly as a geometry-disabled stop:
+
+- `skip_geometry_disabled_count = 156` total (`0` to `16` per step),
+- `finite_count = 0`,
+- `match_count = 0`,
+- `applied_count = 0`,
+- `loss_mean = 0.0` throughout the rerun.
+
+The controlled rerun therefore says, in the simplest possible form:
+
+- support is not the blocker,
+- center confidence is still the dominant collapse,
+- once an anchor is center-confident, the current Phase-A path intentionally stops because no physically convincing local-geometry replacement has been defined yet.
+
+### Phase A Conclusion
+
+The old 4-neighbor pixel readiness check should not remain in the active Chunk-5 path. It has now been removed.
+
+The remaining Chunk-5.5 diagnostic is therefore:
+
+- a center support/confidence readout,
+- plus an explicit count of center-confident anchors that currently have no valid replacement geometry path.
+
+This is a cleaner and more physically honest Phase-A state than the earlier v1 rerun that still logged neighbor readiness.
+
+### Decision After Phase A
+
+- Do **not** automatically enter Phase B.
+- Optional Phase B is still **not justified by default** from this rerun alone.
+- If further work is chosen, it should be framed as one explicit replacement local-geometry design, not as a resurrection of the removed pixel-neighbor logic.
+
+### Confidence Calibration For Clean Synthetic Data (2026-04-01)
+
+After the neighbor gate was removed, the next obvious blocker on the clean cube diagnostic was center confidence.
+
+That blocker is not well calibrated for the noiseless synthetic case if left at the old default:
+
+- old default: `ELEV_NORMAL_CONFIDENCE_THRESH=0.5`
+- with `7` bins, that means entropy must be below about `0.973`
+- but the clean cube center entropies still sit around `1.77` to `1.91`, so the old default rejects most anchors even though the dataset has no background noise.
+
+A controlled rerun on the current no-neighbor Phase-A path used:
+
+```bash
+source ~/anaconda3/etc/profile.d/conda.sh && conda activate unbiased_surfel_sonar && \
+SONAR_DATASET=synthetic_c_clean \
+SONAR_DATASET_PATH=/home/gavin/Unbiased_Surfel_sonar/synthetic_datasets/synthetic_cube_C_azimuth45_fixedpos \
+SONAR_OUTPUT_DIR=./output/chunk5_5_diag_cube20_short_active_phaseA_v3_thresh1 \
+SONAR_NUM_FRAMES=20 \
+SONAR_FRAME_INDICES=0,25,50,75,100,125,150,175,200,225,250,275,300,325,350,375,400,425,450,475 \
+SONAR_STAGE2_ITERS=40 \
+SONAR_STAGE3_ITERS=1 \
+SONAR_FREEZE_SCALE=1 \
+ELEV_STAGE1_MODE=shadow \
+ELEV_COUPLE_MODE=shadow \
+ELEV_SUPPORT_MODE=shadow \
+ELEV_NORMAL_MODE=active \
+ELEV_DENSIFY=0 \
+ELEV_DENSIFY_MODE=off \
+ELEV_NORMAL_RAMP_START_ITER=1 \
+ELEV_NORMAL_RAMP_END_ITER=20 \
+ELEV_NORMAL_ELEV_START_ITER=1 \
+ELEV_NORMAL_CONFIDENCE_THRESH=1.0 \
+SONAR_RENDER_MODE=2dgs \
+SONAR_OCCLUSION_MODE=ray_binned \
+SONAR_LAMBERTIAN_MODE=leaky \
+python debug_multiframe.py
+```
+
+Result versus the current baseline Phase-A rerun:
+
+- baseline no-neighbor Phase A (`conf_thresh=0.5`): `156 / 18054` center-confident anchors (`0.008641`),
+- tuned clean-synthetic rerun (`conf_thresh=1.0`): `7650 / 18054` center-confident anchors (`0.423729`).
+
+Interpretation:
+
+- for the clean synthetic cube, the old confidence default was far too strict for the current posterior regime,
+- raising the threshold to `1.0` restores a substantial amount of center-side signal without reintroducing the physically invalid pixel-neighbor geometry path.
+
+Current implementation decision:
+
+- `debug_multiframe.py` now defaults `ELEV_NORMAL_CONFIDENCE_THRESH` to `1.0` for clean synthetic datasets,
+- other datasets keep the prior default of `0.5`,
+- the environment variable still overrides the default explicitly when needed.
+
+Default-behavior confirmation rerun:
+
+- reran the same clean-cube Phase-A diagnostic without setting `ELEV_NORMAL_CONFIDENCE_THRESH`,
+- output: `output/chunk5_5_diag_cube20_short_active_phaseA_v4_defaultclean/`,
+- log confirmed `conf_thresh=1.00`,
+- result matched the explicit-threshold run: `7650 / 18054` center-confident anchors (`0.423729`).
+
+So the current code default is behaving as intended for the clean synthetic cube case.
+
+### Matched Comparison Run: 8 Frames / 3000 Iterations (2026-04-01)
+
+To compare fairly against the corrected historical cube baseline, the current no-neighbor Chunk-5.5 path was rerun with the same frame subset and Stage-2 budget as:
+
+- reference baseline: `output/cube_8frames_cardinal_corners_longer_azimuth45_fixedpos_backprojfix/`
+- matched frame indices: `0,62,125,188,250,312,375,438`
+- matched training budget: `SONAR_STAGE2_ITERS=3000`, `SONAR_STAGE3_ITERS=1`
+
+Current rerun command:
+
+```bash
+source ~/anaconda3/etc/profile.d/conda.sh && conda activate unbiased_surfel_sonar && \
+SONAR_DATASET=synthetic_c_clean \
+SONAR_DATASET_PATH=/home/gavin/Unbiased_Surfel_sonar/synthetic_datasets/synthetic_cube_C_azimuth45_fixedpos \
+SONAR_OUTPUT_DIR=./output/chunk5_5_cube_8frames_3k_defaultclean_nonneighbor \
+SONAR_NUM_FRAMES=8 \
+SONAR_FRAME_INDICES=0,62,125,188,250,312,375,438 \
+SONAR_STAGE2_ITERS=3000 \
+SONAR_STAGE3_ITERS=1 \
+SONAR_FREEZE_SCALE=1 \
+ELEV_STAGE1_MODE=shadow \
+ELEV_COUPLE_MODE=shadow \
+ELEV_SUPPORT_MODE=shadow \
+ELEV_NORMAL_MODE=active \
+ELEV_DENSIFY=0 \
+ELEV_DENSIFY_MODE=off \
+ELEV_NORMAL_RAMP_START_ITER=1 \
+ELEV_NORMAL_RAMP_END_ITER=1500 \
+ELEV_NORMAL_ELEV_START_ITER=1 \
+SONAR_RENDER_MODE=2dgs \
+SONAR_OCCLUSION_MODE=ray_binned \
+SONAR_LAMBERTIAN_MODE=leaky \
+python debug_multiframe.py
+```
+
+Output:
+
+- run directory: `output/chunk5_5_cube_8frames_3k_defaultclean_nonneighbor/`
+- gate log: `output/chunk5_5_cube_8frames_3k_defaultclean_nonneighbor/chunk5_gate_log.csv`
+
+Final metric comparison against the corrected historical 8-frame baseline:
+
+- historical baseline (`cube_8frames_cardinal_corners_longer_azimuth45_fixedpos_backprojfix`):
+  - `loss_mean=0.003451`
+  - `ssim_mean=0.9781`
+  - `support mean=6.095`
+  - `final surfels=717`
+- current matched Chunk-5.5 rerun (`chunk5_5_cube_8frames_3k_defaultclean_nonneighbor`):
+  - `loss_mean=0.003400`
+  - `ssim_mean=0.9782`
+  - `support mean=6.036`
+  - `final surfels=741`
+
+Matched-run Phase-A gate summary:
+
+- total anchors: `1,424,250`
+- center-supported: `936,000` (`0.657188`)
+- center-confident: `880,875` (`0.618483`)
+- `skip_geometry_disabled_count = 880,875`
+- `finite_count = 0`, `match_count = 0`, `applied_count = 0`
+
+Interpretation:
+
+- under the same 8-frame / 3k training posture, the current clean-synthetic no-neighbor Chunk-5.5 path does **not** degrade the legacy image-fit baseline in any obvious way,
+- final loss/SSIM are essentially unchanged relative to the corrected historical run,
+- support is slightly lower and the final surfel count slightly higher, but the deltas are modest,
+- the main active difference is now diagnostic visibility: a large fraction of anchors become center-confident under the clean-synthetic calibration, but the path still intentionally stops at `geometry_disabled` because no replacement local-geometry mechanism has been defined yet.
+
+### Manual Visual Status For The Recent Matched Run
+
+Manual review of `output/chunk5_5_cube_8frames_3k_defaultclean_nonneighbor/` should be recorded as still showing the same qualitative failure mode as the recent post-backprojection-fix baseline rather than a visual improvement.
+
+- The rendered comparisons are still not matching the dataset images closely enough to count as a meaningful visual step forward.
+- The familiar symptom set remains present: surfel centers/line placement are often roughly in the right places, but cube-face traces are still fragmented into disconnected segments rather than continuous returns.
+- The recurring wrong-orientation symptom also still appears: some segments are centered plausibly but have the wrong slope/orientation relative to neighboring structure.
+- Residual floaters/off-surface surfels should still be treated as present unless a later artifact review shows otherwise.
+- Practical reading: this recent Chunk-5.5 matched run is diagnostically useful, but it should not be described as having materially improved the previously observed manual visual failure mode.
+
 ### Deferred Alternative Note: Normal Consistency From Surfel Neighbors
 
 This section is retained as a research note, not as the current implementation plan.

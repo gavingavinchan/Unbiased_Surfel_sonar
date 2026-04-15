@@ -3,6 +3,51 @@
 ## Abstract
 We extended 2D Gaussian Splatting to forward-looking multibeam sonar by introducing polar rendering, backward projection, metric scale alignment, and sonar-specific training constraints. The work adds sonar mode data flow, pose interpolation from camera trajectories, a learnable global scale factor, camera-to-sonar extrinsics, differentiable polar rendering with intensity modeling, size-aware field-of-view (FOV) constraints, and loss shaping for bright sonar returns. We also introduced mesh tuning workflows and dataset preparation guidelines to support real-world sonar reconstructions.
 
+## 2026-04-06 Chunk-5.6 Closeout Addendum
+Chunk 5.6 now has an explicit retained scientific closeout on the analytic synthetic cube comparator. Two additional pieces were required to make that closeout meaningful.
+
+First, the runtime now emits an analytic synthetic-surface diagnostic for each stage. For a synthetic scene with known geometry, define the near-surface set
+$$
+\mathcal{S}_{\tau} = \{ i \mid d_i \le \tau \},
+$$
+where $d_i$ is the surfel's absolute residual to the known surface and the retained threshold is $\tau = 0.05\,\mathrm{m}$. For surfels in that set, the orientation-quality metric is the sign-agnostic cosine alignment
+$$
+a_i = \left| n_i \cdot n_i^{\star} \right|,
+$$
+with $n_i$ the learned surfel normal and $n_i^{\star}$ the analytic surface normal at the closest sphere/cube face. The reported closeout statistic is then the near-surface mean alignment
+$$
+\bar{a}_{\tau} = \frac{1}{|\mathcal{S}_{\tau}|} \sum_{i \in \mathcal{S}_{\tau}} a_i,
+$$
+plus the fraction of near-surface surfels above a fixed "good" alignment threshold,
+$$
+f_{\mathrm{good}} = \frac{1}{|\mathcal{S}_{\tau}|} \sum_{i \in \mathcal{S}_{\tau}} \mathbb{1}[a_i \ge 0.9].
+$$
+
+The same diagnostic also measures the near-surface opacity gate:
+$$
+f_{\mathrm{opaque}} = \frac{1}{|\mathcal{S}_{\tau}|} \sum_{i \in \mathcal{S}_{\tau}} \mathbb{1}[\alpha_i \ge 0.8].
+$$
+This matters scientifically because the restored hard-depth and distortion semantics are only meaningful when the renderer has learned a stable surface/transmittance profile rather than a diffuse, low-opacity cloud.
+
+Second, the retained sonar depth regularizer is now explicit. For a ray with sorted event ranges $r_j$, cumulative-opacity hard-depth pick $r_{\mathrm{hard}}$, and compositing weights
+$$
+w_j = T_j \, \alpha_j,
+$$
+where $T_j$ is transmittance before event $j$, the current sonar distortion-style penalty is
+$$
+\mathcal{D}_{\mathrm{ray}} = \frac{\sum_j w_j \, |r_j - r_{\mathrm{hard}}|}{\sum_j w_j + \varepsilon}.
+$$
+This quantity is emitted as `rend_dist` after splatting the composited event spread over the sonar row footprint, and is now nonzero throughout the measured active runs.
+
+Empirically, the retained cube closeout run `output/chunk5_6_closeout_probe_cube_active_warm/` shows that once opacity switches from warmup-fixed to learnable at iteration 201, the active Chunk-5.6 path keeps a non-collapsed synthetic surface state:
+
+- Stage 3: `valid_surfel_count = 1914`
+- near-surface opacity fraction above `0.8`: `f_opaque = 1.0000`
+- near-surface mean alignment: `\bar{a}_{\tau} = 0.5089`
+- near-surface good-alignment fraction: `f_good = 0.0952`
+
+The matched `shadow` and `off` runs, with all other settings held fixed, collapse to zero valid synthetic surfels once opacity becomes learnable. Scientifically, that is enough to say the restored active normal-consistency path is now carrying real geometry-preserving signal relative to the no-applied-loss baselines, even though the absolute alignment score is still below the raw initialization baseline.
+
 ## 2026-04-06 Chunk-5.6 TDD Addendum
 Chunk 5.6 is now grounded by an explicit pre-implementation test tranche that treats the current failure as a renderer/trainer contract disconnect rather than as a threshold-tuning issue. The new focused suite in `tests/test_elevation_chunk5_6_tdd_contracts.py` encodes the required recovery posture:
 
