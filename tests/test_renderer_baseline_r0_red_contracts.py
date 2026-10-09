@@ -291,6 +291,7 @@ def test_rb_t10_forward_then_backward_projection_roundtrip_contract():
     camera = SimpleNamespace(
         R=np.eye(3, dtype=np.float32),
         T=np.zeros(3, dtype=np.float32),
+        world_view_transform=torch.eye(4, dtype=torch.float32),
         original_image=image,
     )
 
