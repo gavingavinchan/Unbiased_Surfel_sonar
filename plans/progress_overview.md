@@ -537,3 +537,24 @@ flowchart TB
 - Ran controlled diagnostic rerun `output/chunk5_5_diag_cube20_short_active_v1/` on `synthetic_cube_C_azimuth45_fixedpos` with the same 20-frame subset and early active-normal schedule.
 - The rerun confirms the current collapse happens primarily at `support -> center confidence`, then again at neighbor-confidence closure; finite-normal formation and surfel matching were not the dominant blocker once an anchor survived to those steps.
 - Plan `PLAN_ELEVATION_AWARE_CHUNK5_5_EXECUTION_2026-03-30.md` was reorganized into a plan section plus progress log, with an explicit Phase-A next step: remove the sonar 4-neighbor finite-difference stencil, rerun a few controlled diagnostics, and only then decide whether any replacement geometry path is justified.
+
+
+## 2026-10-09 — Experiment 003 geometry repair (gpt-6.1-sol)
+
+Independent conventional-pose tests found that current forward rendering and shared
+backprojection still treated `Camera.world_view_transform` rotation as conventional
+W2C rather than W2C.T. Echo initialization had a later correction, so it disagreed
+with rendering. Projection, bin backprojection, echo initialization, range maps,
+FOV checks, rigid extrinsic composition and footprint tangent frames now follow
+`docs/SONAR_GEOMETRY_CONVENTIONS.md`. Bins use centres; legacy offset 0 is explicit.
+Camera and world geometry scale together before the metric mount offset is applied.
+The historical mount and .65 remain assumptions. CPU regressions use noncommuting
+rotations, translations and scales .65/1/1.7; the harness retains independent CUDA
+checks and bounded matched image/geometry diagnostics. Acoustic/mesh validation is
+a separate gate. Current cu128/sm_120 large batched eigensolves require chunks of
+8192, and the 000b checkpoint, range-log and empty-FOV fixes are retained.
+
+Numerical follow-up: tied eigenvalues after covariance clipping caused NaN gradients
+in both original and geometry-corrected renders. A value-equivalent closed-form
+2x2 spectral clamp resolves this independently of geometry. Matched comparisons
+apply it to both variants; failures and original conditioning remain reproducible.
