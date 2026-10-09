@@ -1013,3 +1013,17 @@ slope at ties, avoiding eigenvector differentiation and the large cuSOLVER batch
 Tests compare its values to the original eigh implementation and check finite
 isotropic backward/gradcheck. The harness applies this same numerical helper to
 before and after variants, retaining original failed trajectories separately.
+
+## 2026-10-09 — 007 observed support diagnostic
+
+For a frozen mean x, count indicator echoes I_i(project_i(x))>.05 over greedily
+selected training poses; every pair has translation≥.10m and rotation≥5degrees.
+Projection uses Euclidean slant range, left-positive azimuth and20degree elevation
+aperture with explicit centre-sampled zero-origin grid. Echo neighbourhood is±1
+range bin/±2columns, consistent with15mm rows and1.5degree azimuth FWHM.
+Counts≥2/≥3 replace only the released SonarSplat primitive-opacity rejection;
+actual opacity remains in density. Global reflectance normalization is unchanged.
+Selection uses no GT, ROI, camera cloud or held-out echo. Source013 initialization
+is transductive, so75validation views cannot establish clean generalization.
+No covariance eigenvector is promoted to a normal; primary surfel meshing remains
+blocked. Point completeness and actual mesh completeness are reported separately.

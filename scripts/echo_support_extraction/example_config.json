@@ -1,0 +1,14 @@
+{
+ "dataset":"/home/gavin/sonar-recon/data/sim_cube_v1",
+ "checkpoint":"/home/gavin/sonar-recon/experiments/013-sonarsplat-on-sim/outputs/bright_full/renders/output_step39999.ply",
+ "range_origin_m":0.0,"range_span_m":3.0,"pixel_offset":0.5,
+ "azimuth_deg":120.0,"elevation_deg":20.0,"azimuth_psf_fwhm_deg":1.5,
+ "range_tolerance_bins":1,"azimuth_tolerance_columns":2,"fov_numerical_tolerance_rad":1e-6,
+ "bright_threshold":0.05,"pose_min_translation_m":0.10,"pose_min_rotation_deg":5.0,
+ "training_split":"frame_index % 8 != 0", "validation_split":"frame_index % 8 == 0",
+ "training_pose_selection":"ascending frame index, greedy; both translation and rotation minimum to every prior selected pose",
+ "support_settings":[2,3],"density_threshold":0.9,"num_samples_per_gaussian":10,"pitch_scale":0.5,"seed":42,
+ "validation_selection":"maximum F1 between tolerance-expanded projected mean occupancy and observed bright pixels; report both settings regardless; validation is transductive",
+ "inference_gt_usage":"none", "normal_policy":"none; 013 Gaussians are not oriented surfels",
+ "populations":["opacity","all","support2","support3"]
+}

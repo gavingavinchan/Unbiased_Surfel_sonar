@@ -558,3 +558,13 @@ Numerical follow-up: tied eigenvalues after covariance clipping caused NaN gradi
 in both original and geometry-corrected renders. A value-equivalent closed-form
 2x2 spectral clamp resolves this independently of geometry. Matched comparisons
 apply it to both variants; failures and original conditioning remain reproducible.
+
+## 2026-10-09 — 007 frozen echo-support extraction (Codex gpt-6.1-sol)
+
+Primary oriented-surface path blocked:004 failed and005/006 selected no checkpoint.
+Added standalone no-training SonarSplat fallback CLI under scripts/echo_support_extraction.
+Two/three separated-pose support retains weak Gaussians and removes floating density
+fragments, but the selected three-pose mesh is sparse (initial full Chamfer142.33mm,
+completeness2.527%). No validated sonar surface, training permission, native-routing
+fix, Poisson comparison or merge is established. Exact experiment report and
+common-pitch controls live in experiments/007-surfel-supported-surface-extraction.
