@@ -558,3 +558,7 @@ Numerical follow-up: tied eigenvalues after covariance clipping caused NaN gradi
 in both original and geometry-corrected renders. A value-equivalent closed-form
 2x2 spectral clamp resolves this independently of geometry. Matched comparisons
 apply it to both variants; failures and original conditioning remain reproducible.
+
+## 2026-10-09 — Experiment 008, calibration observability (gpt-6.1-sol)
+
+Diagnostic-only branch: exact d8dea36 base plus bdb8ec3 geometry cherry-pick and saved 57-line laptop WIP. No production convention repair and no training. Experiment-local CPU fits use camera centres+SLERP, proper FLU/optical/FRD rotations and explicit zero/.2-origin grids. Nov18 stricter object clusters support the column-right sign only under an upright/forward mount prior; expanded rigid calibration fails range/uncertainty criteria. December legacy-gauge results are diagnostic only. Retain both signs/origins and late-bound scale in data/surfel_mount_candidates_v1; do not adopt an extrinsic or move shared gitlinks. Independent other-backend review remains pending through the ordinary queue.

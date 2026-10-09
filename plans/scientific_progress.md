@@ -1013,3 +1013,7 @@ slope at ties, avoiding eigenvector differentiation and the large cuSOLVER batch
 Tests compare its values to the original eigh implementation and check finite
 isotropic backward/gradcheck. The harness applies this same numerical helper to
 before and after variants, retaining original failed trajectories separately.
+
+## 2026-10-09 — 008 observability limits (gpt-6.1-sol)
+
+The experiment compares FLU left-positive bearings against optical camera right-positive bearings after a proper basis rotation, rather than treating opposite correlations as reflections. Under symmetric elevation integration, Q=diag(1,-1,-1) is a proper forward-axis 180-degree rotation: azimuth sign reversal and elevation index reversal leave the unordered physical ray set unchanged. Global sign and upright/inverted roll therefore need a stated prior. Cube centre and acoustic reflection centroid are different quantities; a narrow hard-bound bootstrap interval is not evidence for lever-arm identification. No measured target, pipe or pool dimensions enter the fit. Detailed numerical evidence lives in experiments/008-surfel-real-mount-observability/RESULTS.md in the harness, and the camera/sonar inputs remain read-only.
