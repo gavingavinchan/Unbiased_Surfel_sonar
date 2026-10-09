@@ -418,6 +418,11 @@ def render_sonar(viewpoint_camera, pc: GaussianModel, bg_color: torch.Tensor,
         range_image = range_flat.view(1, out_H, out_W)
         weight_sum = weight_flat.view(out_H, out_W)
     
+    # An empty FOV still needs a zero-gradient connection to the model so the
+    # training loop can backpropagate the constant black-image loss.
+    if not in_fov.any():
+        rendered_image = rendered_image + means3D.sum() * 0.0
+
     # Normalize range by intensity weight
     range_image = torch.where(
         weight_sum.unsqueeze(0) > 1e-6,
