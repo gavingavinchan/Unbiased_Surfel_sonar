@@ -130,7 +130,7 @@ import open3d as o3d
 from PIL import Image
 
 
-def is_in_sonar_fov(xyz, camera, sonar_config, scale_factor, return_details=False):
+def is_in_sonar_fov(xyz, camera, sonar_config, scale_factor, return_details=False, sonar_extrinsic=None):
     """
     Check if 3D points are within the sonar FOV of a given camera.
 
@@ -155,21 +155,8 @@ def is_in_sonar_fov(xyz, camera, sonar_config, scale_factor, return_details=Fals
                     "in_range": empty, "in_front": empty}
         return empty
 
-    # Match render_sonar's transform EXACTLY
-    w2v = camera.world_view_transform.cuda()  # [4, 4]
-
-    # Extract R and t (translation is in row 3, not column 3!)
-    R_w2v = w2v[:3, :3]
-    t_w2v = w2v[3, :3]
-
-    # Apply scale factor to translation and points
-    scale = scale_factor.scale if scale_factor is not None else 1.0
-    xyz_scaled = xyz * scale
-    t_w2v_scaled = scale * t_w2v
-
-    # Transform points to sonar frame: p_sonar = p_world_scaled @ R.T + t_scaled
-    # This matches render_sonar exactly
-    points_sonar = (xyz_scaled @ R_w2v.T) + t_w2v_scaled  # [N, 3]
+    from gaussian_renderer import _transform_world_points_to_sonar_frame
+    points_sonar, _ = _transform_world_points_to_sonar_frame(xyz, camera, scale_factor, sonar_extrinsic)
 
     # Camera/sonar frame: +X = right, +Y = down, +Z = forward
     right = points_sonar[:, 0]
@@ -244,7 +231,7 @@ def compute_fov_margin_debug(range_vals, azimuth, elevation, sonar_config):
     return margin
 
 
-def is_fully_in_sonar_fov(xyz, scaling, camera, sonar_config, scale_factor):
+def is_fully_in_sonar_fov(xyz, scaling, camera, sonar_config, scale_factor, sonar_extrinsic=None):
     """
     Check if surfels (center + size extent) are fully within the sonar FOV.
 
@@ -266,16 +253,9 @@ def is_fully_in_sonar_fov(xyz, scaling, camera, sonar_config, scale_factor):
     if N == 0:
         return torch.zeros(0, dtype=torch.bool, device=xyz.device)
 
-    # Transform points to sonar frame (same as is_in_sonar_fov)
-    w2v = camera.world_view_transform.cuda()
-
-    R_w2v = w2v[:3, :3]
-    t_w2v = w2v[3, :3]
+    from gaussian_renderer import _transform_world_points_to_sonar_frame
+    points_sonar, _ = _transform_world_points_to_sonar_frame(xyz, camera, scale_factor, sonar_extrinsic)
     scale = scale_factor.scale if scale_factor is not None else 1.0
-    xyz_scaled = xyz * scale
-    t_w2v_scaled = scale * t_w2v
-    points_sonar = (xyz_scaled @ R_w2v.T) + t_w2v_scaled
-
 
     right = points_sonar[:, 0]
     down = points_sonar[:, 1]
@@ -297,7 +277,7 @@ def is_fully_in_sonar_fov(xyz, scaling, camera, sonar_config, scale_factor):
     center_in_fov = in_azimuth & in_elevation & in_range & in_front
 
     # Size-aware check: margin must exceed surfel radius
-    surfel_radius = scaling.max(dim=1).values  # [N]
+    surfel_radius = scaling.max(dim=1).values * scale  # [N], metres
     margin = compute_fov_margin_debug(range_vals, azimuth, elevation, sonar_config)
 
     fully_inside = center_in_fov & (margin > surfel_radius)
