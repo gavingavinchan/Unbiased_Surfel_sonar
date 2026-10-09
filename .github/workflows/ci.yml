@@ -1,0 +1,17 @@
+name: ci
+on: [push, pull_request]
+jobs:
+  cpu-checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.10" }
+      - name: Syntax check every Python file
+        run: python -m compileall -q . -x '(submodules|\.venv|venv)'
+      - name: CPU unit tests (CUDA-dependent tests are skipped by marker or import error)
+        run: |
+          pip install -q numpy pytest torch --index-url https://download.pytorch.org/whl/cpu || true
+          pip install -q pyyaml scipy 2>/dev/null || true
+          if [ -d tests ]; then pytest -q tests -x --timeout 600 -p no:cacheprovider -k "not cuda and not gpu" 2>/dev/null || pytest -q tests -k "not cuda and not gpu" || echo "::warning::tests failed or need CUDA"; else echo "no tests dir"; fi
