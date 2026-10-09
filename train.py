@@ -50,7 +50,7 @@ def training(dataset: ModelParams,
     gaussians.training_setup(opt)
     scene.training_setup(opt)
     if checkpoint:
-        (model_params, first_iter) = torch.load(checkpoint)
+        (model_params, first_iter) = torch.load(checkpoint, weights_only=False)
         gaussians.restore(model_params, opt)
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
@@ -70,6 +70,14 @@ def training(dataset: ModelParams,
             sonar_scale_factor.parameters(), 
             lr=dataset.sonar_scale_lr
         )
+        if checkpoint:
+            sonar_checkpoint = os.path.splitext(checkpoint)[0] + "_sonar.pth"
+            if os.path.isfile(sonar_checkpoint):
+                sonar_state = torch.load(sonar_checkpoint, weights_only=True)
+                sonar_scale_factor.load_state_dict(sonar_state["scale"])
+                sonar_optimizer.load_state_dict(sonar_state["optimizer"])
+            else:
+                print("No sonar checkpoint sidecar; using CLI scale initialization")
         print(f"  Initial scale factor: {sonar_scale_factor.get_scale_value():.4f}")
         # print(f"  log_scale param: {sonar_scale_factor._log_scale.item():.4f}")
         print(f"  Scale factor learning rate: {dataset.sonar_scale_lr}")
@@ -212,7 +220,7 @@ def training(dataset: ModelParams,
                         surf_range = render_pkg.get('surf_depth')  # This is range for sonar
                         if surf_range is not None:
                             # Get valid mask from GT image
-                            gt_valid = gt_image > dataset.sonar_intensity_threshold
+                            gt_valid = gt_image[:1] > dataset.sonar_intensity_threshold
                             if gt_valid.any():
                                 # Mean rendered range for valid pixels
                                 rendered_range = surf_range[gt_valid].mean().item()
@@ -264,6 +272,9 @@ def training(dataset: ModelParams,
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
+                if sonar_scale_factor is not None:
+                    torch.save({"scale": sonar_scale_factor.state_dict(), "optimizer": sonar_optimizer.state_dict(), "iteration": iteration},
+                               scene.model_path + "/chkpnt" + str(iteration) + "_sonar.pth")
 
         with torch.no_grad():        
             if network_gui.conn == None:

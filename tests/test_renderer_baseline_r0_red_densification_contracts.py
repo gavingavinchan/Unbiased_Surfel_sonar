@@ -68,7 +68,7 @@ def _identity_world_to_view(*args, **kwargs):
     return torch.eye(4, dtype=torch.float32)
 
 
-def _fake_ranges_to_points(viewpoint_camera, range_image, sonar_config, scale_factor):
+def _fake_ranges_to_points(viewpoint_camera, range_image, sonar_config, scale_factor, sonar_extrinsic=None):
     h, w = range_image.shape[-2:]
     return torch.zeros((h, w, 3), dtype=range_image.dtype, device=range_image.device)
 
