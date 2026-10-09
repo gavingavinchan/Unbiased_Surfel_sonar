@@ -21,6 +21,8 @@ Outputs:
 - mesh_poisson_after_stage3.ply: Poisson mesh after Stage 3
 - mesh_poisson_after_iter1.ply: Poisson mesh after iter 1
 - comparison_<stage>_<idx>_<image>.png: GT vs rendered for each training frame
+- surf_depth_<stage>_<idx>_<image>.png: Macro-surface depth heatmap per training frame
+- surf_normal_<stage>_<idx>_<image>.png: Macro-surface normal RGB map per training frame
 """
 
 import os
@@ -390,6 +392,45 @@ def brighten_image(img_np, percentile=99, gamma=0.5):
     img_bright = np.power(img_norm, gamma)
     img_bright = np.clip(img_bright * 255, 0, 255).astype(np.uint8)
     return img_bright
+
+
+def colorize_surf_depth_image(surf_depth_np):
+    depth = np.asarray(surf_depth_np, dtype=np.float32)
+    valid = np.isfinite(depth) & (depth > 0.0)
+    color = np.zeros(depth.shape + (3,), dtype=np.uint8)
+    if not np.any(valid):
+        return color
+
+    finite_depth = depth[valid]
+    depth_lo = float(np.min(finite_depth))
+    depth_hi = float(np.max(finite_depth))
+    if depth_hi <= depth_lo + 1e-8:
+        depth_norm = np.zeros_like(depth, dtype=np.float32)
+    else:
+        depth_norm = np.clip((depth - depth_lo) / (depth_hi - depth_lo), 0.0, 1.0)
+
+    depth_rgb = plt.get_cmap("viridis")(depth_norm)[..., :3]
+    color[valid] = np.clip(depth_rgb[valid] * 255.0, 0.0, 255.0).astype(np.uint8)
+    return color
+
+
+def colorize_surf_normal_image(surf_normal_np):
+    normal = np.asarray(surf_normal_np, dtype=np.float32)
+    if normal.ndim != 3 or normal.shape[0] != 3:
+        raise ValueError("surf_normal image must have shape [3, H, W]")
+
+    normal_hwc = np.moveaxis(normal, 0, -1)
+    normal_norm = np.linalg.norm(normal_hwc, axis=-1)
+    valid = np.isfinite(normal_hwc).all(axis=-1) & (normal_norm > 1e-8)
+    color = np.zeros(normal_hwc.shape, dtype=np.uint8)
+    if not np.any(valid):
+        return color
+
+    normal_unit = np.zeros_like(normal_hwc, dtype=np.float32)
+    normal_unit[valid] = normal_hwc[valid] / normal_norm[valid, None]
+    color_float = (normal_unit * 0.5) + 0.5
+    color[valid] = np.clip(color_float[valid] * 255.0, 0.0, 255.0).astype(np.uint8)
+    return color
 
 
 # Intensity threshold: pixels below this value (0-255 scale) are treated as black
@@ -2942,6 +2983,20 @@ def save_comparison_images(training_frames, gaussians, background, sonar_config,
         stem = build_frame_stem(i, cam.image_name, width=frame_width)
         filename = f"comparison_{stage_name}_{stem}.png"
         Image.fromarray(comparison_bright, mode='L').save(os.path.join(output_dir, filename))
+
+        surf_depth = render_pkg.get("surf_depth")
+        if surf_depth is not None:
+            surf_depth_np = surf_depth[0].detach().cpu().numpy()
+            surf_depth_rgb = colorize_surf_depth_image(surf_depth_np)
+            surf_depth_filename = f"surf_depth_{stage_name}_{stem}.png"
+            Image.fromarray(surf_depth_rgb, mode="RGB").save(os.path.join(output_dir, surf_depth_filename))
+
+        surf_normal = render_pkg.get("surf_normal")
+        if surf_normal is not None:
+            surf_normal_np = surf_normal.detach().cpu().numpy()
+            surf_normal_rgb = colorize_surf_normal_image(surf_normal_np)
+            surf_normal_filename = f"surf_normal_{stage_name}_{stem}.png"
+            Image.fromarray(surf_normal_rgb, mode="RGB").save(os.path.join(output_dir, surf_normal_filename))
 
     print(f"  Saved comparison images for {stage_name}")
 
@@ -7265,6 +7320,8 @@ def main():
     print(f"  - comparison_after_stage2_<idx>_<image>.png    (After surfel learning)")
     print(f"  - comparison_after_stage3_<idx>_<image>.png    (After joint fine-tuning)")
     print(f"  - comparison_after_stage3_raw_<idx>_<image>.png (Raw sonar vs rendered)")
+    print(f"  - surf_depth_<stage>_<idx>_<image>.png         (Macro-surface depth heatmap)")
+    print(f"  - surf_normal_<stage>_<idx>_<image>.png        (Macro-surface normal RGB map)")
     print(f"  - scale_and_loss.png                    (Scale and loss curves)")
     print(f"  - chunk5_gate_log.csv                  (Chunk-5 gate-by-gate diagnostics)")
     print(f"  - frame_training_visits.csv             (Per-frame optimizer visit coverage)")
