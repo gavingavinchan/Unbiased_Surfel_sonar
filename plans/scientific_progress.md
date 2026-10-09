@@ -1026,3 +1026,9 @@ include col=-.5 at +60 degrees for centre grids. Source pose precision is retain
 for discrete floor decisions (a measured row 73.000001 was formerly 72.999992).
 Strict native adapter/image, endpoint, normal/tangent and negative-fixture checks
 are separate from reconstruction evidence. No optimizer steps are part of 019.
+
+019 validation scope: the native train and debug adapters independently reproduce
+all 48 archived/PVC views with zero quantized mismatches. Both 18/36-case oracles
+and all 28 invalid fixtures retain their mathematical expectations. CPU test
+extraction now loads the target's function dependencies and actual literal
+defaults, with deferred annotation evaluation; assertions are unchanged.

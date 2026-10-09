@@ -569,3 +569,9 @@ apply it to both variants; failures and original conditioning remain reproducibl
 - Repaired AST contract dependency extraction and adopted the exact 018 strict CPU CI.
 - Validation is numerical only; no training, mesh claim, merge or peer approval.
   Detailed policy: `docs/SONAR_NATIVE_CONVENTION_GATE.md`.
+
+019 CPU follow-up: repaired four AST-extraction namespace/default failures without
+changing assertions; two historical `new_ones_like` errors were already fixed
+in the supplied 004 head. Retained 018 locked, fail-closed CI now runs the whole
+suite: local 221 passed / 0 failed / 13 explicitly reported skips. Remote CI is
+required on the final pushed head; its receipt is recorded by experiment 019.
