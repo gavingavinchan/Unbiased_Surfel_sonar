@@ -223,13 +223,15 @@ def rotation_matrix_from_rotvec(rotvec: np.ndarray) -> np.ndarray:
 
 def build_row_major_pose_matrix(R_w2v: np.ndarray, t_w2v: np.ndarray) -> np.ndarray:
     T = np.eye(4, dtype=np.float64)
-    T[:3, :3] = R_w2v
+    # Stored homogeneous row transform S = conventional W2V.T.
+    T[:3, :3] = R_w2v.T
     T[3, :3] = t_w2v
     return T
 
 
 def extract_rt_from_row_major_pose(T_w2v: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    return T_w2v[:3, :3].copy(), T_w2v[3, :3].copy()
+    # COLMAP expects conventional R_w2v and t_w2v.
+    return T_w2v[:3, :3].T.copy(), T_w2v[3, :3].copy()
 
 
 def camera_center_from_w2v(R_w2v: np.ndarray, t_w2v: np.ndarray) -> np.ndarray:
@@ -372,6 +374,7 @@ def build_pose_records(args: argparse.Namespace, rng: np.random.Generator) -> Li
         t_w2s = (R_w2s @ sonar_center) * -1.0
         T_w2s = build_row_major_pose_matrix(R_w2s, t_w2s)
 
+        # S_camera = S_sonar @ inverse(E.T); transpose back for COLMAP.
         T_w2c = T_w2s @ T_s2c
         R_w2c, t_w2c = extract_rt_from_row_major_pose(T_w2c)
         camera_center = camera_center_from_w2v(R_w2c, t_w2c)
@@ -530,6 +533,8 @@ def render_sonar_frame(
         front_ranges = np.min(np.where(valid_grid, hit_ranges_grid, np.inf), axis=1)
         front_valid = np.isfinite(front_ranges)
         if np.any(front_valid):
+            # Historical front-envelope deposition is edge-indexed in range:
+            # deliberately no -0.5, even with centre-sampled azimuth.
             front_row_f = (front_ranges[front_valid] - float(sonar_cfg.range_min)) / span * H
             in_bounds = (front_row_f >= 0.0) & (front_row_f <= float(H - 1))
             if np.any(in_bounds):
@@ -1123,6 +1128,9 @@ def write_dataset(
             "intersection_policy": intersection_policy,
             "intensity_model": "first-hit per (azimuth,elevation) ray, collapsed to front envelope per azimuth",
             "normalization": "img_float deposits elevation hit fraction at the nearest range bin(s)",
+            "azimuth_sample_offset": 0.5,
+            "range_deposition_offset": 0.0,
+            "range_deposition": "front envelope; row=(range-origin)*H/span; linear floor/ceil; no -0.5",
         },
         "noise_model": {
             "enabled": bool(variant_is_noisy(args.variant)),

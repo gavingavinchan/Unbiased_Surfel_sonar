@@ -558,3 +558,14 @@ Numerical follow-up: tied eigenvalues after covariance clipping caused NaN gradi
 in both original and geometry-corrected renders. A value-equivalent closed-form
 2x2 spectral clamp resolves this independently of geometry. Matched comparisons
 apply it to both variants; failures and original conditioning remain reproducible.
+
+## 2026-10-09 — 019 native convention gate repair (gpt-6-astra)
+
+- Unified CLI/debug grid origin/span/offset and camera-versus-sonar pose routing.
+- Repaired generator transposed pose composition; preserved archived benchmarks.
+- Defined a fixed closed angular boundary lattice and physical border-cell support.
+- Retained float64 source poses for floor-bin decisions; preserved float32 rendering
+  and the 003 covariance-gradient fix. Added the measured archived floor-edge fixture.
+- Repaired AST contract dependency extraction and adopted the exact 018 strict CPU CI.
+- Validation is numerical only; no training, mesh claim, merge or peer approval.
+  Detailed policy: `docs/SONAR_NATIVE_CONVENTION_GATE.md`.

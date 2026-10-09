@@ -65,7 +65,7 @@ class _DummyPointCloud:
 
 
 def _identity_world_to_view(*args, **kwargs):
-    return torch.eye(4, dtype=torch.float32)
+    return torch.eye(4, dtype=kwargs.get("dtype", torch.float32))
 
 
 def _fake_ranges_to_points(viewpoint_camera, range_image, sonar_config, scale_factor, sonar_extrinsic=None):

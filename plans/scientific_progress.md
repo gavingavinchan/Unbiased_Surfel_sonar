@@ -1013,3 +1013,16 @@ slope at ties, avoiding eigenvector differentiation and the large cuSOLVER batch
 Tests compare its values to the original eigh implementation and check finite
 isotropic backward/gradcheck. The harness applies this same numerical helper to
 before and after variants, retaining original failed trajectories separately.
+
+## 2026-10-09 — numerical convention gate 019
+
+`r=o+(row+d)L/H`, `theta=A/2-(col+d)A/W`; archive o=.2,L=2.8,d=0;
+PVC o=0,L=3,d=.5. Already-sonar poses apply no mount; camera poses use
+`S_sonar=S_camera_metric @ E.T`. Generator build/extract now both transpose R.
+Angular membership is closed nearest-even signed-clearance ticks at 2^-19 rad;
+coordinates are not rounded. This explicitly includes the unresolved half-tick
+boundary cell; nearby values beyond it remain outside. Physical border cells
+include col=-.5 at +60 degrees for centre grids. Source pose precision is retained
+for discrete floor decisions (a measured row 73.000001 was formerly 72.999992).
+Strict native adapter/image, endpoint, normal/tangent and negative-fixture checks
+are separate from reconstruction evidence. No optimizer steps are part of 019.

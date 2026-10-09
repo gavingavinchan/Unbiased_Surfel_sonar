@@ -180,6 +180,7 @@ def _transform_world_points_to_sonar_frame(points_world, viewpoint_camera, scale
         viewpoint_camera,
         scale_factor=scale_factor,
         sonar_extrinsic=sonar_extrinsic,
+        dtype=points_world.dtype,
     )
     R_w2v = w2v[:3, :3]
     t_w2v = w2v[3, :3]
@@ -200,11 +201,15 @@ def sonar_project_points(points_world, viewpoint_camera, sonar_config, scale_fac
     Returns SonarProjection with explicit validity fields:
       - in_fov: azimuth/elevation/range constraints
       - in_front: forward > 0
-      - in_bounds: pixel bounds check
+      - in_bounds: physical grid support, including border cells
       - valid: in_fov & in_front & in_bounds
     """
+    from utils.sonar_utils import resolve_sonar_extrinsic, sonar_aperture_masks
+    sonar_extrinsic = resolve_sonar_extrinsic(sonar_config, sonar_extrinsic)
     points_sonar, _ = _transform_world_points_to_sonar_frame(
-        points_world,
+        # Quantized return-bin checks are discontinuous at integer rows. Use
+        # preserved source poses and double arithmetic, not a widened bin gate.
+        points_world.to(torch.float64),
         viewpoint_camera,
         scale_factor=scale_factor,
         sonar_extrinsic=sonar_extrinsic,
@@ -219,12 +224,9 @@ def sonar_project_points(points_world, viewpoint_camera, sonar_config, scale_fac
     horiz_dist = torch.sqrt(right**2 + forward**2)
     elevation = torch.atan2(down, horiz_dist.clamp_min(1e-8))
 
-    in_fov = (
-        (torch.abs(azimuth) <= sonar_config.half_azimuth_rad)
-        & (torch.abs(elevation) <= sonar_config.half_elevation_rad)
-        & (range_vals >= sonar_config.range_min)
-        & (range_vals <= sonar_config.range_max)
-    )
+    in_azimuth, in_elevation = sonar_aperture_masks(
+        azimuth, elevation, sonar_config.half_azimuth_rad, sonar_config.half_elevation_rad)
+    in_fov = in_azimuth & in_elevation & (range_vals >= sonar_config.range_min) & (range_vals <= sonar_config.range_max)
     in_front = forward > 0
 
     H = viewpoint_camera.image_height
@@ -232,7 +234,10 @@ def sonar_project_points(points_world, viewpoint_camera, sonar_config, scale_fac
     offset = getattr(sonar_config, "pixel_center_offset", 0.5)
     col = (-azimuth / sonar_config.half_azimuth_rad + 1) * (W / 2) - offset
     row = (range_vals - sonar_config.range_min) / (sonar_config.range_max - sonar_config.range_min) * H - offset
-    in_bounds = (col >= 0) & (col <= W - 1) & (row >= 0) & (row <= H - 1)
+    # Pixel centres are sample locations, not the physical support boundary.
+    # At +60deg a centre grid gives col=-0.5; it belongs to the border cell.
+    # Rendering clamps coordinates to the border sample after membership.
+    in_bounds = in_azimuth & (range_vals >= sonar_config.range_min) & (range_vals <= sonar_config.range_max)
     valid = in_fov & in_front & in_bounds
 
     return SonarProjection(
@@ -486,9 +491,10 @@ def _project_points_to_sonar_batch(points_3d, sonar_config):
 
     in_front = z > 0
     in_range = (range_vals >= range_min) & (range_vals <= range_max)
-    in_azimuth = torch.abs(azimuth) <= half_az
-    in_elevation = torch.abs(elevation) <= half_el
-    in_bounds = (col >= 0) & (col <= (width - 1.0)) & (row >= 0) & (row <= (height - 1.0))
+    from utils.sonar_utils import sonar_aperture_masks
+    in_azimuth, in_elevation = sonar_aperture_masks(
+        azimuth, elevation, cfg["half_azimuth_rad"], cfg["half_elevation_rad"])
+    in_bounds = in_range & in_azimuth
     valid = in_front & in_range & in_azimuth & in_elevation & in_bounds
 
     return {
@@ -1181,6 +1187,8 @@ def render_sonar(
         - visibility_filter: Boolean mask of visible surfels
         - viewspace_points: Screen-space point positions for gradients
     """
+    from utils.sonar_utils import resolve_sonar_extrinsic, sonar_aperture_masks
+    sonar_extrinsic = resolve_sonar_extrinsic(sonar_config, sonar_extrinsic)
     device = pc.get_xyz.device
     runtime_contract = resolve_sonar_render_contract()
 
@@ -1221,16 +1229,16 @@ def render_sonar(
         scale_factor=scale_factor,
         sonar_extrinsic=sonar_extrinsic,
     )
-    azimuth = projection.azimuth
-    range_vals = projection.range_vals
+    azimuth = projection.azimuth.to(means3D.dtype)
+    range_vals = projection.range_vals.to(means3D.dtype)
     horiz_dist = torch.sqrt(right * right + forward * forward)
     elevation = torch.atan2(down, horiz_dist.clamp_min(1e-8))
     in_fov = projection.valid
 
     H = viewpoint_camera.image_height
     W = viewpoint_camera.image_width
-    col = torch.clamp(projection.col, 0, W - 1)
-    row = torch.clamp(projection.row, 0, H - 1)
+    col = torch.clamp(projection.col, 0, W - 1).to(means3D.dtype)
+    row = torch.clamp(projection.row, 0, H - 1).to(means3D.dtype)
 
     footprint_config = type(
         "SonarRuntimeConfig",

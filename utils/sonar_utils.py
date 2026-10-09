@@ -41,7 +41,7 @@ def sonar_polar_to_points(azimuth: torch.Tensor, elevation: torch.Tensor, range_
     return torch.stack([x, y, z], dim=-1)
 
 
-def get_scaled_world_to_view_transform(viewpoint_camera, scale_factor=None, sonar_extrinsic=None) -> torch.Tensor:
+def get_scaled_world_to_view_transform(viewpoint_camera, scale_factor=None, sonar_extrinsic=None, *, dtype=None) -> torch.Tensor:
     """
     Build S = conventional W2C.T, for homogeneous row-vector multiplication.
 
@@ -54,7 +54,10 @@ def get_scaled_world_to_view_transform(viewpoint_camera, scale_factor=None, sona
       - translation in [3, :3]
       - first three entries of [:3, 3] expected to be 0
     """
-    w2v = viewpoint_camera.world_view_transform.clone()
+    source = viewpoint_camera.world_view_transform
+    if dtype == torch.float64:
+        source = getattr(viewpoint_camera, "world_view_transform_precise", source)
+    w2v = source.clone() if dtype is None else source.to(dtype=dtype).clone()
     if scale_factor is not None:
         w2v[3, :3] = scale_factor.scale * w2v[3, :3]
     if sonar_extrinsic is not None:
@@ -127,6 +130,7 @@ def back_project_bins(
         range_pk.reshape(-1),
     )
 
+    sonar_extrinsic = resolve_sonar_extrinsic(sonar_config, sonar_extrinsic)
     w2v = get_scaled_world_to_view_transform(camera, scale_factor=scale_factor, sonar_extrinsic=sonar_extrinsic)
     points_world = view_points_to_world(points_view, w2v, scale_factor=scale_factor)
     return points_world.reshape(P, K, 3)
@@ -303,6 +307,17 @@ class SonarScaleFactor(nn.Module):
         return 0.0
 
 
+APERTURE_QUANTUM_RAD = 2.0 ** -19
+
+
+def sonar_aperture_masks(azimuth, elevation, half_azimuth, half_elevation):
+    """Closed angular boundary on a fixed signed-clearance lattice (radians)."""
+    def closed_boundary(angle, half):
+        clearance = float(half) - torch.abs(angle).to(torch.float64)
+        return torch.round(clearance / APERTURE_QUANTUM_RAD) >= 0
+    return closed_boundary(azimuth, half_azimuth), closed_boundary(elevation, half_elevation)
+
+
 class SonarConfig:
     """
     Configuration class for sonar parameters.
@@ -320,7 +335,25 @@ class SonarConfig:
         intensity_threshold: float = 0.01,
         device: str = "cuda",
         pixel_center_offset: float = 0.5,
+        range_origin=None,
+        range_span=None,
+        pose_mode=None,
     ):
+        # range_min/max remain aliases for callers using the original API.
+        if range_origin is not None:
+            range_min = float(range_origin)
+        if range_span is not None:
+            range_max = range_min + float(range_span)
+        if not (math.isfinite(range_min) and math.isfinite(range_max) and range_max > range_min):
+            raise ValueError("Sonar range origin/span must define a finite positive span")
+        if pixel_center_offset not in (0.0, 0.5):
+            raise ValueError("pixel_center_offset must be 0 (archive edges) or 0.5 (centres)")
+        if pose_mode not in (None, "poses_are_camera", "poses_are_sonar"):
+            raise ValueError("pose_mode must be poses_are_camera or poses_are_sonar")
+        self.range_origin = range_min
+        self.range_span = range_max - range_min
+        self.pose_mode = pose_mode
+        self.sonar_extrinsic = SonarExtrinsic(device=device) if pose_mode == "poses_are_camera" else None
         self.image_width = image_width
         self.image_height = image_height
         self.azimuth_fov = azimuth_fov
@@ -400,44 +433,71 @@ class SonarConfig:
         row = (range_val - self.range_min) / (self.range_max - self.range_min) * H - self.pixel_center_offset
         return col, row
     
-    def is_in_fov(self, azimuth: torch.Tensor, elevation: torch.Tensor, range_val: torch.Tensor):
-        """
-        Check if points are within sonar field of view.
-        
-        Args:
-            azimuth: Azimuth angles in radians
-            elevation: Elevation angles in radians
-            range_val: Range values in meters
-            
-        Returns:
-            Boolean mask of valid points
-        """
-        valid_azimuth = torch.abs(azimuth) <= self.half_azimuth_rad
-        valid_elevation = torch.abs(elevation) <= self.half_elevation_rad
+    # Membership uses a fixed angular lattice, independent of dtype and dataset.
+    # Signed clearance is rounded to nearest-even ticks; tick zero is the CLOSED
+    # boundary. This resolves float32 transform/atan2 noise on nominal endpoints.
+    # Raw angles/pixels are never rounded: this policy changes only membership.
+    aperture_quantum_rad = APERTURE_QUANTUM_RAD
+
+    def aperture_masks(self, azimuth, elevation):
+        return sonar_aperture_masks(azimuth, elevation, self.half_azimuth_rad, self.half_elevation_rad)
+
+    def is_in_fov(self, azimuth, elevation, range_val):
+        """Closed quantized angular aperture, closed metric range interval."""
+        valid_azimuth, valid_elevation = self.aperture_masks(azimuth, elevation)
         valid_range = (range_val >= self.range_min) & (range_val <= self.range_max)
         return valid_azimuth & valid_elevation & valid_range
 
 
-def build_sonar_config(args) -> SonarConfig:
+def resolve_sonar_extrinsic(sonar_config, sonar_extrinsic=None):
+    """Route pose mode once at every geometry entry point.
+
+    Low-level legacy configs (pose_mode=None) retain explicit-extrinsic behavior.
+    Native entry points always select a mode. Already-sonar poses forbid a mount.
     """
-    Build SonarConfig from command-line arguments.
-    
-    Args:
-        args: Parsed arguments containing sonar parameters
-        
-    Returns:
-        SonarConfig instance
-    """
+    mode = getattr(sonar_config, "pose_mode", None)
+    if mode == "poses_are_sonar":
+        if sonar_extrinsic is not None:
+            raise ValueError("Already-sonar poses must not receive a camera mount")
+        return None
+    if mode == "poses_are_camera" and sonar_extrinsic is None:
+        return sonar_config.sonar_extrinsic
+    return sonar_extrinsic
+
+
+def build_sonar_config(args, *, image_width=256, image_height=200, device="cuda") -> SonarConfig:
+    """Shared native CLI/debug factory. Explicit origin/span override old min/max aliases."""
+    origin = getattr(args, "sonar_range_origin", float("nan"))
+    span = getattr(args, "sonar_range_span", float("nan"))
+    if origin is None or math.isnan(origin):
+        origin = getattr(args, "sonar_range_min", 0.2)
+    if span is None or math.isnan(span):
+        span = getattr(args, "sonar_range_max", 3.0) - origin
     return SonarConfig(
-        image_width=256,   # Sonoptix Echo default
-        image_height=200,  # Sonoptix Echo default
+        image_width=image_width, image_height=image_height,
         azimuth_fov=args.sonar_azimuth_fov,
         elevation_fov=args.sonar_elevation_fov,
-        range_min=args.sonar_range_min,
-        range_max=args.sonar_range_max,
+        range_origin=origin, range_span=span,
+        pixel_center_offset=getattr(args, "sonar_pixel_center_offset", 0.5),
+        pose_mode=getattr(args, "sonar_pose_mode", "poses_are_sonar"),
         intensity_threshold=args.sonar_intensity_threshold,
-        device="cuda"
+        device=device,
     )
+
+
+def build_debug_sonar_config(environ, *, image_width=256, image_height=200, device="cuda"):
+    """Debug environment uses precisely the same routing as train.py."""
+    from types import SimpleNamespace
+    args = SimpleNamespace(
+        sonar_azimuth_fov=float(environ.get("SONAR_AZIMUTH_FOV", "120")),
+        sonar_elevation_fov=float(environ.get("SONAR_ELEVATION_FOV", "20")),
+        sonar_range_origin=float(environ.get("SONAR_RANGE_ORIGIN", "0.2")),
+        sonar_range_span=float(environ.get("SONAR_RANGE_SPAN", "2.8")),
+        sonar_pixel_center_offset=float(environ.get("SONAR_PIXEL_CENTER_OFFSET", "0.5")),
+        sonar_pose_mode=environ.get("SONAR_POSE_MODE", "poses_are_sonar"),
+        sonar_intensity_threshold=0.01,
+    )
+    return build_sonar_config(args, image_width=image_width, image_height=image_height, device=device)
 
 
 # =============================================================================
@@ -675,6 +735,7 @@ def sonar_frame_to_points(
     points_cam_metric = np.stack([x_cam, y_cam, z_cam], axis=1)  # [N, 3] metric
     
     # Use the actual stored camera transform (includes Camera scene offsets).
+    sonar_extrinsic = resolve_sonar_extrinsic(sonar_config, sonar_extrinsic)
     w2v = get_scaled_world_to_view_transform(
         camera, scale_factor=type("Scale", (), {"scale": scale_factor})(),
         sonar_extrinsic=sonar_extrinsic,

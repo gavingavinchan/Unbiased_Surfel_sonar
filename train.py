@@ -65,7 +65,7 @@ def training(dataset: ModelParams,
         print("Sonar mode enabled - initializing sonar scale factor and config")
         sonar_config = build_sonar_config(dataset)
         sonar_scale_factor = SonarScaleFactor(init_value=dataset.sonar_scale_init).cuda()
-        sonar_extrinsic = SonarExtrinsic(device="cuda")
+        sonar_extrinsic = sonar_config.sonar_extrinsic
         sonar_optimizer = torch.optim.Adam(
             sonar_scale_factor.parameters(), 
             lr=dataset.sonar_scale_lr
@@ -81,7 +81,7 @@ def training(dataset: ModelParams,
         print(f"  Initial scale factor: {sonar_scale_factor.get_scale_value():.4f}")
         # print(f"  log_scale param: {sonar_scale_factor._log_scale.item():.4f}")
         print(f"  Scale factor learning rate: {dataset.sonar_scale_lr}")
-        print(f"  Camera-to-sonar extrinsic: 10cm offset, 5deg pitch down")
+        print(f"  Pose mode: {sonar_config.pose_mode}; grid: origin={sonar_config.range_origin}, span={sonar_config.range_span}, offset={sonar_config.pixel_center_offset}")
 
     iter_start = torch.cuda.Event(enable_timing = True)
     iter_end = torch.cuda.Event(enable_timing = True)

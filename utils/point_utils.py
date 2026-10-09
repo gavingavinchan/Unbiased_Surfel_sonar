@@ -139,7 +139,8 @@ def sonar_ranges_to_points(view, range_image, sonar_config, scale_factor=None, e
     # Stack to get points in sonar frame [H, W, 3]
     points_sonar = torch.stack([x_s, y_s, z_s], dim=-1)
     
-    from utils.sonar_utils import get_scaled_world_to_view_transform, view_points_to_world
+    from utils.sonar_utils import get_scaled_world_to_view_transform, view_points_to_world, resolve_sonar_extrinsic
+    sonar_extrinsic = resolve_sonar_extrinsic(sonar_config, sonar_extrinsic)
     w2v = get_scaled_world_to_view_transform(view, scale_factor, sonar_extrinsic)
     points_world = view_points_to_world(points_sonar.reshape(-1, 3), w2v, scale_factor).reshape(H, W, 3)
 

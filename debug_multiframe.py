@@ -45,7 +45,7 @@ from argparse import Namespace
 from scene import Scene, GaussianModel
 from scene.dataset_readers import readColmapCameras, readColmapSceneInfo, getNerfppNorm
 from gaussian_renderer import render_sonar, render, quaternion_to_normal, sonar_project_points
-from utils.sonar_utils import (SonarConfig, SonarScaleFactor, SonarExtrinsic,
+from utils.sonar_utils import (build_debug_sonar_config, SonarConfig, SonarScaleFactor, SonarExtrinsic,
                                   sonar_frame_to_points, sonar_frames_to_point_cloud,
                                   back_project_bins,
                                   SONAR_CAMERA_FRAME_CONVENTION, SONAR_IMAGE_CONVENTION,
@@ -158,6 +158,8 @@ def is_in_sonar_fov(xyz, camera, sonar_config, scale_factor, return_details=Fals
         return empty
 
     from gaussian_renderer import _transform_world_points_to_sonar_frame
+    from utils.sonar_utils import resolve_sonar_extrinsic
+    sonar_extrinsic = resolve_sonar_extrinsic(sonar_config, sonar_extrinsic)
     points_sonar, _ = _transform_world_points_to_sonar_frame(xyz, camera, scale_factor, sonar_extrinsic)
 
     # Camera/sonar frame: +X = right, +Y = down, +Z = forward
@@ -180,8 +182,7 @@ def is_in_sonar_fov(xyz, camera, sonar_config, scale_factor, return_details=Fals
     half_az_rad = math.radians(sonar_config.azimuth_fov / 2)
     half_el_rad = math.radians(sonar_config.elevation_fov / 2)
 
-    in_azimuth = torch.abs(azimuth) <= half_az_rad
-    in_elevation = torch.abs(elevation) <= half_el_rad
+    in_azimuth, in_elevation = sonar_config.aperture_masks(azimuth, elevation)
     in_range = (range_vals >= sonar_config.range_min) & (range_vals <= sonar_config.range_max)
     in_front = forward > 0  # Must be in front of sonar
 
@@ -256,6 +257,8 @@ def is_fully_in_sonar_fov(xyz, scaling, camera, sonar_config, scale_factor, sona
         return torch.zeros(0, dtype=torch.bool, device=xyz.device)
 
     from gaussian_renderer import _transform_world_points_to_sonar_frame
+    from utils.sonar_utils import resolve_sonar_extrinsic
+    sonar_extrinsic = resolve_sonar_extrinsic(sonar_config, sonar_extrinsic)
     points_sonar, _ = _transform_world_points_to_sonar_frame(xyz, camera, scale_factor, sonar_extrinsic)
     scale = scale_factor.scale if scale_factor is not None else 1.0
 
@@ -272,8 +275,7 @@ def is_fully_in_sonar_fov(xyz, scaling, camera, sonar_config, scale_factor, sona
     half_az_rad = math.radians(sonar_config.azimuth_fov / 2)
     half_el_rad = math.radians(sonar_config.elevation_fov / 2)
 
-    in_azimuth = torch.abs(azimuth) <= half_az_rad
-    in_elevation = torch.abs(elevation) <= half_el_rad
+    in_azimuth, in_elevation = sonar_config.aperture_masks(azimuth, elevation)
     in_range = (range_vals >= sonar_config.range_min) & (range_vals <= sonar_config.range_max)
     in_front = forward > 0
     center_in_fov = in_azimuth & in_elevation & in_range & in_front
@@ -3443,8 +3445,13 @@ def export_frame_visualizer_artifacts(
     for frame_idx, cam in enumerate(training_frames):
         stem = build_frame_stem(frame_idx, cam.image_name, width=frame_width)
         color = colors[frame_idx % len(colors)]
-        r_c2w = np.asarray(cam.R, dtype=np.float64)
-        position = -r_c2w @ cam.T
+        from utils.sonar_utils import get_scaled_world_to_view_transform, resolve_sonar_extrinsic
+        stored_sonar = get_scaled_world_to_view_transform(
+            cam, scale_factor, resolve_sonar_extrinsic(sonar_config), dtype=torch.float64
+        ).detach().cpu().numpy()
+        metric_scale = float(scale_factor.scale) if scale_factor is not None else 1.0
+        r_c2w = stored_sonar[:3, :3]
+        position = (-r_c2w @ stored_sonar[3, :3]) / metric_scale
 
         wireframe_near_path = os.path.join(visualizer_dir, f"{stem}_wireframe_near.ply")
         wireframe_full_path = os.path.join(visualizer_dir, f"{stem}_wireframe_full_range.ply")
@@ -3453,7 +3460,7 @@ def export_frame_visualizer_artifacts(
             create_pose_wireframe(
                 position,
                 r_c2w,
-                depth=PYRAMID_DEPTH,
+                depth=PYRAMID_DEPTH / metric_scale,
                 azimuth_fov=sonar_config.azimuth_fov,
                 elevation_fov=sonar_config.elevation_fov,
                 color=color,
@@ -3465,7 +3472,7 @@ def export_frame_visualizer_artifacts(
             create_pose_wireframe(
                 position,
                 r_c2w,
-                depth=sonar_config.range_max,
+                depth=sonar_config.range_max / metric_scale,
                 azimuth_fov=sonar_config.azimuth_fov,
                 elevation_fov=sonar_config.elevation_fov,
                 color=color,
@@ -4801,15 +4808,8 @@ def main():
     print("=" * 60)
 
     # Sonar config (will be updated with actual image size)
-    sonar_config = SonarConfig(
-        image_height=100,
-        image_width=128,
-        azimuth_fov=120.0,
-        elevation_fov=20.0,
-        range_min=0.2,
-        range_max=3.0,
-        intensity_threshold=0.01,
-        device="cuda"
+    sonar_config = build_debug_sonar_config(
+        os.environ, image_height=200, image_width=256, device="cuda"
     )
 
     # Dataset arguments
@@ -4817,7 +4817,7 @@ def main():
         source_path=DATASET_PATH,
         model_path=OUTPUT_DIR,
         images="images",
-        resolution=2,
+        resolution=int(os.environ.get("SONAR_RESOLUTION", "1")),
         white_background=False,
         data_device="cpu",
         eval=False,
@@ -4826,8 +4826,10 @@ def main():
         sonar_images="sonar",
         sonar_azimuth_fov=120.0,
         sonar_elevation_fov=20.0,
-        sonar_range_min=0.2,
-        sonar_range_max=3.0,
+        sonar_range_origin=sonar_config.range_origin,
+        sonar_range_span=sonar_config.range_span,
+        sonar_pixel_center_offset=sonar_config.pixel_center_offset,
+        sonar_pose_mode=sonar_config.pose_mode,
         sonar_intensity_threshold=0.01,
         gamma=2.2,
     )
@@ -4973,15 +4975,8 @@ def main():
 
     # Update sonar config with actual image size
     sample_cam = training_frames[0]
-    sonar_config = SonarConfig(
-        image_height=sample_cam.image_height,
-        image_width=sample_cam.image_width,
-        azimuth_fov=120.0,
-        elevation_fov=20.0,
-        range_min=0.2,
-        range_max=3.0,
-        intensity_threshold=0.01,
-        device="cuda"
+    sonar_config = build_debug_sonar_config(
+        os.environ, image_height=sample_cam.image_height, image_width=sample_cam.image_width, device="cuda"
     )
 
     print(f"\nSonar config:")
