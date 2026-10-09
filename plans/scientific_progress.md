@@ -1027,3 +1027,10 @@ Selection uses no GT, ROI, camera cloud or held-out echo. Source013 initializati
 is transductive, so75validation views cannot establish clean generalization.
 No covariance eigenvector is promoted to a normal; primary surfel meshing remains
 blocked. Point completeness and actual mesh completeness are reported separately.
+
+For causal extraction controls, keep metric pitch fixed at the original opacity
+mesh3.295688mm. Draw ten samples from every original Gaussian before mask selection,
+then use the same Gaussian samples in opacity/all/support3 populations. Original
+query densities and opacity weights remain unchanged. Report seeds42/7, with the
+same100000-point triangle metrics and noGT alignment. The shuffled-image null only
+tests support specificity; it is neither a candidate nor a calibrated noise model.

@@ -35,3 +35,13 @@ ROI bounds are evaluation-only and never passed to these scripts. Gaussian
 covariance axes are not validated surface normals. No Poisson/TSDF route is used.
 See007 RESULTS.md, configs/extraction.json and extraction_comparison.json for
 negative surface results, resolution controls and exact reproducibility.
+
+Additional standalone diagnostics retain the original protocol and separately
+label equal-pitch (`common_pitch.py`), shared per-primitive sample draws
+(`paired_samples.py --seed42/7`), null correspondence (`null_support.py`), density
+stage survival (`density_trace.py`), exact triangle/edge metrics
+(`score_extractions.py`), and no-training filtered rasterization
+(`evaluate_filtered_images.py`). Inputs/outputs are relative to the007 experiment
+working directory. `density_trace.py` asserts exact agreement with retained
+original accepted point sets. Paired controls do not alter the originally
+reproduced013 baseline. None changes support threshold choices usingGT scores.

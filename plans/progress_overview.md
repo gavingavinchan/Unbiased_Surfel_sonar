@@ -568,3 +568,12 @@ fragments, but the selected three-pose mesh is sparse (initial full Chamfer142.3
 completeness2.527%). No validated sonar surface, training permission, native-routing
 fix, Poisson comparison or merge is established. Exact experiment report and
 common-pitch controls live in experiments/007-surfel-supported-surface-extraction.
+
+007 controls now retain equal3.296mm-pitch meshing and shared per-Gaussian random
+samples (seeds42/7), without new thresholds or optimization. A shuffled-intensity
+null accepts81.97% of all means and96.39% of the three-pose selected set: the
+low-count bright support rule lacks specificity. Actual density trace reproduces
+accepted point sets and records primitive survival. Image checks reuse013 cached
+LPIPS weights read-only after an unexpected temporary007 cache exceeded the cap;
+no historical cleanup occurred. Strict CPU checks:196passed/4inherited failures/
+13skipped; remote green masks missing pytest and is not certification.
