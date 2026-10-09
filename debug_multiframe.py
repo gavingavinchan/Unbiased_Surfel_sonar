@@ -689,6 +689,7 @@ def build_stage1_multiview_loglik(
     sonar_config,
     sonar_scale_factor,
     cfg,
+    sonar_extrinsic=None,
 ):
     bank_entry = pixel_bank[str(frame_key)]
     return build_stage1_multiview_loglik_for_pixels(
@@ -705,6 +706,7 @@ def build_stage1_multiview_loglik(
         sonar_config=sonar_config,
         sonar_scale_factor=sonar_scale_factor,
         cfg=cfg,
+        sonar_extrinsic=sonar_extrinsic,
     )
 
 
@@ -723,6 +725,7 @@ def build_stage1_multiview_loglik_for_pixels(
     sonar_config,
     sonar_scale_factor,
     cfg,
+    sonar_extrinsic=None,
 ):
     evidence = build_stage1_multiview_evidence_for_pixels(
         frame_idx=frame_idx,
@@ -738,6 +741,7 @@ def build_stage1_multiview_loglik_for_pixels(
         sonar_config=sonar_config,
         sonar_scale_factor=sonar_scale_factor,
         cfg=cfg,
+        sonar_extrinsic=sonar_extrinsic,
     )
     return evidence["loglik"], evidence["support_mask"]
 
@@ -757,6 +761,7 @@ def build_stage1_multiview_evidence_for_pixels(
     sonar_config,
     sonar_scale_factor,
     cfg,
+    sonar_extrinsic=None,
 ):
     if str(cfg.lik_invalid_mode) != "neutral":
         raise ValueError(f"Unsupported ELEV_LIK_INVALID_MODE: {cfg.lik_invalid_mode}")
@@ -783,6 +788,7 @@ def build_stage1_multiview_evidence_for_pixels(
         cameras=training_frames,
         sonar_config=sonar_config,
         scale_factor=sonar_scale_factor,
+        sonar_extrinsic=sonar_extrinsic,
     )
     pts_flat = pts_bins.reshape(-1, 3)
 
@@ -809,6 +815,7 @@ def build_stage1_multiview_evidence_for_pixels(
             neighbor_cam,
             sonar_config,
             scale_factor=sonar_scale_factor,
+            sonar_extrinsic=sonar_extrinsic,
         )
 
         sampled_i, sampled_valid = sample_gt(
@@ -1129,6 +1136,7 @@ def compute_chunk4_coupling_for_frame(
     p_post_frame,
     elev_angle_bins,
     chunk4_cfg,
+    sonar_extrinsic=None,
 ):
     zero = gaussians.get_xyz.new_tensor(0.0)
     out = {
@@ -1171,6 +1179,7 @@ def compute_chunk4_coupling_for_frame(
         cameras=training_frames,
         sonar_config=sonar_config,
         scale_factor=sonar_scale_factor,
+        sonar_extrinsic=sonar_extrinsic,
     )
     pts_expected = torch.sum(p_post.unsqueeze(-1) * pts_bins, dim=1)
 
@@ -1179,6 +1188,7 @@ def compute_chunk4_coupling_for_frame(
         training_frames[frame_idx],
         sonar_config,
         scale_factor=sonar_scale_factor,
+        sonar_extrinsic=sonar_extrinsic,
     )
 
     visible_mask = render_pkg["visibility_filter"].to(dtype=torch.bool)
@@ -1202,6 +1212,7 @@ def compute_chunk4_coupling_for_frame(
         training_frames[frame_idx],
         sonar_config,
         scale_factor=sonar_scale_factor,
+        sonar_extrinsic=sonar_extrinsic,
     )
 
     surf_idx, assoc_w, match_valid = associate_expected_points_to_surfels(
@@ -2035,6 +2046,7 @@ def compute_chunk4_support_observations_for_frame(
     sonar_config,
     sonar_scale_factor,
     support_residual_thresh,
+    sonar_extrinsic=None,
 ):
     device = gaussians.get_xyz.device
     empty_idx = torch.empty((0,), dtype=torch.long, device=device)
@@ -2063,6 +2075,7 @@ def compute_chunk4_support_observations_for_frame(
         training_frames[frame_idx],
         sonar_config,
         scale_factor=sonar_scale_factor,
+        sonar_extrinsic=sonar_extrinsic,
     )
     valid_proj = proj.valid & torch.isfinite(proj.row) & torch.isfinite(proj.col)
     out["valid_projection_count"] = int(valid_proj.sum().item())

@@ -1013,3 +1013,32 @@ slope at ties, avoiding eigenvector differentiation and the large cuSOLVER batch
 Tests compare its values to the original eigh implementation and check finite
 isotropic backward/gradcheck. The harness applies this same numerical helper to
 before and after variants, retaining original failed trajectories separately.
+
+
+## 2026-10-09 — Experiment 006 diagnostic-only support audit (Codex)
+
+004's convention gate fails and 005 has no selected control. No new training,
+pruning schedule, pose optimization, adoption or extraction checkpoint is claimed.
+Native likelihood/coupling/support helpers now accept an optional metric mount
+and propagate it to both inverse and forward transforms. Defaults remain None
+for sonar-equivalent data. A cloned translation multiplier fixes a demonstrated
+autograd version error when differentiating metric scale; comparisons still
+require frozen scale. The 003 closed-form covariance conditioner is unchanged.
+
+`scripts/audit_elevation_support.py` and CPU regressions separate differentiable
+fixed-association losses from recomputed detached weights (about 0.119 relative
+FD disagreement in a two-match case). They exercise 128 smooth sphere/cube loss
+fixtures, 128 tangent covariance/compositing fixtures and 128 mounted-pose
+equivalence cases. Full rendered-image gradients are not certified. Active
+support is a hard-pruning switch, not an added differentiable loss. Coupling
+detaches posterior/association weights, updates XYZ but not rotations, opacity
+or surfel scales directly, and is ambiguous for equal range/azimuth hypotheses.
+A symmetric +/-8 degree posterior at 2m shortens range by 19.464mm under Cartesian
+averaging. Counts accumulate observations across epochs, not globally unique
+view IDs. These are diagnosis targets, not reasons to silently change objectives.
+
+Reproduce CPU diagnostics with `python scripts/audit_elevation_support.py
+--output /path/to/support_audit.json`. The experiment harness retains read-only
+archive probes, exact source hashes, failed gate and unavailable training cells.
+No source correction here repairs native dataset grid routing, generator camera
+export, or inclusive aperture endpoint errors.
