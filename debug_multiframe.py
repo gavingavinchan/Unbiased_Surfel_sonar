@@ -21,6 +21,8 @@ Outputs:
 - mesh_poisson_after_stage3.ply: Poisson mesh after Stage 3
 - mesh_poisson_after_iter1.ply: Poisson mesh after iter 1
 - comparison_<stage>_<idx>_<image>.png: GT vs rendered for each training frame
+- surf_depth_<stage>_<idx>_<image>.png: Macro-surface depth heatmap per training frame
+- surf_normal_<stage>_<idx>_<image>.png: Macro-surface normal RGB map per training frame
 """
 
 import os
@@ -43,7 +45,7 @@ from argparse import Namespace
 from scene import Scene, GaussianModel
 from scene.dataset_readers import readColmapCameras, readColmapSceneInfo, getNerfppNorm
 from gaussian_renderer import render_sonar, render, quaternion_to_normal, sonar_project_points
-from utils.sonar_utils import (SonarConfig, SonarScaleFactor, SonarExtrinsic,
+from utils.sonar_utils import (build_debug_sonar_config, SonarConfig, SonarScaleFactor, SonarExtrinsic,
                                   sonar_frame_to_points, sonar_frames_to_point_cloud,
                                   back_project_bins,
                                   SONAR_CAMERA_FRAME_CONVENTION, SONAR_IMAGE_CONVENTION,
@@ -130,7 +132,7 @@ import open3d as o3d
 from PIL import Image
 
 
-def is_in_sonar_fov(xyz, camera, sonar_config, scale_factor, return_details=False):
+def is_in_sonar_fov(xyz, camera, sonar_config, scale_factor, return_details=False, sonar_extrinsic=None):
     """
     Check if 3D points are within the sonar FOV of a given camera.
 
@@ -155,21 +157,10 @@ def is_in_sonar_fov(xyz, camera, sonar_config, scale_factor, return_details=Fals
                     "in_range": empty, "in_front": empty}
         return empty
 
-    # Match render_sonar's transform EXACTLY
-    w2v = camera.world_view_transform.cuda()  # [4, 4]
-
-    # Extract R and t (translation is in row 3, not column 3!)
-    R_w2v = w2v[:3, :3]
-    t_w2v = w2v[3, :3]
-
-    # Apply scale factor to translation and points
-    scale = scale_factor.scale if scale_factor is not None else 1.0
-    xyz_scaled = xyz * scale
-    t_w2v_scaled = scale * t_w2v
-
-    # Transform points to sonar frame: p_sonar = p_world_scaled @ R.T + t_scaled
-    # This matches render_sonar exactly
-    points_sonar = (xyz_scaled @ R_w2v.T) + t_w2v_scaled  # [N, 3]
+    from gaussian_renderer import _transform_world_points_to_sonar_frame
+    from utils.sonar_utils import resolve_sonar_extrinsic
+    sonar_extrinsic = resolve_sonar_extrinsic(sonar_config, sonar_extrinsic)
+    points_sonar, _ = _transform_world_points_to_sonar_frame(xyz, camera, scale_factor, sonar_extrinsic)
 
     # Camera/sonar frame: +X = right, +Y = down, +Z = forward
     right = points_sonar[:, 0]
@@ -191,8 +182,7 @@ def is_in_sonar_fov(xyz, camera, sonar_config, scale_factor, return_details=Fals
     half_az_rad = math.radians(sonar_config.azimuth_fov / 2)
     half_el_rad = math.radians(sonar_config.elevation_fov / 2)
 
-    in_azimuth = torch.abs(azimuth) <= half_az_rad
-    in_elevation = torch.abs(elevation) <= half_el_rad
+    in_azimuth, in_elevation = sonar_config.aperture_masks(azimuth, elevation)
     in_range = (range_vals >= sonar_config.range_min) & (range_vals <= sonar_config.range_max)
     in_front = forward > 0  # Must be in front of sonar
 
@@ -244,7 +234,7 @@ def compute_fov_margin_debug(range_vals, azimuth, elevation, sonar_config):
     return margin
 
 
-def is_fully_in_sonar_fov(xyz, scaling, camera, sonar_config, scale_factor):
+def is_fully_in_sonar_fov(xyz, scaling, camera, sonar_config, scale_factor, sonar_extrinsic=None):
     """
     Check if surfels (center + size extent) are fully within the sonar FOV.
 
@@ -266,16 +256,11 @@ def is_fully_in_sonar_fov(xyz, scaling, camera, sonar_config, scale_factor):
     if N == 0:
         return torch.zeros(0, dtype=torch.bool, device=xyz.device)
 
-    # Transform points to sonar frame (same as is_in_sonar_fov)
-    w2v = camera.world_view_transform.cuda()
-
-    R_w2v = w2v[:3, :3]
-    t_w2v = w2v[3, :3]
+    from gaussian_renderer import _transform_world_points_to_sonar_frame
+    from utils.sonar_utils import resolve_sonar_extrinsic
+    sonar_extrinsic = resolve_sonar_extrinsic(sonar_config, sonar_extrinsic)
+    points_sonar, _ = _transform_world_points_to_sonar_frame(xyz, camera, scale_factor, sonar_extrinsic)
     scale = scale_factor.scale if scale_factor is not None else 1.0
-    xyz_scaled = xyz * scale
-    t_w2v_scaled = scale * t_w2v
-    points_sonar = (xyz_scaled @ R_w2v.T) + t_w2v_scaled
-
 
     right = points_sonar[:, 0]
     down = points_sonar[:, 1]
@@ -290,14 +275,13 @@ def is_fully_in_sonar_fov(xyz, scaling, camera, sonar_config, scale_factor):
     half_az_rad = math.radians(sonar_config.azimuth_fov / 2)
     half_el_rad = math.radians(sonar_config.elevation_fov / 2)
 
-    in_azimuth = torch.abs(azimuth) <= half_az_rad
-    in_elevation = torch.abs(elevation) <= half_el_rad
+    in_azimuth, in_elevation = sonar_config.aperture_masks(azimuth, elevation)
     in_range = (range_vals >= sonar_config.range_min) & (range_vals <= sonar_config.range_max)
     in_front = forward > 0
     center_in_fov = in_azimuth & in_elevation & in_range & in_front
 
     # Size-aware check: margin must exceed surfel radius
-    surfel_radius = scaling.max(dim=1).values  # [N]
+    surfel_radius = scaling.max(dim=1).values * scale  # [N], metres
     margin = compute_fov_margin_debug(range_vals, azimuth, elevation, sonar_config)
 
     fully_inside = center_in_fov & (margin > surfel_radius)
@@ -410,6 +394,45 @@ def brighten_image(img_np, percentile=99, gamma=0.5):
     img_bright = np.power(img_norm, gamma)
     img_bright = np.clip(img_bright * 255, 0, 255).astype(np.uint8)
     return img_bright
+
+
+def colorize_surf_depth_image(surf_depth_np):
+    depth = np.asarray(surf_depth_np, dtype=np.float32)
+    valid = np.isfinite(depth) & (depth > 0.0)
+    color = np.zeros(depth.shape + (3,), dtype=np.uint8)
+    if not np.any(valid):
+        return color
+
+    finite_depth = depth[valid]
+    depth_lo = float(np.min(finite_depth))
+    depth_hi = float(np.max(finite_depth))
+    if depth_hi <= depth_lo + 1e-8:
+        depth_norm = np.zeros_like(depth, dtype=np.float32)
+    else:
+        depth_norm = np.clip((depth - depth_lo) / (depth_hi - depth_lo), 0.0, 1.0)
+
+    depth_rgb = plt.get_cmap("viridis")(depth_norm)[..., :3]
+    color[valid] = np.clip(depth_rgb[valid] * 255.0, 0.0, 255.0).astype(np.uint8)
+    return color
+
+
+def colorize_surf_normal_image(surf_normal_np):
+    normal = np.asarray(surf_normal_np, dtype=np.float32)
+    if normal.ndim != 3 or normal.shape[0] != 3:
+        raise ValueError("surf_normal image must have shape [3, H, W]")
+
+    normal_hwc = np.moveaxis(normal, 0, -1)
+    normal_norm = np.linalg.norm(normal_hwc, axis=-1)
+    valid = np.isfinite(normal_hwc).all(axis=-1) & (normal_norm > 1e-8)
+    color = np.zeros(normal_hwc.shape, dtype=np.uint8)
+    if not np.any(valid):
+        return color
+
+    normal_unit = np.zeros_like(normal_hwc, dtype=np.float32)
+    normal_unit[valid] = normal_hwc[valid] / normal_norm[valid, None]
+    color_float = (normal_unit * 0.5) + 0.5
+    color[valid] = np.clip(color_float[valid] * 255.0, 0.0, 255.0).astype(np.uint8)
+    return color
 
 
 # Intensity threshold: pixels below this value (0-255 scale) are treated as black
@@ -2963,6 +2986,20 @@ def save_comparison_images(training_frames, gaussians, background, sonar_config,
         filename = f"comparison_{stage_name}_{stem}.png"
         Image.fromarray(comparison_bright, mode='L').save(os.path.join(output_dir, filename))
 
+        surf_depth = render_pkg.get("surf_depth")
+        if surf_depth is not None:
+            surf_depth_np = surf_depth[0].detach().cpu().numpy()
+            surf_depth_rgb = colorize_surf_depth_image(surf_depth_np)
+            surf_depth_filename = f"surf_depth_{stage_name}_{stem}.png"
+            Image.fromarray(surf_depth_rgb, mode="RGB").save(os.path.join(output_dir, surf_depth_filename))
+
+        surf_normal = render_pkg.get("surf_normal")
+        if surf_normal is not None:
+            surf_normal_np = surf_normal.detach().cpu().numpy()
+            surf_normal_rgb = colorize_surf_normal_image(surf_normal_np)
+            surf_normal_filename = f"surf_normal_{stage_name}_{stem}.png"
+            Image.fromarray(surf_normal_rgb, mode="RGB").save(os.path.join(output_dir, surf_normal_filename))
+
     print(f"  Saved comparison images for {stage_name}")
 
 
@@ -3408,8 +3445,13 @@ def export_frame_visualizer_artifacts(
     for frame_idx, cam in enumerate(training_frames):
         stem = build_frame_stem(frame_idx, cam.image_name, width=frame_width)
         color = colors[frame_idx % len(colors)]
-        r_c2w = np.asarray(cam.R, dtype=np.float64)
-        position = -r_c2w @ cam.T
+        from utils.sonar_utils import get_scaled_world_to_view_transform, resolve_sonar_extrinsic
+        stored_sonar = get_scaled_world_to_view_transform(
+            cam, scale_factor, resolve_sonar_extrinsic(sonar_config), dtype=torch.float64
+        ).detach().cpu().numpy()
+        metric_scale = float(scale_factor.scale) if scale_factor is not None else 1.0
+        r_c2w = stored_sonar[:3, :3]
+        position = (-r_c2w @ stored_sonar[3, :3]) / metric_scale
 
         wireframe_near_path = os.path.join(visualizer_dir, f"{stem}_wireframe_near.ply")
         wireframe_full_path = os.path.join(visualizer_dir, f"{stem}_wireframe_full_range.ply")
@@ -3418,7 +3460,7 @@ def export_frame_visualizer_artifacts(
             create_pose_wireframe(
                 position,
                 r_c2w,
-                depth=PYRAMID_DEPTH,
+                depth=PYRAMID_DEPTH / metric_scale,
                 azimuth_fov=sonar_config.azimuth_fov,
                 elevation_fov=sonar_config.elevation_fov,
                 color=color,
@@ -3430,7 +3472,7 @@ def export_frame_visualizer_artifacts(
             create_pose_wireframe(
                 position,
                 r_c2w,
-                depth=sonar_config.range_max,
+                depth=sonar_config.range_max / metric_scale,
                 azimuth_fov=sonar_config.azimuth_fov,
                 elevation_fov=sonar_config.elevation_fov,
                 color=color,
@@ -4766,15 +4808,8 @@ def main():
     print("=" * 60)
 
     # Sonar config (will be updated with actual image size)
-    sonar_config = SonarConfig(
-        image_height=100,
-        image_width=128,
-        azimuth_fov=120.0,
-        elevation_fov=20.0,
-        range_min=0.2,
-        range_max=3.0,
-        intensity_threshold=0.01,
-        device="cuda"
+    sonar_config = build_debug_sonar_config(
+        os.environ, image_height=200, image_width=256, device="cuda"
     )
 
     # Dataset arguments
@@ -4782,7 +4817,7 @@ def main():
         source_path=DATASET_PATH,
         model_path=OUTPUT_DIR,
         images="images",
-        resolution=2,
+        resolution=int(os.environ.get("SONAR_RESOLUTION", "1")),
         white_background=False,
         data_device="cpu",
         eval=False,
@@ -4791,8 +4826,10 @@ def main():
         sonar_images="sonar",
         sonar_azimuth_fov=120.0,
         sonar_elevation_fov=20.0,
-        sonar_range_min=0.2,
-        sonar_range_max=3.0,
+        sonar_range_origin=sonar_config.range_origin,
+        sonar_range_span=sonar_config.range_span,
+        sonar_pixel_center_offset=sonar_config.pixel_center_offset,
+        sonar_pose_mode=sonar_config.pose_mode,
         sonar_intensity_threshold=0.01,
         gamma=2.2,
     )
@@ -4938,15 +4975,8 @@ def main():
 
     # Update sonar config with actual image size
     sample_cam = training_frames[0]
-    sonar_config = SonarConfig(
-        image_height=sample_cam.image_height,
-        image_width=sample_cam.image_width,
-        azimuth_fov=120.0,
-        elevation_fov=20.0,
-        range_min=0.2,
-        range_max=3.0,
-        intensity_threshold=0.01,
-        device="cuda"
+    sonar_config = build_debug_sonar_config(
+        os.environ, image_height=sample_cam.image_height, image_width=sample_cam.image_width, device="cuda"
     )
 
     print(f"\nSonar config:")
@@ -7285,6 +7315,8 @@ def main():
     print(f"  - comparison_after_stage2_<idx>_<image>.png    (After surfel learning)")
     print(f"  - comparison_after_stage3_<idx>_<image>.png    (After joint fine-tuning)")
     print(f"  - comparison_after_stage3_raw_<idx>_<image>.png (Raw sonar vs rendered)")
+    print(f"  - surf_depth_<stage>_<idx>_<image>.png         (Macro-surface depth heatmap)")
+    print(f"  - surf_normal_<stage>_<idx>_<image>.png        (Macro-surface normal RGB map)")
     print(f"  - scale_and_loss.png                    (Scale and loss curves)")
     print(f"  - chunk5_gate_log.csv                  (Chunk-5 gate-by-gate diagnostics)")
     print(f"  - frame_training_visits.csv             (Per-frame optimizer visit coverage)")

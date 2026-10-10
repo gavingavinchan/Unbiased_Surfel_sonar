@@ -988,3 +988,47 @@ with observed center-entropy means approximately `1.77` to `1.91` and queried-ne
 The practical conclusion from this rerun is that the current Chunk-5 path is blocked primarily by confidence collapse, not by finite-normal construction or surfel matching once a rare anchor survives the earlier gates.
 
 This result motivated the current Chunk-5.5 Phase-A execution direction: remove the sonar 4-neighbor pixel finite-difference stencil from the active path, preserve the diagnostics, rerun a few controlled tests, and only then decide whether any replacement local-geometry construction is justified.
+
+
+## 2026-10-09 — Experiment 003 geometry repair (gpt-6.1-sol)
+
+Independent conventional-pose tests found that current forward rendering and shared
+backprojection still treated `Camera.world_view_transform` rotation as conventional
+W2C rather than W2C.T. Echo initialization had a later correction, so it disagreed
+with rendering. Projection, bin backprojection, echo initialization, range maps,
+FOV checks, rigid extrinsic composition and footprint tangent frames now follow
+`docs/SONAR_GEOMETRY_CONVENTIONS.md`. Bins use centres; legacy offset 0 is explicit.
+Camera and world geometry scale together before the metric mount offset is applied.
+The historical mount and .65 remain assumptions. CPU regressions use noncommuting
+rotations, translations and scales .65/1/1.7; the harness retains independent CUDA
+checks and bounded matched image/geometry diagnostics. Acoustic/mesh validation is
+a separate gate. Current cu128/sm_120 large batched eigensolves require chunks of
+8192, and the 000b checkpoint, range-log and empty-FOV fixes are retained.
+
+The first controlled runs exposed an additional numerical blocker: autograd traced
+nonfinite position gradients to `LinalgEighBackward0` at tied covariance eigenvalues.
+A 0.1 I covariance reproduces it directly. The existing spectral variance/condition
+clamp now uses its closed-form 2x2 matrix spectral function with the finite scalar
+slope at ties, avoiding eigenvector differentiation and the large cuSOLVER batches.
+Tests compare its values to the original eigh implementation and check finite
+isotropic backward/gradcheck. The harness applies this same numerical helper to
+before and after variants, retaining original failed trajectories separately.
+
+## 2026-10-09 — numerical convention gate 019
+
+`r=o+(row+d)L/H`, `theta=A/2-(col+d)A/W`; archive o=.2,L=2.8,d=0;
+PVC o=0,L=3,d=.5. Already-sonar poses apply no mount; camera poses use
+`S_sonar=S_camera_metric @ E.T`. Generator build/extract now both transpose R.
+Angular membership is closed nearest-even signed-clearance ticks at 2^-19 rad;
+coordinates are not rounded. This explicitly includes the unresolved half-tick
+boundary cell; nearby values beyond it remain outside. Physical border cells
+include col=-.5 at +60 degrees for centre grids. Source pose precision is retained
+for discrete floor decisions (a measured row 73.000001 was formerly 72.999992).
+Strict native adapter/image, endpoint, normal/tangent and negative-fixture checks
+are separate from reconstruction evidence. No optimizer steps are part of 019.
+
+019 validation scope: the native train and debug adapters independently reproduce
+all 48 archived/PVC views with zero quantized mismatches. Both 18/36-case oracles
+and all 28 invalid fixtures retain their mathematical expectations. CPU test
+extraction now loads the target's function dependencies and actual literal
+defaults, with deferred annotation evaluation; assertions are unchanged.

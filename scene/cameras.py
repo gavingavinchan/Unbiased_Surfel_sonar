@@ -56,7 +56,11 @@ class Camera(nn.Module):
         self.trans = trans
         self.scale = scale
 
-        self.world_view_transform = torch.tensor(getWorld2View2(R, T, trans, scale)).transpose(0, 1).cuda()
+        # Retain source pose precision for discrete sonar bin projection. Casting
+        # the only copy to float32 can move a return across a floor-bin edge.
+        self.world_view_transform_precise = torch.tensor(
+            getWorld2View2(R, T, trans, scale, dtype=np.float64)).transpose(0, 1).cuda()
+        self.world_view_transform = self.world_view_transform_precise.float()
         self.projection_matrix = getProjectionMatrix(znear=self.znear, zfar=self.zfar, fovX=self.FoVx, fovY=self.FoVy).transpose(0,1).cuda()
         self.full_proj_transform = (self.world_view_transform.unsqueeze(0).bmm(self.projection_matrix.unsqueeze(0))).squeeze(0)
         self.camera_center = self.world_view_transform.inverse()[3, :3]

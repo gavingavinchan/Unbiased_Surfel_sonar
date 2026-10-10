@@ -180,6 +180,7 @@ def _transform_world_points_to_sonar_frame(points_world, viewpoint_camera, scale
         viewpoint_camera,
         scale_factor=scale_factor,
         sonar_extrinsic=sonar_extrinsic,
+        dtype=points_world.dtype,
     )
     R_w2v = w2v[:3, :3]
     t_w2v = w2v[3, :3]
@@ -189,7 +190,7 @@ def _transform_world_points_to_sonar_frame(points_world, viewpoint_camera, scale
     else:
         points_world_scaled = points_world
 
-    points_view = points_world_scaled @ R_w2v.T + t_w2v
+    points_view = points_world_scaled @ R_w2v + t_w2v
     return points_view, w2v
 
 
@@ -200,11 +201,15 @@ def sonar_project_points(points_world, viewpoint_camera, sonar_config, scale_fac
     Returns SonarProjection with explicit validity fields:
       - in_fov: azimuth/elevation/range constraints
       - in_front: forward > 0
-      - in_bounds: pixel bounds check
+      - in_bounds: physical grid support, including border cells
       - valid: in_fov & in_front & in_bounds
     """
+    from utils.sonar_utils import resolve_sonar_extrinsic, sonar_aperture_masks
+    sonar_extrinsic = resolve_sonar_extrinsic(sonar_config, sonar_extrinsic)
     points_sonar, _ = _transform_world_points_to_sonar_frame(
-        points_world,
+        # Quantized return-bin checks are discontinuous at integer rows. Use
+        # preserved source poses and double arithmetic, not a widened bin gate.
+        points_world.to(torch.float64),
         viewpoint_camera,
         scale_factor=scale_factor,
         sonar_extrinsic=sonar_extrinsic,
@@ -219,19 +224,20 @@ def sonar_project_points(points_world, viewpoint_camera, sonar_config, scale_fac
     horiz_dist = torch.sqrt(right**2 + forward**2)
     elevation = torch.atan2(down, horiz_dist.clamp_min(1e-8))
 
-    in_fov = (
-        (torch.abs(azimuth) <= sonar_config.half_azimuth_rad)
-        & (torch.abs(elevation) <= sonar_config.half_elevation_rad)
-        & (range_vals >= sonar_config.range_min)
-        & (range_vals <= sonar_config.range_max)
-    )
+    in_azimuth, in_elevation = sonar_aperture_masks(
+        azimuth, elevation, sonar_config.half_azimuth_rad, sonar_config.half_elevation_rad)
+    in_fov = in_azimuth & in_elevation & (range_vals >= sonar_config.range_min) & (range_vals <= sonar_config.range_max)
     in_front = forward > 0
 
     H = viewpoint_camera.image_height
     W = viewpoint_camera.image_width
-    col = (-azimuth / sonar_config.half_azimuth_rad + 1) * (W / 2)
-    row = (range_vals - sonar_config.range_min) / (sonar_config.range_max - sonar_config.range_min) * H
-    in_bounds = (col >= 0) & (col <= W - 1) & (row >= 0) & (row <= H - 1)
+    offset = getattr(sonar_config, "pixel_center_offset", 0.5)
+    col = (-azimuth / sonar_config.half_azimuth_rad + 1) * (W / 2) - offset
+    row = (range_vals - sonar_config.range_min) / (sonar_config.range_max - sonar_config.range_min) * H - offset
+    # Pixel centres are sample locations, not the physical support boundary.
+    # At +60deg a centre grid gives col=-0.5; it belongs to the border cell.
+    # Rendering clamps coordinates to the border sample after membership.
+    in_bounds = in_azimuth & (range_vals >= sonar_config.range_min) & (range_vals <= sonar_config.range_max)
     valid = in_fov & in_front & in_bounds
 
     return SonarProjection(
@@ -372,19 +378,41 @@ def _sonar_config_values(sonar_config):
         "half_elevation_rad": float(half_elevation_rad),
         "range_min": range_min,
         "range_max": range_max,
+        "pixel_center_offset": float(getattr(sonar_config, "pixel_center_offset", 0.5)),
     }
 
 
 def _condition_sigma_2d(sigma_2d, min_var=0.1, max_var=400.0, cond_cap=100.0):
+    """Spectrally clamp a symmetric 2x2 covariance without eigenvector gradients.
+
+    Repeated eigenvalues occur after variance clipping. eigh's eigenvector backward
+    is undefined there; the matrix spectral function has a finite limiting slope.
+    This closed-form function also avoids large batched cuSOLVER limits on sm_120.
+    """
     sym = 0.5 * (sigma_2d + sigma_2d.transpose(-1, -2))
-    eigvals, eigvecs = torch.linalg.eigh(sym)
-    eigvals = torch.clamp(eigvals, min=min_var, max=max_var)
+    midpoint = 0.5 * (sym[..., 0, 0] + sym[..., 1, 1])
+    diag_delta = 0.5 * (sym[..., 0, 0] - sym[..., 1, 1])
+    offdiag = sym[..., 0, 1]
+    gap_sq = diag_delta.square() + offdiag.square()
+    eps = 1e-6 if sym.dtype == torch.float32 else 1e-12
+    half_gap = torch.sqrt(gap_sq.clamp_min(eps * eps))
+    low = torch.clamp(midpoint - half_gap, min=min_var, max=max_var)
+    high = torch.clamp(midpoint + half_gap, min=min_var, max=max_var)
     if cond_cap is not None and cond_cap > 0:
-        max_eval = eigvals.max(dim=-1, keepdim=True).values
-        min_allowed = torch.clamp(max_eval / float(cond_cap), min=min_var)
-        eigvals = torch.maximum(eigvals, min_allowed)
-        eigvals = torch.clamp(eigvals, max=max_var)
-    return eigvecs @ torch.diag_embed(eigvals) @ eigvecs.transpose(-1, -2)
+        minimum = torch.clamp(high / float(cond_cap), min=min_var)
+        low = torch.clamp(torch.maximum(low, minimum), max=max_var)
+        high = torch.clamp(torch.maximum(high, minimum), max=max_var)
+    mean_value = 0.5 * (high + low)
+    slope = (high - low) / (2 * half_gap)
+    # At a repeated eigenvalue, f(A)=f(lambda) I and df/dA has the scalar slope.
+    tied = gap_sq <= eps * eps
+    tied_slope = ((midpoint >= min_var) & (midpoint <= max_var)).to(sym.dtype)
+    slope = torch.where(tied, tied_slope, slope)
+    mean_value = torch.where(tied, torch.clamp(midpoint, min=min_var, max=max_var), mean_value)
+    row0 = torch.stack([mean_value + slope * diag_delta, slope * offdiag], dim=-1)
+    row1 = torch.stack([slope * offdiag, mean_value - slope * diag_delta], dim=-1)
+    return torch.stack([row0, row1], dim=-2)
+
 
 
 def _elevation_bin_weights(num_bins, mode, device, dtype):
@@ -458,14 +486,15 @@ def _project_points_to_sonar_batch(points_3d, sonar_config):
     range_max = range_vals.new_tensor(cfg["range_max"])
     range_span = (range_max - range_min).clamp_min(1e-8)
 
-    col = (-azimuth / half_az + 1.0) * (width * 0.5)
-    row = (range_vals - range_min) / range_span * height
+    col = (-azimuth / half_az + 1.0) * (width * 0.5) - cfg["pixel_center_offset"]
+    row = (range_vals - range_min) / range_span * height - cfg["pixel_center_offset"]
 
     in_front = z > 0
     in_range = (range_vals >= range_min) & (range_vals <= range_max)
-    in_azimuth = torch.abs(azimuth) <= half_az
-    in_elevation = torch.abs(elevation) <= half_el
-    in_bounds = (col >= 0) & (col <= (width - 1.0)) & (row >= 0) & (row <= (height - 1.0))
+    from utils.sonar_utils import sonar_aperture_masks
+    in_azimuth, in_elevation = sonar_aperture_masks(
+        azimuth, elevation, cfg["half_azimuth_rad"], cfg["half_elevation_rad"])
+    in_bounds = in_range & in_azimuth
     valid = in_front & in_range & in_azimuth & in_elevation & in_bounds
 
     return {
@@ -497,7 +526,7 @@ def _ukf_sigma_point_weights(alpha, beta, kappa, device, dtype):
     return lam, mean_weights, cov_weights
 
 
-def _jacobian_sigma_footprint_batch(mean_3d, scale_xy, quat_wxyz, sonar_config):
+def _jacobian_sigma_footprint_batch(mean_3d, scale_xy, quat_wxyz, sonar_config, world_to_view_rotation=None):
     cfg = _sonar_config_values(sonar_config)
     x = mean_3d[:, 0]
     y = mean_3d[:, 1]
@@ -523,6 +552,8 @@ def _jacobian_sigma_footprint_batch(mean_3d, scale_xy, quat_wxyz, sonar_config):
     j[:, 1, 2] = drow_scale * (z / range_val)
 
     rot = _quat_to_rotation_matrices(quat_wxyz)
+    if world_to_view_rotation is not None:
+        rot = world_to_view_rotation @ rot
     t1 = rot[:, :, 0] * scale_xy[:, 0:1]
     t2 = rot[:, :, 1] * scale_xy[:, 1:2]
     sigma_3d = t1.unsqueeze(-1) * t1.unsqueeze(-2) + t2.unsqueeze(-1) * t2.unsqueeze(-2)
@@ -622,6 +653,7 @@ def _project_sonar_footprints_batch(
     sigma_point_config=None,
     sonar_config=None,
     previous_fallback_used=None,
+    world_to_view_rotation=None,
 ):
     if sonar_config is None:
         raise ValueError("sonar_config is required")
@@ -635,7 +667,7 @@ def _project_sonar_footprints_batch(
     center_in_bounds = center_proj["in_bounds"]
 
     mu_2d = torch.stack([center_proj["col"], center_proj["row"]], dim=-1)
-    jac_sigma = _jacobian_sigma_footprint_batch(mean_3d, scale_xy, quat_wxyz, sonar_config)
+    jac_sigma = _jacobian_sigma_footprint_batch(mean_3d, scale_xy, quat_wxyz, sonar_config, world_to_view_rotation)
 
     skipped = ~center_hard_valid
     fallback_used = torch.zeros_like(skipped)
@@ -659,6 +691,8 @@ def _project_sonar_footprints_batch(
         spread = math.sqrt(max(2.0 + lam, 1e-8))
 
         rot = _quat_to_rotation_matrices(quat_wxyz)
+        if world_to_view_rotation is not None:
+            rot = world_to_view_rotation @ rot
         t1 = rot[:, :, 0] * scale_xy[:, 0:1]
         t2 = rot[:, :, 1] * scale_xy[:, 1:2]
         sigma_points = torch.stack(
@@ -1153,6 +1187,8 @@ def render_sonar(
         - visibility_filter: Boolean mask of visible surfels
         - viewspace_points: Screen-space point positions for gradients
     """
+    from utils.sonar_utils import resolve_sonar_extrinsic, sonar_aperture_masks
+    sonar_extrinsic = resolve_sonar_extrinsic(sonar_config, sonar_extrinsic)
     device = pc.get_xyz.device
     runtime_contract = resolve_sonar_render_contract()
 
@@ -1177,8 +1213,8 @@ def render_sonar(
 
     R_w2v = w2v[:3, :3]
     t_w2v_scaled = w2v[3, :3]
-    R_v2w = R_w2v.T
-    sonar_origin_scaled = -R_v2w @ t_w2v_scaled
+    # S[:3,:3] is R_c2w; conventional world origin = -R_c2w @ t.
+    sonar_origin_scaled = -R_w2v @ t_w2v_scaled
 
     N = viewspace_points.shape[0]
 
@@ -1193,16 +1229,16 @@ def render_sonar(
         scale_factor=scale_factor,
         sonar_extrinsic=sonar_extrinsic,
     )
-    azimuth = projection.azimuth
-    range_vals = projection.range_vals
+    azimuth = projection.azimuth.to(means3D.dtype)
+    range_vals = projection.range_vals.to(means3D.dtype)
     horiz_dist = torch.sqrt(right * right + forward * forward)
     elevation = torch.atan2(down, horiz_dist.clamp_min(1e-8))
     in_fov = projection.valid
 
     H = viewpoint_camera.image_height
     W = viewpoint_camera.image_width
-    col = torch.clamp(projection.col, 0, W - 1)
-    row = torch.clamp(projection.row, 0, H - 1)
+    col = torch.clamp(projection.col, 0, W - 1).to(means3D.dtype)
+    row = torch.clamp(projection.row, 0, H - 1).to(means3D.dtype)
 
     footprint_config = type(
         "SonarRuntimeConfig",
@@ -1214,6 +1250,7 @@ def render_sonar(
             "half_elevation_rad": getattr(sonar_config, "half_elevation_rad"),
             "range_min": getattr(sonar_config, "range_min"),
             "range_max": getattr(sonar_config, "range_max"),
+            "pixel_center_offset": getattr(sonar_config, "pixel_center_offset", 0.5),
         },
     )()
 
@@ -1271,8 +1308,9 @@ def render_sonar(
 
     footprints = _project_sonar_footprints_batch(
         mean_3d=points_sonar,
-        scale_xy=scaling_xy,
+        scale_xy=scaling_xy if scale_factor is None else scaling_xy * scale_factor.scale,
         quat_wxyz=rotations,
+        world_to_view_rotation=w2v[:3, :3].T,
         mode=runtime_contract["render_mode"],
         sigma_point_config=sigma_point_config,
         sonar_config=footprint_config,
@@ -1367,7 +1405,7 @@ def render_sonar(
                 event_returns = event_value
                 composed = {
                     "final_transmittance": event_value.new_ones(num_ray_bins),
-                    "transmittance_before_event": event_value.new_ones_like(event_value),
+                    "transmittance_before_event": torch.ones_like(event_value),
                     "alpha_sorted": torch.clamp(event_alpha, min=0.0, max=1.0),
                     "range_sorted": event_range,
                     "ray_ids_sorted": event_ray_ids,
@@ -1590,6 +1628,9 @@ def render_sonar(
     weight_sum = support_ar.transpose(0, 1)
     render_alpha = reg_alpha_ar.transpose(0, 1).unsqueeze(0)
 
+    # Retain brief 000b empty-FOV backward fix.
+    rendered_image = rendered_image + means3D.sum() * 0.0
+
     range_image = torch.where(
         weight_sum.unsqueeze(0) > 1e-6,
         range_image / weight_sum.unsqueeze(0),
@@ -1646,7 +1687,7 @@ def render_sonar(
     rendered_image = rendered_image.expand(3, -1, -1)
 
     surf_normal = sonar_points_to_normals(
-        sonar_ranges_to_points(viewpoint_camera, surf_depth_image, sonar_config, scale_factor),
+        sonar_ranges_to_points(viewpoint_camera, surf_depth_image, sonar_config, scale_factor, sonar_extrinsic=sonar_extrinsic),
         surf_depth_image,
     ).permute(2, 0, 1)
     surf_normal = surf_normal * render_alpha.detach()

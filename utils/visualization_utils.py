@@ -269,19 +269,27 @@ def _resolve_scale_value(scale_factor) -> float:
     return float(scale_np[0])
 
 
-def compute_frame_surfel_membership(centers, scales, rotations, camera, sonar_config, scale_factor=None):
+def compute_frame_surfel_membership(centers, scales, rotations, camera, sonar_config, scale_factor=None, sonar_extrinsic=None):
     centers_np = _to_numpy(centers).astype(np.float64)
     scales_np = _to_numpy(scales).astype(np.float64)
     rotations_np = normalize_quaternions(rotations)
     _, _, normals_world = compute_surfel_axes(rotations_np)
 
-    w2v = _to_numpy(camera.world_view_transform).astype(np.float64)
+    import torch
+    from types import SimpleNamespace
+    from utils.sonar_utils import (get_scaled_world_to_view_transform,
+                                   resolve_sonar_extrinsic, sonar_aperture_masks)
+    scale_value = _resolve_scale_value(scale_factor)
+    stored = torch.as_tensor(_to_numpy(camera.world_view_transform), dtype=torch.float64)
+    w2v = get_scaled_world_to_view_transform(
+        SimpleNamespace(world_view_transform=stored),
+        SimpleNamespace(scale=scale_value),
+        resolve_sonar_extrinsic(sonar_config, sonar_extrinsic),
+    ).cpu().numpy()
     rotation = w2v[:3, :3]
     translation = w2v[3, :3]
-    scale_value = _resolve_scale_value(scale_factor)
-
-    points_view = (centers_np * scale_value) @ rotation.T + (translation * scale_value)
-    normals_view = normals_world @ rotation.T
+    points_view = (centers_np * scale_value) @ rotation + translation
+    normals_view = normals_world @ rotation
 
     right = points_view[:, 0]
     down = points_view[:, 1]
@@ -301,12 +309,14 @@ def compute_frame_surfel_membership(centers, scales, rotations, camera, sonar_co
         np.stack([az_margin, el_margin, range_margin_near, range_margin_far], axis=0),
         axis=0,
     )
-    surfel_radius = np.max(scales_np[:, :2], axis=1)
+    surfel_radius = np.max(scales_np[:, :2], axis=1) * scale_value
     in_front = forward > 0.0
+    in_azimuth, in_elevation = sonar_aperture_masks(
+        torch.from_numpy(azimuth), torch.from_numpy(elevation), half_az, half_el)
     center_in_fov = (
         in_front
-        & (np.abs(azimuth) <= half_az)
-        & (np.abs(elevation) <= half_el)
+        & in_azimuth.numpy()
+        & in_elevation.numpy()
         & (range_vals >= float(sonar_config.range_min))
         & (range_vals <= float(sonar_config.range_max))
     )
