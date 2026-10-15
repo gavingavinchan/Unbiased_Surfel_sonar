@@ -1032,3 +1032,13 @@ all 48 archived/PVC views with zero quantized mismatches. Both 18/36-case oracle
 and all 28 invalid fixtures retain their mathematical expectations. CPU test
 extraction now loads the target's function dependencies and actual literal
 defaults, with deferred annotation evaluation; assertions are unchanged.
+
+## 034 — initialization/extraction boundary (Codex, 2026-10-14)
+Both initializations use 525 training views; indices divisible by eight are held out.
+Native Poisson extraction can now take a metric cell width with depth=0, and a
+positive explicit thread count. It remains an oriented surface interpolation,
+without sonar-support enforcement. PCA/seeded initial orientations are not measured
+normals. Step-0 meshes cannot answer whether optimization preserves the prior.
+Atomic serialization retains caller-declared model, optimizers, schedulers, step,
+sampler, strategy, scale and Python/NumPy/torch/CUDA RNG. Native callers still need
+an exhaustive state audit and the independent 100/exit/resume/200 acceptance test.

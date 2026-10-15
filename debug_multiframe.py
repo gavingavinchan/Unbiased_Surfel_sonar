@@ -2836,7 +2836,19 @@ def render_sonar_for_mesh(sonar_config, scale_factor, sonar_extrinsic=None):
     return _render
 
 
-def save_poisson_mesh(points, normals, output_dir, filename, opacities=None, scales=None):
+def save_poisson_mesh(points, normals, output_dir, filename, opacities=None, scales=None,
+                      *, metric_pitch=None, n_threads=None):
+    # Optional fixed metric resolution for matched checkpoints with changing extent.
+    # Preserve the historical depth/default-thread path unless explicitly requested.
+    poisson_options = {"depth": POISSON_DEPTH}
+    if metric_pitch is not None:
+        if not np.isfinite(metric_pitch) or metric_pitch <= 0:
+            raise ValueError("metric_pitch must be finite and positive")
+        poisson_options = {"depth": 0, "width": float(metric_pitch)}
+    if n_threads is not None:
+        if not isinstance(n_threads, int) or isinstance(n_threads, bool) or n_threads < 1:
+            raise ValueError("n_threads must be a positive integer")
+        poisson_options["n_threads"] = n_threads
     if points.size == 0:
         print("  Skipping Poisson mesh (no points)")
         return
@@ -2877,7 +2889,7 @@ def save_poisson_mesh(points, normals, output_dir, filename, opacities=None, sca
     pcd_mesh.points = o3d.utility.Vector3dVector(points)
     pcd_mesh.normals = o3d.utility.Vector3dVector(normals)
     poisson_mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
-        pcd_mesh, depth=POISSON_DEPTH
+        pcd_mesh, **poisson_options
     )
     densities = np.asarray(densities)
     if densities.size > 0:

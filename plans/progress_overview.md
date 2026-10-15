@@ -575,3 +575,13 @@ changing assertions; two historical `new_ones_like` errors were already fixed
 in the supplied 004 head. Retained 018 locked, fail-closed CI now runs the whole
 suite: local 221 passed / 0 failed / 13 explicitly reported skips. Remote CI is
 required on the final pushed head; its receipt is recorded by experiment 019.
+
+## 034 — bounded native prior preparation (Codex, 2026-10-14)
+At base 01c7683, added an optional metric-width/explicit-thread route to the existing
+oriented Poisson helper; historical defaults remain unchanged. Added an atomic,
+checksum/source/config-bound training-state serializer with restricted torch loading.
+CPU tests cover exact 200-step fixture continuation, corruption/source refusal and
+interrupted publication. This is not native surfel restore equivalence or CUDA/RSS
+release proof. The 034 sandbox has no native GPU access; no optimizer steps were run.
+Step-0 12,000-point train-only carved/bright artifacts are retained in experiment 034.
+No renderer, objective, submodule pointer or previous experiment was changed.
