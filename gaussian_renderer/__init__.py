@@ -382,6 +382,21 @@ def _sonar_config_values(sonar_config):
     }
 
 
+def _bounded_sonar_linalg(operation, matrix):
+    """Bound cuSOLVER workspace for independent small covariance matrices.
+
+    Large batches of 2x2 solves can request GiB workspaces on CUDA. Splitting
+    independent matrices preserves the mathematical operator and autograd while
+    keeping each solver invocation at the already tested 512-matrix scale.
+    """
+    if matrix.ndim <= 2 or matrix.shape[0] <= 512:
+        return operation(matrix)
+    values = [operation(part) for part in matrix.split(512, dim=0)]
+    if isinstance(values[0], tuple):
+        return tuple(torch.cat(parts, dim=0) for parts in zip(*values))
+    return torch.cat(values, dim=0)
+
+
 def _condition_sigma_2d(sigma_2d, min_var=0.1, max_var=400.0, cond_cap=100.0):
     """Spectrally clamp a symmetric 2x2 covariance without eigenvector gradients.
 
@@ -429,8 +444,8 @@ def _elevation_bin_weights(num_bins, mode, device, dtype):
 def sigma2d_to_transmat_precomp(mu_2d, sigma_2d):
     sigma_conditioned = _condition_sigma_2d(sigma_2d)
     try:
-        chol = torch.linalg.cholesky(sigma_conditioned)
-    except RuntimeError:
+        chol = _bounded_sonar_linalg(torch.linalg.cholesky, sigma_conditioned)
+    except torch.linalg.LinAlgError:
         eigvals, eigvecs = torch.linalg.eigh(0.5 * (sigma_conditioned + sigma_conditioned.T))
         chol = eigvecs @ torch.diag(torch.sqrt(torch.clamp(eigvals, min=1e-6)))
 
@@ -783,7 +798,7 @@ def _project_sonar_footprints_batch(
             else:
                 effective_mode.append("2dgs_nonlinear")
 
-    radii = torch.sqrt(torch.linalg.eigvalsh(sigma_2d).max(dim=-1).values.clamp_min(1e-8))
+    radii = torch.sqrt(_bounded_sonar_linalg(torch.linalg.eigvalsh, sigma_2d).max(dim=-1).values.clamp_min(1e-8))
     zero_mu = torch.zeros_like(mu_2d)
     zero_sigma = torch.eye(2, dtype=sigma_2d.dtype, device=sigma_2d.device).unsqueeze(0).expand_as(sigma_2d) * 0.1
     mu_2d = torch.where(skipped.unsqueeze(-1), zero_mu, mu_2d)
@@ -961,9 +976,9 @@ def marginalize_elevation_bins(returns_aer, elev_weights=None):
 def _sigma2d_to_transmat_precomp_batch(mu_2d, sigma_2d):
     sigma_conditioned = _condition_sigma_2d(sigma_2d)
     try:
-        chol = torch.linalg.cholesky(sigma_conditioned)
-    except RuntimeError:
-        eigvals, eigvecs = torch.linalg.eigh(0.5 * (sigma_conditioned + sigma_conditioned.transpose(-1, -2)))
+        chol = _bounded_sonar_linalg(torch.linalg.cholesky, sigma_conditioned)
+    except torch.linalg.LinAlgError:
+        eigvals, eigvecs = _bounded_sonar_linalg(torch.linalg.eigh, 0.5 * (sigma_conditioned + sigma_conditioned.transpose(-1, -2)))
         chol = eigvecs @ torch.diag_embed(torch.sqrt(torch.clamp(eigvals, min=1e-6)))
 
     zero = mu_2d.new_zeros(mu_2d.shape[0])

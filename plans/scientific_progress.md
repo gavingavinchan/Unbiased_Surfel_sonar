@@ -1042,3 +1042,8 @@ normals. Step-0 meshes cannot answer whether optimization preserves the prior.
 Atomic serialization retains caller-declared model, optimizers, schedulers, step,
 sampler, strategy, scale and Python/NumPy/torch/CUDA RNG. Native callers still need
 an exhaustive state audit and the independent 100/exit/resume/200 acceptance test.
+
+
+## 2026-10-17 — Bounded covariance solver workspace (Codex)
+
+Native 12,000-point fixed-density jobs stopped on their first update at a 6 GiB allocation limit; the 512-point acceptance case passed. Bound independent covariance eigvalsh/Cholesky/eigh calls to batches of 512, retaining autograd and covariance values. Allocation failures now propagate instead of being mistaken for non-positive covariance. CPU 12,000-matrix value/gradient agreement is tested against unsplit PyTorch. Native full-size training confirmation is pending; the solver-workspace diagnosis remains provisional until the actual repaired job runs. No scientific loss, initialization, pose, frame selection, scale or point count changes.

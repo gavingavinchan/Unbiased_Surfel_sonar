@@ -585,3 +585,8 @@ interrupted publication. This is not native surfel restore equivalence or CUDA/R
 release proof. The 034 sandbox has no native GPU access; no optimizer steps were run.
 Step-0 12,000-point train-only carved/bright artifacts are retained in experiment 034.
 No renderer, objective, submodule pointer or previous experiment was changed.
+
+
+## 2026-10-17 — Bounded covariance solver workspace (Codex)
+
+Native 12,000-point fixed-density jobs stopped on their first update at a 6 GiB allocation limit; the 512-point acceptance case passed. Bound independent covariance eigvalsh/Cholesky/eigh calls to batches of 512, retaining autograd and covariance values. Allocation failures now propagate instead of being mistaken for non-positive covariance. CPU 12,000-matrix value/gradient agreement is tested against unsplit PyTorch. Native full-size training confirmation is pending; the solver-workspace diagnosis remains provisional until the actual repaired job runs. No scientific loss, initialization, pose, frame selection, scale or point count changes.
