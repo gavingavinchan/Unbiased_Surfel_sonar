@@ -187,6 +187,10 @@ def is_in_sonar_fov(xyz, camera, sonar_config, scale_factor, return_details=Fals
     in_front = forward > 0  # Must be in front of sonar
 
     in_fov = in_azimuth & in_elevation & in_range & in_front
+    if getattr(sonar_config, "membership_policy", "quantized_clearance_v1") == "bin_edges_v1":
+        # This helper's azimuth is right-positive; membership uses left-positive.
+        in_fov = sonar_config.bin_membership(-azimuth, elevation, range_vals, forward,
+                                             image_width=camera.image_width, image_height=camera.image_height)
 
     if return_details:
         return {
@@ -279,6 +283,8 @@ def is_fully_in_sonar_fov(xyz, scaling, camera, sonar_config, scale_factor, sona
     in_range = (range_vals >= sonar_config.range_min) & (range_vals <= sonar_config.range_max)
     in_front = forward > 0
     center_in_fov = in_azimuth & in_elevation & in_range & in_front
+    if getattr(sonar_config, "membership_policy", "quantized_clearance_v1") == "bin_edges_v1":
+        center_in_fov = sonar_config.bin_membership(-azimuth, elevation, range_vals, forward)
 
     # Size-aware check: margin must exceed surfel radius
     surfel_radius = scaling.max(dim=1).values * scale  # [N], metres

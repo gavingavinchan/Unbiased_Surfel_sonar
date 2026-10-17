@@ -320,6 +320,10 @@ def compute_frame_surfel_membership(centers, scales, rotations, camera, sonar_co
         & (range_vals >= float(sonar_config.range_min))
         & (range_vals <= float(sonar_config.range_max))
     )
+    if getattr(sonar_config, "membership_policy", "quantized_clearance_v1") == "bin_edges_v1":
+        center_in_fov = sonar_config.bin_membership(
+            -torch.from_numpy(azimuth), torch.from_numpy(elevation),
+            torch.from_numpy(range_vals), torch.from_numpy(forward)).numpy()
     overlap_mask = in_front & ((fov_margin + surfel_radius) > 0.0)
 
     dir_to_sonar = -points_view / np.clip(range_vals[:, None], 1e-12, None)

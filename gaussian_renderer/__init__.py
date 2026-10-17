@@ -172,6 +172,8 @@ class SonarProjection:
     in_front: torch.Tensor
     in_bounds: torch.Tensor
     valid: torch.Tensor
+    cell_col: torch.Tensor = None  # bin_edges_v1 integer membership cells
+    cell_row: torch.Tensor = None
 
 
 def _transform_world_points_to_sonar_frame(points_world, viewpoint_camera, scale_factor=None, sonar_extrinsic=None):
@@ -239,6 +241,12 @@ def sonar_project_points(points_world, viewpoint_camera, sonar_config, scale_fac
     # Rendering clamps coordinates to the border sample after membership.
     in_bounds = in_azimuth & (range_vals >= sonar_config.range_min) & (range_vals <= sonar_config.range_max)
     valid = in_fov & in_front & in_bounds
+    cell_col = cell_row = None
+    if getattr(sonar_config, "membership_policy", "quantized_clearance_v1") == "bin_edges_v1":
+        from utils.sonar_utils import sonar_bin_membership
+        valid, cell_col, cell_row = sonar_bin_membership(
+            azimuth, elevation, range_vals, forward, col, row, sonar_config, W, H)
+        in_fov = in_bounds = valid
 
     return SonarProjection(
         row=row,
@@ -249,6 +257,8 @@ def sonar_project_points(points_world, viewpoint_camera, sonar_config, scale_fac
         in_front=in_front,
         in_bounds=in_bounds,
         valid=valid,
+        cell_col=cell_col,
+        cell_row=cell_row,
     )
 
 
@@ -379,6 +389,7 @@ def _sonar_config_values(sonar_config):
         "range_min": range_min,
         "range_max": range_max,
         "pixel_center_offset": float(getattr(sonar_config, "pixel_center_offset", 0.5)),
+        "membership_policy": getattr(sonar_config, "membership_policy", "quantized_clearance_v1"),
     }
 
 
@@ -496,6 +507,14 @@ def _project_points_to_sonar_batch(points_3d, sonar_config):
         azimuth, elevation, cfg["half_azimuth_rad"], cfg["half_elevation_rad"])
     in_bounds = in_range & in_azimuth
     valid = in_front & in_range & in_azimuth & in_elevation & in_bounds
+    if cfg.get("membership_policy", "quantized_clearance_v1") == "bin_edges_v1":
+        from utils.sonar_utils import sonar_bin_membership
+        valid, _, _ = sonar_bin_membership(
+            azimuth, elevation, range_vals, z, col, row,
+            sonar_config, int(cfg["image_width"]), int(cfg["image_height"]))
+        in_azimuth = azimuth.to(torch.float64).abs() <= float(cfg["half_azimuth_rad"])
+        in_elevation = elevation.to(torch.float64).abs() <= float(cfg["half_elevation_rad"])
+        in_bounds = valid
 
     return {
         "col": col,
@@ -1237,8 +1256,7 @@ def render_sonar(
 
     H = viewpoint_camera.image_height
     W = viewpoint_camera.image_width
-    col = torch.clamp(projection.col, 0, W - 1).to(means3D.dtype)
-    row = torch.clamp(projection.row, 0, H - 1).to(means3D.dtype)
+    # Deposition centres come from the footprint batch below; no clamped copy.
 
     footprint_config = type(
         "SonarRuntimeConfig",
@@ -1251,6 +1269,8 @@ def render_sonar(
             "range_min": getattr(sonar_config, "range_min"),
             "range_max": getattr(sonar_config, "range_max"),
             "pixel_center_offset": getattr(sonar_config, "pixel_center_offset", 0.5),
+            "membership_policy": getattr(sonar_config, "membership_policy", "quantized_clearance_v1"),
+            "bin_edge_offsets": getattr(sonar_config, "bin_edge_offsets", None),
         },
     )()
 

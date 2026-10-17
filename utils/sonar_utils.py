@@ -318,6 +318,49 @@ def sonar_aperture_masks(azimuth, elevation, half_azimuth, half_elevation):
     return closed_boundary(azimuth, half_azimuth), closed_boundary(elevation, half_elevation)
 
 
+MEMBERSHIP_POLICIES = ("quantized_clearance_v1", "bin_edges_v1")
+
+
+def sonar_bin_membership(azimuth, elevation, range_vals, forward, col, row, sonar_config,
+                         image_width, image_height):
+    """bin_edges_v1: integer cell membership from explicit bin edges (float64).
+
+    Physical sample coordinates ``col``/``row`` are the unchanged projection
+    (sample centres for offset 0.5). Membership never moves them. Cell k along
+    an axis spans [k + e, k + 1 + e) in sample coordinates, with e the explicit
+    edge offset; the far closed endpoint k = N + e belongs to cell N - 1.
+    A point is valid iff it lies in the closed physical aperture, the closed
+    range interval, in front, and inside the closed edge grid. Acceptance band
+    is exactly zero: membership is the float64 evaluation of the stored point.
+    Returns (valid, cell_col, cell_row); cells are -1 where invalid.
+    """
+    e_col, e_row = sonar_config.bin_edge_offsets
+    az = azimuth.to(torch.float64)
+    el = elevation.to(torch.float64)
+    rv = range_vals.to(torch.float64)
+    c = col.to(torch.float64)
+    r = row.to(torch.float64)
+    W, H = int(image_width), int(image_height)
+    in_aperture = (az.abs() <= float(sonar_config.half_azimuth_rad)) & (
+        el.abs() <= float(sonar_config.half_elevation_rad))
+    in_range = (rv >= float(sonar_config.range_min)) & (rv <= float(sonar_config.range_max))
+    # Compare against the edge values themselves (exact in float64 for the
+    # supported offsets); subtracting the offset first can round across an edge.
+    in_grid = (c >= e_col) & (c <= W + e_col) & (r >= e_row) & (r <= H + e_row)
+    valid = in_aperture & in_range & in_grid & (forward > 0)
+    def owning_cell(x, e, n):
+        # floor(x - e), corrected so that edge k + e (compared exactly) opens cell k.
+        k = torch.floor(x - e)
+        k = torch.where(x < k + e, k - 1, k)
+        k = torch.where(x >= k + 1 + e, k + 1, k)
+        return torch.clamp(k, 0, n - 1).long()
+    cell_col = owning_cell(c, e_col, W)
+    cell_row = owning_cell(r, e_row, H)
+    cell_col = torch.where(valid, cell_col, torch.full_like(cell_col, -1))
+    cell_row = torch.where(valid, cell_row, torch.full_like(cell_row, -1))
+    return valid, cell_col, cell_row
+
+
 class SonarConfig:
     """
     Configuration class for sonar parameters.
@@ -338,6 +381,8 @@ class SonarConfig:
         range_origin=None,
         range_span=None,
         pose_mode=None,
+        membership_policy="quantized_clearance_v1",
+        bin_edge_offsets=None,
     ):
         # range_min/max remain aliases for callers using the original API.
         if range_origin is not None:
@@ -348,8 +393,25 @@ class SonarConfig:
             raise ValueError("Sonar range origin/span must define a finite positive span")
         if pixel_center_offset not in (0.0, 0.5):
             raise ValueError("pixel_center_offset must be 0 (archive edges) or 0.5 (centres)")
-        if pose_mode not in (None, "poses_are_camera", "poses_are_sonar"):
-            raise ValueError("pose_mode must be poses_are_camera or poses_are_sonar")
+        if pose_mode not in (None, "poses_are_camera", "poses_are_sonar", "explicit_extrinsic"):
+            raise ValueError("pose_mode must be poses_are_camera, poses_are_sonar or explicit_extrinsic")
+        if membership_policy not in MEMBERSHIP_POLICIES:
+            raise ValueError(f"membership_policy must be one of {MEMBERSHIP_POLICIES}")
+        if membership_policy == "bin_edges_v1":
+            # New policy code requires every routing decision to be explicit.
+            if pose_mode is None:
+                # explicit_extrinsic keeps low-level per-call extrinsic semantics, declared.
+                raise ValueError("bin_edges_v1 requires an explicit pose_mode "
+                                 "(poses_are_camera, poses_are_sonar or explicit_extrinsic)")
+            if bin_edge_offsets is None:
+                if pixel_center_offset != 0.5:
+                    raise ValueError("bin_edges_v1 with pixel_center_offset 0 requires explicit bin_edge_offsets")
+                bin_edge_offsets = (-0.5, -0.5)
+            bin_edge_offsets = tuple(float(v) for v in bin_edge_offsets)
+            if len(bin_edge_offsets) != 2:
+                raise ValueError("bin_edge_offsets must be (col_offset, row_offset)")
+        self.membership_policy = membership_policy
+        self.bin_edge_offsets = bin_edge_offsets
         self.range_origin = range_min
         self.range_span = range_max - range_min
         self.pose_mode = pose_mode
@@ -444,9 +506,21 @@ class SonarConfig:
 
     def is_in_fov(self, azimuth, elevation, range_val):
         """Closed quantized angular aperture, closed metric range interval."""
+        if self.membership_policy == "bin_edges_v1":
+            return self.bin_membership(azimuth, elevation, range_val, torch.ones_like(range_val))
         valid_azimuth, valid_elevation = self.aperture_masks(azimuth, elevation)
         valid_range = (range_val >= self.range_min) & (range_val <= self.range_max)
         return valid_azimuth & valid_elevation & valid_range
+
+    def bin_membership(self, azimuth, elevation, range_val, forward, *, image_width=None, image_height=None):
+        """Left-positive azimuth in radians; bin_edges_v1 validity only."""
+        W = self.image_width if image_width is None else image_width
+        H = self.image_height if image_height is None else image_height
+        az = azimuth.to(torch.float64)
+        rv = range_val.to(torch.float64)
+        col = (-az / self.half_azimuth_rad + 1) * (W / 2) - self.pixel_center_offset
+        row = (rv - self.range_min) / (self.range_max - self.range_min) * H - self.pixel_center_offset
+        return sonar_bin_membership(az, elevation, rv, forward, col, row, self, W, H)[0]
 
 
 def resolve_sonar_extrinsic(sonar_config, sonar_extrinsic=None):
