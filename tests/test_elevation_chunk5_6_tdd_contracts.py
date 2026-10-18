@@ -32,16 +32,34 @@ def _load_function_from_ast(path: Path, fn_name: str, extra_ns=None):
     if not found:
         return None
 
-    selected_nodes = []
-    for node in tree.body:
-        if isinstance(node, (ast.FunctionDef, ast.ClassDef)):
-            selected_nodes.append(copy.deepcopy(node))
-
-    mod = ast.Module(body=selected_nodes, type_ignores=[])
-    ast.fix_missing_locations(mod)
+    functions = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
+    needed = {fn_name}
+    pending = [fn_name]
+    while pending:
+        current = functions[pending.pop()]
+        for n in ast.walk(current):
+            if isinstance(n, ast.Name) and n.id in functions and n.id not in needed:
+                needed.add(n.id)
+                pending.append(n.id)
+    selected_nodes = [copy.deepcopy(n) for n in tree.body
+                      if isinstance(n, ast.FunctionDef) and n.name in needed]
+    # Preserve real literal module defaults, rather than inventing test values.
     ns = {"torch": torch, "math": math}
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            try:
+                value = ast.literal_eval(node.value)
+            except (ValueError, TypeError):
+                continue
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    ns[target.id] = value
     if extra_ns:
         ns.update(extra_ns)
+    mod = ast.Module(body=[ast.ImportFrom(module="__future__",
+                      names=[ast.alias(name="annotations")], level=0)] + selected_nodes,
+                     type_ignores=[])
+    ast.fix_missing_locations(mod)
     exec(compile(mod, str(path), "exec"), ns)
     return ns[fn_name]
 

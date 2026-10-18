@@ -69,7 +69,7 @@ def depth_to_normal(view, depth, sonar_mode=False, sonar_config=None, scale_fact
 # Sonar (Polar) Projection Functions
 # =============================================================================
 
-def sonar_ranges_to_points(view, range_image, sonar_config, scale_factor=None, elevation_image=None):
+def sonar_ranges_to_points(view, range_image, sonar_config, scale_factor=None, elevation_image=None, sonar_extrinsic=None):
     """
     Convert sonar range image to 3D world-space points.
     
@@ -106,7 +106,8 @@ def sonar_ranges_to_points(view, range_image, sonar_config, scale_factor=None, e
     
     # Get azimuth angles for each column.
     # Canonical convention: left columns = positive azimuth, right = negative.
-    azimuth_grid = sonar_config.azimuth_grid[:W]  # [W]
+    cols = torch.arange(W, device=range_image.device, dtype=range_image.dtype)
+    azimuth_grid, _ = sonar_config.pixel_to_polar(cols, torch.zeros_like(cols), image_width=W, image_height=H)
     
     # Expand to full grid
     azimuth = azimuth_grid[None, :].expand(H, W)  # [H, W]
@@ -138,32 +139,11 @@ def sonar_ranges_to_points(view, range_image, sonar_config, scale_factor=None, e
     # Stack to get points in sonar frame [H, W, 3]
     points_sonar = torch.stack([x_s, y_s, z_s], dim=-1)
     
-    # Get sonar-to-world transform from view WITHOUT using torch.inverse()
-    # world_view_transform is [R|t] where camera_pos = -R^T @ t
-    # NOTE: translation is stored in ROW 3 (not column 3)
-    w2v = view.world_view_transform  # [4, 4]
-    R_w2v = w2v[:3, :3]  # rotation world-to-view
-    t_w2v = w2v[3, :3]   # translation (row 3)
-    
-    # Apply scale factor to translation if provided
-    if scale_factor is not None:
-        t_w2v_scaled = scale_factor.scale * t_w2v
-    else:
-        t_w2v_scaled = t_w2v
-    
-    # Compute view-to-world transform without torch.inverse()
-    # For [R|t], the inverse is [R^T | -R^T @ t]
-    R_v2w = R_w2v.T  # transpose = inverse for orthogonal rotation
-    t_v2w = -R_v2w @ t_w2v_scaled  # camera/sonar origin in world coords
-    
-    # Transform points to world: p_world = R_v2w @ p_sonar + t_v2w
-    # Reshape for batch matrix multiply: [H*W, 3] @ [3, 3].T + [3]
-    points_flat = points_sonar.reshape(-1, 3)  # [H*W, 3]
-    points_world_flat = points_flat @ R_v2w.T + t_v2w  # [H*W, 3]
-    
-    # Reshape back to [H, W, 3]
-    points_world = points_world_flat.reshape(H, W, 3)
-    
+    from utils.sonar_utils import get_scaled_world_to_view_transform, view_points_to_world, resolve_sonar_extrinsic
+    sonar_extrinsic = resolve_sonar_extrinsic(sonar_config, sonar_extrinsic)
+    w2v = get_scaled_world_to_view_transform(view, scale_factor, sonar_extrinsic)
+    points_world = view_points_to_world(points_sonar.reshape(-1, 3), w2v, scale_factor).reshape(H, W, 3)
+
     return points_world
 
 
