@@ -441,13 +441,43 @@ def _elevation_bin_weights(num_bins, mode, device, dtype):
     return weights / weights.sum().clamp_min(1e-8)
 
 
+def _covariance_cholesky_2x2(sigma):
+    """Lower factor of an already conditioned symmetric positive 2x2 matrix.
+
+    Packing below consumes only L00, L10 and L11, so an eigenvector factor
+    cannot be substituted for L. No additional floor/jitter is applied here:
+    _condition_sigma_2d owns the variance and condition-number policy.
+    Elementwise operations preserve dtype/device/autograd and need no solver
+    workspace. Invalid conditioned matrices fail instead of changing policy.
+    This retains the Python decoder/normal factor convention; it does not
+    correct the separate inherited native interpretation of the packed rows.
+    """
+    if sigma.shape[-2:] != (2, 2) or not torch.isfinite(sigma).all():
+        raise ValueError("Expected finite conditioned 2x2 covariance")
+    if not torch.equal(sigma, sigma.transpose(-1, -2)):
+        raise ValueError("Expected symmetric conditioned covariance")
+    a = sigma[..., 0, 0]
+    if not (a > 0).all():
+        raise ValueError("Expected positive definite conditioned covariance")
+    l00 = torch.sqrt(a)
+    l10 = sigma[..., 1, 0] / l00
+    schur = sigma[..., 1, 1] - l10.square()
+    if not (torch.isfinite(schur) & (schur > 0)).all():
+        raise ValueError("Expected positive definite conditioned covariance")
+    zero = torch.zeros_like(l00)
+    row0 = torch.stack([l00, zero], dim=-1)
+    row1 = torch.stack([l10, torch.sqrt(schur)], dim=-1)
+    return torch.stack([row0, row1], dim=-2)
+
+
 def sigma2d_to_transmat_precomp(mu_2d, sigma_2d):
+    if not torch.isfinite(sigma_2d).all():
+        raise ValueError("Expected finite covariance before conditioning")
     sigma_conditioned = _condition_sigma_2d(sigma_2d)
     try:
         chol = _bounded_sonar_linalg(torch.linalg.cholesky, sigma_conditioned)
     except torch.linalg.LinAlgError:
-        eigvals, eigvecs = torch.linalg.eigh(0.5 * (sigma_conditioned + sigma_conditioned.T))
-        chol = eigvecs @ torch.diag(torch.sqrt(torch.clamp(eigvals, min=1e-6)))
+        chol = _covariance_cholesky_2x2(sigma_conditioned)
 
     zero = sigma_2d.new_tensor(0.0)
     one = sigma_2d.new_tensor(1.0)
@@ -974,12 +1004,13 @@ def marginalize_elevation_bins(returns_aer, elev_weights=None):
 
 
 def _sigma2d_to_transmat_precomp_batch(mu_2d, sigma_2d):
+    if not torch.isfinite(sigma_2d).all():
+        raise ValueError("Expected finite covariance before conditioning")
     sigma_conditioned = _condition_sigma_2d(sigma_2d)
     try:
         chol = _bounded_sonar_linalg(torch.linalg.cholesky, sigma_conditioned)
     except torch.linalg.LinAlgError:
-        eigvals, eigvecs = _bounded_sonar_linalg(torch.linalg.eigh, 0.5 * (sigma_conditioned + sigma_conditioned.transpose(-1, -2)))
-        chol = eigvecs @ torch.diag_embed(torch.sqrt(torch.clamp(eigvals, min=1e-6)))
+        chol = _covariance_cholesky_2x2(sigma_conditioned)
 
     zero = mu_2d.new_zeros(mu_2d.shape[0])
     one = mu_2d.new_ones(mu_2d.shape[0])
