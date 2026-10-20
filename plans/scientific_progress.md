@@ -1047,3 +1047,6 @@ an exhaustive state audit and the independent 100/exit/resume/200 acceptance tes
 ## 2026-10-17 — Bounded covariance solver workspace (Codex)
 
 Native 12,000-point fixed-density jobs stopped on their first update at a 6 GiB allocation limit; the 512-point acceptance case passed. Bound independent covariance eigvalsh/Cholesky/eigh calls to batches of 512, retaining autograd and covariance values. Allocation failures now propagate instead of being mistaken for non-positive covariance. CPU 12,000-matrix value/gradient agreement is tested against unsplit PyTorch. Native full-size training confirmation is pending; the solver-workspace diagnosis remains provisional until the actual repaired job runs. No scientific loss, initialization, pose, frame selection, scale or point count changes.
+
+## 2026-10-20 — Rational screen-center VJP (Codex gpt-6.1-sol)
+For c_i=sum(t*u_i*w)/d, d=sum(t*w²), t=(9,9,-1), the closed-form VJP is bar_u_i=b_i*t*w/d and bar_w=sum_i b_i*t*(u_i-2*c_i*w)/d. With b=-2*sum(g*alpha*(c-pixel)), the direct derivative agrees with CPU native-equation backward and autograd. Frozen172 fixtures fail their tile-window requirement and some float32 FD checks; this is diagnostic support, not accepted gradient coverage or native success. No replacement fixture or mathematical renderer change.

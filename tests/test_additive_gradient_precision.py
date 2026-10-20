@@ -118,5 +118,15 @@ class PackedCovarianceAcceptance(unittest.TestCase):
                         np.testing.assert_allclose(actual.detach().cpu().numpy(),reference.detach().numpy(),atol=3e-5,rtol=3e-4)
 
 
+        # Extend this mandatory 162/167 entry point; preserve all inherited checks.
+        import importlib.util
+        import sys
+        helper_dir = str(Path(__file__).resolve().parent)
+        if helper_dir not in sys.path:
+            sys.path.insert(0, helper_dir)
+        from screen_center_cases import native_screen_cases
+        native_screen_cases(self)
+
+
 if __name__ == '__main__':
     unittest.main()

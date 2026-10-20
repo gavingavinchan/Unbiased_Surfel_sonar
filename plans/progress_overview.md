@@ -590,3 +590,6 @@ No renderer, objective, submodule pointer or previous experiment was changed.
 ## 2026-10-17 — Bounded covariance solver workspace (Codex)
 
 Native 12,000-point fixed-density jobs stopped on their first update at a 6 GiB allocation limit; the 512-point acceptance case passed. Bound independent covariance eigvalsh/Cholesky/eigh calls to batches of 512, retaining autograd and covariance values. Allocation failures now propagate instead of being mistaken for non-positive covariance. CPU 12,000-matrix value/gradient agreement is tested against unsplit PyTorch. Native full-size training confirmation is pending; the solver-workspace diagnosis remains provisional until the actual repaired job runs. No scientific loss, initialization, pose, frame selection, scale or point count changes.
+
+## 2026-10-20 — Screen-center coverage experiment 172 (Codex gpt-6.1-sol)
+Test-only branch from exact PR6 d63fd31. Sixteen frozen low-variance arms activate the screen filter, but all fail the predeclared finite-window tile-stability condition. Keep the strict tests failing as evidence; do not adopt this branch or generate a native acceptance request from it. No renderer semantics or inherited targets change. Exact diagnostic values and failures are retained by experiment172, separately from compiled evidence (none).
