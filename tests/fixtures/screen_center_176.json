@@ -1,0 +1,161 @@
+{
+  "schema": 1,
+  "frozen_before_scores": "2026-10-20",
+  "covariances": [
+    [
+      [
+        0.08,
+        0.01
+      ],
+      [
+        0.01,
+        0.12
+      ]
+    ],
+    [
+      [
+        0.14,
+        -0.02
+      ],
+      [
+        -0.02,
+        0.18
+      ]
+    ]
+  ],
+  "mappings": [
+    {
+      "mean": [
+        0.25,
+        -0.35
+      ],
+      "affine": [
+        [
+          1.0336618828644994,
+          -0.30781812899310185,
+          6.88384818413629
+        ],
+        [
+          0.37622215765823563,
+          0.8457233587073176,
+          7.951947636133002
+        ],
+        [
+          0,
+          0,
+          1
+        ]
+      ],
+      "pixels": [
+        [
+          7,
+          8
+        ],
+        [
+          8,
+          8
+        ]
+      ],
+      "target_mean": [
+        7.25,
+        7.75
+      ],
+      "degrees": 20,
+      "scales": [
+        1.1,
+        0.9
+      ]
+    },
+    {
+      "mean": [
+        0.4,
+        0.2
+      ],
+      "affine": [
+        [
+          0.815677008332985,
+          0.4648800879147694,
+          7.830753179083852
+        ],
+        [
+          -0.3803564355666295,
+          0.996938565740315,
+          8.702754861078589
+        ],
+        [
+          0,
+          0,
+          1
+        ]
+      ],
+      "pixels": [
+        [
+          8,
+          9
+        ],
+        [
+          9,
+          9
+        ]
+      ],
+      "target_mean": [
+        8.25,
+        8.75
+      ],
+      "degrees": -25,
+      "scales": [
+        0.9,
+        1.1
+      ]
+    }
+  ],
+  "weights": [
+    0.7,
+    -0.3
+  ],
+  "opacity": 0.7,
+  "family": "2 covariance x 2 mapping x 2 factorization x 2 scalar/batch = 16; repeat each in float32 and float64",
+  "float32": {
+    "mean_step": 0.004,
+    "matrix_steps": [
+      0.002,
+      0.002,
+      0.004,
+      0.002,
+      0.002,
+      0.004,
+      5e-05,
+      5e-05,
+      0.0005
+    ],
+    "fd_relative_limit": 0.001
+  },
+  "float64": {
+    "mean_step": 1e-05,
+    "matrix_steps": [
+      1e-06,
+      1e-06,
+      1e-06,
+      1e-06,
+      1e-06,
+      1e-06,
+      1e-08,
+      1e-08,
+      1e-07
+    ],
+    "fd_relative_limit": 1e-06
+  },
+  "eligibility": {
+    "rho_margin_min": 0.05,
+    "alpha_lower_margin_min": 0.01,
+    "alpha_upper_margin_min": 0.1,
+    "tile_signature_unchanged": true,
+    "scored_filter_branch_unchanged": true
+  },
+  "native_forward_atol": 2e-06,
+  "native_forward_rtol": 2e-05,
+  "native_gradient_atol": 3e-05,
+  "native_gradient_rtol": 0.0003,
+  "negative": "negate independent full center chain; require rejection by native gradient tolerance for every case",
+  "provenance": "172 independent quotient VJP and negative-sign control, unchanged steps and tolerances; PR6 renderer unchanged"
+}

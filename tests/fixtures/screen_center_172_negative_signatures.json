@@ -1,0 +1,3490 @@
+[
+  {
+    "case": [
+      0,
+      0,
+      false,
+      false
+    ],
+    "dtype": "float32",
+    "eligibility_failures": [
+      {
+        "label": "matrix_6_plus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          1,
+          2
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_6_minus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          1,
+          2
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_7_plus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          1,
+          2
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_7_minus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          1,
+          2
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_8_plus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          1,
+          2
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_8_minus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          1,
+          2
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      }
+    ],
+    "matrix_fd_relative": 0.0019044996006414294,
+    "mean_fd_relative": 0.00011906907457159832
+  },
+  {
+    "case": [
+      0,
+      0,
+      false,
+      true
+    ],
+    "dtype": "float32",
+    "eligibility_failures": [
+      {
+        "label": "matrix_6_plus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          1,
+          2
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_6_minus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          1,
+          2
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_7_plus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          1,
+          2
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_7_minus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          1,
+          2
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_8_plus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          1,
+          2
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_8_minus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          1,
+          2
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      }
+    ],
+    "matrix_fd_relative": 0.0019044996006414294,
+    "mean_fd_relative": 0.00011906907457159832
+  },
+  {
+    "case": [
+      0,
+      0,
+      true,
+      false
+    ],
+    "dtype": "float32",
+    "eligibility_failures": [
+      {
+        "label": "matrix_6_plus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          1,
+          2
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_6_minus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          1,
+          2
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_7_plus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          1,
+          2
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_7_minus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          1,
+          2
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_8_plus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          1,
+          2
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_8_minus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          1,
+          2
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      }
+    ],
+    "matrix_fd_relative": 0.0019045195076614618,
+    "mean_fd_relative": 0.00011906907457159832
+  },
+  {
+    "case": [
+      0,
+      0,
+      true,
+      true
+    ],
+    "dtype": "float32",
+    "eligibility_failures": [
+      {
+        "label": "matrix_6_plus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          1,
+          2
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_6_minus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          1,
+          2
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_7_plus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          1,
+          2
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_7_minus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          1,
+          2
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_8_plus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          1,
+          2
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_8_minus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          1,
+          2
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      }
+    ],
+    "matrix_fd_relative": 0.0019045195076614618,
+    "mean_fd_relative": 0.00011906907457159832
+  },
+  {
+    "case": [
+      0,
+      1,
+      false,
+      false
+    ],
+    "dtype": "float32",
+    "eligibility_failures": [
+      {
+        "label": "matrix_6_plus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          2,
+          1
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_6_minus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          2,
+          1
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_7_plus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          2,
+          1
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_7_minus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          2,
+          1
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_8_plus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          2,
+          1
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_8_minus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          2,
+          1
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      }
+    ],
+    "matrix_fd_relative": 0.0004349701921455562,
+    "mean_fd_relative": 3.3411095046176342e-06
+  },
+  {
+    "case": [
+      0,
+      1,
+      false,
+      true
+    ],
+    "dtype": "float32",
+    "eligibility_failures": [
+      {
+        "label": "matrix_6_plus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          2,
+          1
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_6_minus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          2,
+          1
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_7_plus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          2,
+          1
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_7_minus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          2,
+          1
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_8_plus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          2,
+          1
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_8_minus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          2,
+          1
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      }
+    ],
+    "matrix_fd_relative": 0.0004349701921455562,
+    "mean_fd_relative": 3.3411095046176342e-06
+  },
+  {
+    "case": [
+      0,
+      1,
+      true,
+      false
+    ],
+    "dtype": "float32",
+    "eligibility_failures": [
+      {
+        "label": "matrix_6_plus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          2,
+          1
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_6_minus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          2,
+          1
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_7_plus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          2,
+          1
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_7_minus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          2,
+          1
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_8_plus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          2,
+          1
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_8_minus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          2,
+          1
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      }
+    ],
+    "matrix_fd_relative": 0.00043499894673004746,
+    "mean_fd_relative": 3.3411095046176342e-06
+  },
+  {
+    "case": [
+      0,
+      1,
+      true,
+      true
+    ],
+    "dtype": "float32",
+    "eligibility_failures": [
+      {
+        "label": "matrix_6_plus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          2,
+          1
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_6_minus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          2,
+          1
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_7_plus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          2,
+          1
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_7_minus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          2,
+          1
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_8_plus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          2,
+          1
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_8_minus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          2,
+          1
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      }
+    ],
+    "matrix_fd_relative": 0.00043499894673004746,
+    "mean_fd_relative": 3.3411095046176342e-06
+  },
+  {
+    "case": [
+      1,
+      0,
+      false,
+      false
+    ],
+    "dtype": "float32",
+    "eligibility_failures": [
+      {
+        "label": "matrix_6_plus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          1,
+          2
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_6_minus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          1,
+          2
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_7_plus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          1,
+          2
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_7_minus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          1,
+          2
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_8_plus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          1,
+          2
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_8_minus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          1,
+          2
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      }
+    ],
+    "matrix_fd_relative": 0.0009371729684062302,
+    "mean_fd_relative": 0.00011906907457159832
+  },
+  {
+    "case": [
+      1,
+      0,
+      false,
+      true
+    ],
+    "dtype": "float32",
+    "eligibility_failures": [
+      {
+        "label": "matrix_6_plus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          1,
+          2
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_6_minus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          1,
+          2
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_7_plus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          1,
+          2
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_7_minus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          1,
+          2
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_8_plus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          1,
+          2
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_8_minus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          1,
+          2
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      }
+    ],
+    "matrix_fd_relative": 0.0009371729684062302,
+    "mean_fd_relative": 0.00011906907457159832
+  },
+  {
+    "case": [
+      1,
+      0,
+      true,
+      false
+    ],
+    "dtype": "float32",
+    "eligibility_failures": [
+      {
+        "label": "matrix_6_plus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          1,
+          2
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_6_minus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          1,
+          2
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_7_plus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          1,
+          2
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_7_minus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          1,
+          2
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_8_plus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          1,
+          2
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_8_minus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          1,
+          2
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      }
+    ],
+    "matrix_fd_relative": 0.0009371558553539217,
+    "mean_fd_relative": 0.00011906907457159832
+  },
+  {
+    "case": [
+      1,
+      0,
+      true,
+      true
+    ],
+    "dtype": "float32",
+    "eligibility_failures": [
+      {
+        "label": "matrix_6_plus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          1,
+          2
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_6_minus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          1,
+          2
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_7_plus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          1,
+          2
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_7_minus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          1,
+          2
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_8_plus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          1,
+          2
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_8_minus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          1,
+          2
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      }
+    ],
+    "matrix_fd_relative": 0.0009371558553539217,
+    "mean_fd_relative": 0.00011906907457159832
+  },
+  {
+    "case": [
+      1,
+      1,
+      false,
+      false
+    ],
+    "dtype": "float32",
+    "eligibility_failures": [
+      {
+        "label": "matrix_6_plus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          2,
+          1
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_6_minus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          2,
+          1
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_7_plus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          2,
+          1
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_7_minus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          2,
+          1
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_8_plus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          2,
+          1
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_8_minus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          2,
+          1
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      }
+    ],
+    "matrix_fd_relative": 0.0008989533525891602,
+    "mean_fd_relative": 3.3411095046176342e-06
+  },
+  {
+    "case": [
+      1,
+      1,
+      false,
+      true
+    ],
+    "dtype": "float32",
+    "eligibility_failures": [
+      {
+        "label": "matrix_6_plus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          2,
+          1
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_6_minus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          2,
+          1
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_7_plus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          2,
+          1
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_7_minus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          2,
+          1
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_8_plus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          2,
+          1
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_8_minus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          2,
+          1
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      }
+    ],
+    "matrix_fd_relative": 0.0008989533525891602,
+    "mean_fd_relative": 3.3411095046176342e-06
+  },
+  {
+    "case": [
+      1,
+      1,
+      true,
+      false
+    ],
+    "dtype": "float32",
+    "eligibility_failures": [
+      {
+        "label": "matrix_6_plus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          2,
+          1
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_6_minus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          2,
+          1
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_7_plus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          2,
+          1
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_7_minus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          2,
+          1
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_8_plus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          2,
+          1
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_8_minus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          2,
+          1
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      }
+    ],
+    "matrix_fd_relative": 0.0008989390335045755,
+    "mean_fd_relative": 3.3411095046176342e-06
+  },
+  {
+    "case": [
+      1,
+      1,
+      true,
+      true
+    ],
+    "dtype": "float32",
+    "eligibility_failures": [
+      {
+        "label": "matrix_6_plus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          2,
+          1
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_6_minus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          2,
+          1
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_7_plus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          2,
+          1
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_7_minus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          2,
+          1
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_8_plus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          2,
+          1
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_8_minus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          2,
+          1
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      }
+    ],
+    "matrix_fd_relative": 0.0008989390335045755,
+    "mean_fd_relative": 3.3411095046176342e-06
+  },
+  {
+    "case": [
+      0,
+      0,
+      false,
+      false
+    ],
+    "dtype": "float64",
+    "eligibility_failures": [
+      {
+        "label": "matrix_6_plus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          1,
+          2
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_6_minus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          1,
+          2
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_7_plus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          1,
+          2
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_7_minus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          1,
+          2
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_8_plus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          1,
+          2
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_8_minus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          1,
+          2
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      }
+    ],
+    "matrix_fd_relative": 8.798610631072343e-09,
+    "mean_fd_relative": 2.763820102689631e-11
+  },
+  {
+    "case": [
+      0,
+      0,
+      false,
+      true
+    ],
+    "dtype": "float64",
+    "eligibility_failures": [
+      {
+        "label": "matrix_6_plus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          1,
+          2
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_6_minus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          1,
+          2
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_7_plus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          1,
+          2
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_7_minus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          1,
+          2
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_8_plus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          1,
+          2
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_8_minus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          1,
+          2
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      }
+    ],
+    "matrix_fd_relative": 8.798610631072343e-09,
+    "mean_fd_relative": 2.763820102689631e-11
+  },
+  {
+    "case": [
+      0,
+      0,
+      true,
+      false
+    ],
+    "dtype": "float64",
+    "eligibility_failures": [
+      {
+        "label": "matrix_6_plus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          1,
+          2
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_6_minus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          1,
+          2
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_7_plus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          1,
+          2
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_7_minus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          1,
+          2
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_8_plus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          1,
+          2
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_8_minus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          1,
+          2
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      }
+    ],
+    "matrix_fd_relative": 8.798610631072343e-09,
+    "mean_fd_relative": 2.763820102689631e-11
+  },
+  {
+    "case": [
+      0,
+      0,
+      true,
+      true
+    ],
+    "dtype": "float64",
+    "eligibility_failures": [
+      {
+        "label": "matrix_6_plus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          1,
+          2
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_6_minus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          1,
+          2
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_7_plus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          1,
+          2
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_7_minus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          1,
+          2
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_8_plus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          1,
+          2
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_8_minus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          1,
+          2
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      }
+    ],
+    "matrix_fd_relative": 8.798610631072343e-09,
+    "mean_fd_relative": 2.763820102689631e-11
+  },
+  {
+    "case": [
+      0,
+      1,
+      false,
+      false
+    ],
+    "dtype": "float64",
+    "eligibility_failures": [
+      {
+        "label": "matrix_6_plus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          2,
+          1
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_6_minus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          2,
+          1
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_7_plus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          2,
+          1
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_7_minus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          2,
+          1
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_8_plus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          2,
+          1
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_8_minus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          2,
+          1
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      }
+    ],
+    "matrix_fd_relative": 7.415122003316122e-09,
+    "mean_fd_relative": 1.1176701965199528e-10
+  },
+  {
+    "case": [
+      0,
+      1,
+      false,
+      true
+    ],
+    "dtype": "float64",
+    "eligibility_failures": [
+      {
+        "label": "matrix_6_plus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          2,
+          1
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_6_minus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          2,
+          1
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_7_plus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          2,
+          1
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_7_minus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          2,
+          1
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_8_plus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          2,
+          1
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_8_minus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          2,
+          1
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      }
+    ],
+    "matrix_fd_relative": 7.415122003316122e-09,
+    "mean_fd_relative": 1.1176701965199528e-10
+  },
+  {
+    "case": [
+      0,
+      1,
+      true,
+      false
+    ],
+    "dtype": "float64",
+    "eligibility_failures": [
+      {
+        "label": "matrix_6_plus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          2,
+          1
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_6_minus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          2,
+          1
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_7_plus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          2,
+          1
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_7_minus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          2,
+          1
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_8_plus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          2,
+          1
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_8_minus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          2,
+          1
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      }
+    ],
+    "matrix_fd_relative": 7.415122003316122e-09,
+    "mean_fd_relative": 1.1176701965199528e-10
+  },
+  {
+    "case": [
+      0,
+      1,
+      true,
+      true
+    ],
+    "dtype": "float64",
+    "eligibility_failures": [
+      {
+        "label": "matrix_6_plus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          2,
+          1
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_6_minus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          2,
+          1
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_7_plus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          2,
+          1
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_7_minus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          2,
+          1
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_8_plus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          2,
+          1
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_8_minus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          2,
+          1
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      }
+    ],
+    "matrix_fd_relative": 7.415122003316122e-09,
+    "mean_fd_relative": 1.1176701965199528e-10
+  },
+  {
+    "case": [
+      1,
+      0,
+      false,
+      false
+    ],
+    "dtype": "float64",
+    "eligibility_failures": [
+      {
+        "label": "matrix_6_plus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          1,
+          2
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_6_minus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          1,
+          2
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_7_plus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          1,
+          2
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_7_minus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          1,
+          2
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_8_plus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          1,
+          2
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_8_minus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          1,
+          2
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      }
+    ],
+    "matrix_fd_relative": 7.66447104197465e-09,
+    "mean_fd_relative": 2.763820102689631e-11
+  },
+  {
+    "case": [
+      1,
+      0,
+      false,
+      true
+    ],
+    "dtype": "float64",
+    "eligibility_failures": [
+      {
+        "label": "matrix_6_plus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          1,
+          2
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_6_minus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          1,
+          2
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_7_plus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          1,
+          2
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_7_minus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          1,
+          2
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_8_plus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          1,
+          2
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_8_minus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          1,
+          2
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      }
+    ],
+    "matrix_fd_relative": 7.66447104197465e-09,
+    "mean_fd_relative": 2.763820102689631e-11
+  },
+  {
+    "case": [
+      1,
+      0,
+      true,
+      false
+    ],
+    "dtype": "float64",
+    "eligibility_failures": [
+      {
+        "label": "matrix_6_plus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          1,
+          2
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_6_minus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          1,
+          2
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_7_plus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          1,
+          2
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_7_minus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          1,
+          2
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_8_plus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          1,
+          2
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_8_minus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          1,
+          2
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      }
+    ],
+    "matrix_fd_relative": 7.66447104197465e-09,
+    "mean_fd_relative": 2.763820102689631e-11
+  },
+  {
+    "case": [
+      1,
+      0,
+      true,
+      true
+    ],
+    "dtype": "float64",
+    "eligibility_failures": [
+      {
+        "label": "matrix_6_plus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          1,
+          2
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_6_minus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          1,
+          2
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_7_plus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          1,
+          2
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_7_minus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          1,
+          2
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_8_plus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          1,
+          2
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_8_minus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          1,
+          2
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      }
+    ],
+    "matrix_fd_relative": 7.66447104197465e-09,
+    "mean_fd_relative": 2.763820102689631e-11
+  },
+  {
+    "case": [
+      1,
+      1,
+      false,
+      false
+    ],
+    "dtype": "float64",
+    "eligibility_failures": [
+      {
+        "label": "matrix_6_plus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          2,
+          1
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_6_minus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          2,
+          1
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_7_plus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          2,
+          1
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_7_minus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          2,
+          1
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_8_plus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          2,
+          1
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_8_minus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          2,
+          1
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      }
+    ],
+    "matrix_fd_relative": 1.0611271994822103e-08,
+    "mean_fd_relative": 1.1176701965199528e-10
+  },
+  {
+    "case": [
+      1,
+      1,
+      false,
+      true
+    ],
+    "dtype": "float64",
+    "eligibility_failures": [
+      {
+        "label": "matrix_6_plus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          2,
+          1
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_6_minus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          2,
+          1
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_7_plus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          2,
+          1
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_7_minus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          2,
+          1
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_8_plus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          2,
+          1
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_8_minus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          2,
+          1
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      }
+    ],
+    "matrix_fd_relative": 1.0611271994822103e-08,
+    "mean_fd_relative": 1.1176701965199528e-10
+  },
+  {
+    "case": [
+      1,
+      1,
+      true,
+      false
+    ],
+    "dtype": "float64",
+    "eligibility_failures": [
+      {
+        "label": "matrix_6_plus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          2,
+          1
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_6_minus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          2,
+          1
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_7_plus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          2,
+          1
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_7_minus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          2,
+          1
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_8_plus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          2,
+          1
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_8_minus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          2,
+          1
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      }
+    ],
+    "matrix_fd_relative": 1.0611271994822103e-08,
+    "mean_fd_relative": 1.1176701965199528e-10
+  },
+  {
+    "case": [
+      1,
+      1,
+      true,
+      true
+    ],
+    "dtype": "float64",
+    "eligibility_failures": [
+      {
+        "label": "matrix_6_plus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          2,
+          1
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_6_minus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          2,
+          1
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_7_plus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          2,
+          1
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_7_minus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          2,
+          1
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_8_plus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          2,
+          1
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      },
+      {
+        "label": "matrix_8_minus",
+        "error": "eligibility assertion",
+        "base_tile": [
+          0,
+          0,
+          2,
+          1
+        ],
+        "actual_tile": [
+          0,
+          0,
+          1,
+          1
+        ]
+      }
+    ],
+    "matrix_fd_relative": 1.0611271994822103e-08,
+    "mean_fd_relative": 1.1176701965199528e-10
+  }
+]
