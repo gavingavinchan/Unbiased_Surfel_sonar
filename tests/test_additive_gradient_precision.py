@@ -52,5 +52,71 @@ class AdditiveGradientTests(unittest.TestCase):
         np.testing.assert_allclose(matrix.grad.cpu().numpy()[0],expected_matrix,atol=3e-5,rtol=3e-4)
 
 
+@unittest.skipUnless(torch is not None and torch.cuda.is_available(), 'native CUDA required')
+class PackedCovarianceAcceptance(unittest.TestCase):
+    """Staged 162 kernel acceptance; runs only in the registered native build.
+
+    Real scalar/batch callers, both factorization paths, correlated Gaussian
+    pixels and covariance/mean derivatives. The broad case catches omitted
+    above-threshold pixels beyond the inherited 3-sigma tile footprint.
+    """
+    def test_correlated_packing_gradients_and_tail_containment(self):
+        import ast
+        from pathlib import Path
+        from unittest.mock import patch
+        from diff_surfel_rasterization import GaussianRasterizationSettings, GaussianRasterizer
+        source=Path(__file__).resolve().parents[1]/'gaussian_renderer/__init__.py'
+        names={'_bounded_sonar_linalg','_condition_sigma_2d','_covariance_cholesky_2x2',
+               'sigma2d_to_transmat_precomp','_sigma2d_to_transmat_precomp_batch'}
+        nodes=[n for n in ast.parse(source.read_text()).body if isinstance(n,ast.FunctionDef) and n.name in names]
+        self.assertEqual({n.name for n in nodes},names)
+        ns={'torch':torch};exec(compile(ast.Module(body=nodes,type_ignores=[]),str(source),'exec'),ns)
+        eye=torch.eye(4,device='cuda')
+        size=192
+        settings=GaussianRasterizationSettings(image_height=size,image_width=size,
+            tanfovx=1.,tanfovy=1.,bg=torch.zeros(3,device='cuda'),ndc2world=eye,
+            scale_modifier=1.,viewmatrix=eye,projmatrix=eye,sh_degree=0,
+            campos=torch.zeros(3,device='cuda'),prefiltered=False,additive_mode=True,debug=False)
+        raster=GaussianRasterizer(settings)
+        yy,xx=torch.meshgrid(torch.arange(size,dtype=torch.float64),torch.arange(size,dtype=torch.float64),indexing='ij')
+        pixels=torch.stack((xx,yy),-1)
+        # Fixed integer observations, away from clipping and branch boundaries.
+        sy,sx=torch.meshgrid(torch.arange(90,106,2),torch.arange(88,104),indexing='ij')
+        sy=sy.flatten();sx=sx.flatten()
+        weights=torch.linspace(.1,.9,128,dtype=torch.float64)
+        fixtures=[[[2.,.6],[.6,4.]],[[2.,-.6],[-.6,4.]],
+                  [[7.,5.],[5.,6.]],[[360.,40.],[40.,340.]]]
+        def failure(x):raise torch.linalg.LinAlgError('forced native acceptance fallback')
+        for batch in (False,True):
+            for fallback in (False,True):
+                for raw in fixtures:
+                    sigma=torch.tensor(raw,device='cuda',dtype=torch.float32,requires_grad=True)
+                    mean=torch.tensor([97.2,99.3],device='cuda',dtype=torch.float32,requires_grad=True)
+                    fn=ns['_sigma2d_to_transmat_precomp_batch' if batch else 'sigma2d_to_transmat_precomp']
+                    def pack():return fn(mean[None],sigma[None]) if batch else fn(mean,sigma)
+                    if fallback:
+                        with patch.object(torch.linalg,'cholesky',failure):h=pack()
+                    else:h=pack()
+                    image,radii,_,_=raster(means3D=torch.tensor([[0.,0.,1.]],device='cuda'),
+                        means2D=torch.zeros(1,3,device='cuda'),opacities=torch.tensor([[.7]],device='cuda'),
+                        colors_precomp=torch.ones(1,3,device='cuda'),cov3D_precomp=h.reshape(1,9).contiguous())
+                    ref_sigma=sigma.detach().cpu().double().requires_grad_()
+                    ref_mean=mean.detach().cpu().double().requires_grad_()
+                    target=ns['_condition_sigma_2d'](ref_sigma)
+                    delta=pixels-ref_mean
+                    solved=torch.linalg.solve(target,delta.reshape(-1,2).T).T.reshape(size,size,2)
+                    rho=torch.minimum((delta*solved).sum(-1),2*delta.square().sum(-1))
+                    alpha=.7*torch.exp(-.5*rho)
+                    expected=torch.where(alpha>=1/255,alpha,torch.zeros_like(alpha))
+                    np.testing.assert_allclose(image[0].detach().cpu().numpy(),expected.detach().numpy(),atol=2e-6,rtol=2e-5)
+                    self.assertGreater(int(radii[0]),0)
+                    gpu_loss=(image[0,sy.to('cuda'),sx.to('cuda')]*weights.to(device='cuda',dtype=torch.float32)).sum()
+                    gpu_grads=torch.autograd.grad(gpu_loss,(sigma,mean))
+                    ref_loss=(expected[sy,sx]*weights).sum()
+                    ref_grads=torch.autograd.grad(ref_loss,(ref_sigma,ref_mean))
+                    for actual,reference in zip(gpu_grads,ref_grads):
+                        np.testing.assert_allclose(actual.detach().cpu().numpy(),reference.detach().numpy(),atol=3e-5,rtol=3e-4)
+
+
 if __name__ == '__main__':
     unittest.main()
