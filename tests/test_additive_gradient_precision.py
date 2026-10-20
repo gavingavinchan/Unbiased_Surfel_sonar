@@ -85,7 +85,7 @@ class PackedCovarianceAcceptance(unittest.TestCase):
         sy=sy.flatten();sx=sx.flatten()
         weights=torch.linspace(.1,.9,128,dtype=torch.float64)
         fixtures=[[[2.,.6],[.6,4.]],[[2.,-.6],[-.6,4.]],
-                  [[7.,5.],[5.,6.]],[[360.,40.],[40.,340.]]]
+                  [[7.,5.],[5.,6.]],[[390.,5.],[5.,380.]]]
         def failure(x):raise torch.linalg.LinAlgError('forced native acceptance fallback')
         for batch in (False,True):
             for fallback in (False,True):
