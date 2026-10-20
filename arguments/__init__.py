@@ -64,6 +64,10 @@ class ModelParams(ParamGroup):
         self.sonar_elevation_fov = 20.0     # degrees (total elevation spread)
         self.sonar_range_min = 0.2          # meters (20 cm)
         self.sonar_range_max = 3.0          # meters (3 m)
+        self.sonar_range_origin = float("nan")  # explicit override of range_min
+        self.sonar_range_span = float("nan")    # explicit override of max-min
+        self.sonar_pixel_center_offset = 0.5
+        self.sonar_pose_mode = "poses_are_sonar"  # camera mount is opt-in
         self.sonar_intensity_threshold = 0.01  # for valid mask (intensity > threshold)
         # Scale factor parameters (to align COLMAP arbitrary scale with sonar metric range)
         self.sonar_scale_init = 1.0         # initial scale factor value

@@ -79,6 +79,7 @@ def _load_sonar_utils_module():
     return module
 
 
+@pytest.mark.cuda
 def test_rb_t01_create_from_pcd_uses_input_normals_for_rotation_contract():
     if not torch.cuda.is_available():
         pytest.skip("RB-T01 contract requires CUDA path used by create_from_pcd")
@@ -126,6 +127,7 @@ def test_rb_t01_create_from_pcd_uses_input_normals_for_rotation_contract():
     assert torch.all(cosine > 0.999), "RB-T01: output quaternion normals must align with input pcd.normals"
 
 
+@pytest.mark.cuda
 def test_rb_t02_normal_based_rotation_is_seed_stable_contract():
     if not torch.cuda.is_available():
         pytest.skip("RB-T02 contract requires CUDA path used by create_from_pcd")
@@ -291,6 +293,7 @@ def test_rb_t10_forward_then_backward_projection_roundtrip_contract():
     camera = SimpleNamespace(
         R=np.eye(3, dtype=np.float32),
         T=np.zeros(3, dtype=np.float32),
+        world_view_transform=torch.eye(4, dtype=torch.float32),
         original_image=image,
     )
 

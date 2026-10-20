@@ -41,16 +41,23 @@ def sonar_polar_to_points(azimuth: torch.Tensor, elevation: torch.Tensor, range_
     return torch.stack([x, y, z], dim=-1)
 
 
-def get_scaled_world_to_view_transform(viewpoint_camera, scale_factor=None, sonar_extrinsic=None) -> torch.Tensor:
+def get_scaled_world_to_view_transform(viewpoint_camera, scale_factor=None, sonar_extrinsic=None, *, dtype=None) -> torch.Tensor:
     """
-    Build world->view transform using repository row-major layout.
+    Build S = conventional W2C.T, for homogeneous row-vector multiplication.
+
+    World points and camera translation share SfM units. Scale both to metres
+    BEFORE composing a metric camera-to-sonar extrinsic: S_sonar = S_camera @ E.T.
+    The rotation block stores R_c2w; it must NOT be transposed on forward use.
 
     Layout contract:
       - rotation in [:3, :3]
       - translation in [3, :3]
       - first three entries of [:3, 3] expected to be 0
     """
-    w2v = viewpoint_camera.world_view_transform.clone()
+    source = viewpoint_camera.world_view_transform
+    if dtype == torch.float64:
+        source = getattr(viewpoint_camera, "world_view_transform_precise", source)
+    w2v = source.clone() if dtype is None else source.to(dtype=dtype).clone()
     if scale_factor is not None:
         w2v[3, :3] = scale_factor.scale * w2v[3, :3]
     if sonar_extrinsic is not None:
@@ -59,10 +66,11 @@ def get_scaled_world_to_view_transform(viewpoint_camera, scale_factor=None, sona
 
 
 def view_points_to_world(points_view: torch.Tensor, w2v: torch.Tensor, scale_factor=None) -> torch.Tensor:
-    """Convert view-frame points to world-frame points under row-major transform semantics."""
+    """Invert S=W2C.T: (p_view - S[3,:3]) @ S[:3,:3].T / scale."""
+    points_view = points_view.to(w2v)
     R_w2v = w2v[:3, :3]
     t_w2v = w2v[3, :3]
-    points_world_scaled = (points_view - t_w2v.unsqueeze(0)) @ R_w2v
+    points_world_scaled = (points_view - t_w2v) @ R_w2v.T
     if scale_factor is not None:
         points_world = points_world_scaled / scale_factor.scale
     else:
@@ -105,7 +113,10 @@ def back_project_bins(
     cols_f = cols.to(dtype=torch.float32)
     elev_bins = elev_bins.to(device=device, dtype=torch.float32)
 
-    azimuth, range_vals = sonar_config.pixel_to_polar(cols_f, rows_f)
+    azimuth, range_vals = sonar_config.pixel_to_polar(
+        cols_f, rows_f, image_width=getattr(camera, "image_width", sonar_config.image_width),
+        image_height=getattr(camera, "image_height", sonar_config.image_height),
+    )
     P = rows.shape[0]
     K = elev_bins.shape[0]
 
@@ -119,6 +130,7 @@ def back_project_bins(
         range_pk.reshape(-1),
     )
 
+    sonar_extrinsic = resolve_sonar_extrinsic(sonar_config, sonar_extrinsic)
     w2v = get_scaled_world_to_view_transform(camera, scale_factor=scale_factor, sonar_extrinsic=sonar_extrinsic)
     points_world = view_points_to_world(points_view, w2v, scale_factor=scale_factor)
     return points_world.reshape(P, K, 3)
@@ -212,9 +224,9 @@ def assert_transform_roundtrip(sample_camera=None, device: str = "cuda", atol: f
         t_w2v = w2v[3, :3]
         pts_cam = pts.to(device=w2v.device, dtype=w2v.dtype)
         # Validate transform roundtrip under renderer semantics:
-        # p_view = p_world @ R.T + t; p_world = (p_view - t) @ R
-        pts_view = pts_cam @ R_w2v.T + t_w2v
-        pts_recovered = (pts_view - t_w2v) @ R_w2v
+        # Stored S = conventional W2C.T: p_view = p_world @ S[:3,:3] + t.
+        pts_view = pts_cam @ R_w2v + t_w2v
+        pts_recovered = (pts_view - t_w2v) @ R_w2v.T
         layout_roundtrip_max_abs = torch.max(torch.abs(pts_recovered - pts_cam)).item()
         if layout_roundtrip_max_abs > atol:
             _raise_convention_error(
@@ -295,6 +307,17 @@ class SonarScaleFactor(nn.Module):
         return 0.0
 
 
+APERTURE_QUANTUM_RAD = 2.0 ** -19
+
+
+def sonar_aperture_masks(azimuth, elevation, half_azimuth, half_elevation):
+    """Closed angular boundary on a fixed signed-clearance lattice (radians)."""
+    def closed_boundary(angle, half):
+        clearance = float(half) - torch.abs(angle).to(torch.float64)
+        return torch.round(clearance / APERTURE_QUANTUM_RAD) >= 0
+    return closed_boundary(azimuth, half_azimuth), closed_boundary(elevation, half_elevation)
+
+
 class SonarConfig:
     """
     Configuration class for sonar parameters.
@@ -310,8 +333,27 @@ class SonarConfig:
         range_min: float = 0.2,          # meters
         range_max: float = 3.0,          # meters
         intensity_threshold: float = 0.01,
-        device: str = "cuda"
+        device: str = "cuda",
+        pixel_center_offset: float = 0.5,
+        range_origin=None,
+        range_span=None,
+        pose_mode=None,
     ):
+        # range_min/max remain aliases for callers using the original API.
+        if range_origin is not None:
+            range_min = float(range_origin)
+        if range_span is not None:
+            range_max = range_min + float(range_span)
+        if not (math.isfinite(range_min) and math.isfinite(range_max) and range_max > range_min):
+            raise ValueError("Sonar range origin/span must define a finite positive span")
+        if pixel_center_offset not in (0.0, 0.5):
+            raise ValueError("pixel_center_offset must be 0 (archive edges) or 0.5 (centres)")
+        if pose_mode not in (None, "poses_are_camera", "poses_are_sonar"):
+            raise ValueError("pose_mode must be poses_are_camera or poses_are_sonar")
+        self.range_origin = range_min
+        self.range_span = range_max - range_min
+        self.pose_mode = pose_mode
+        self.sonar_extrinsic = SonarExtrinsic(device=device) if pose_mode == "poses_are_camera" else None
         self.image_width = image_width
         self.image_height = image_height
         self.azimuth_fov = azimuth_fov
@@ -320,6 +362,7 @@ class SonarConfig:
         self.range_max = range_max
         self.intensity_threshold = intensity_threshold
         self.device = device
+        self.pixel_center_offset = pixel_center_offset
         
         # Convert FOV to radians
         self.azimuth_fov_rad = math.radians(azimuth_fov)
@@ -328,26 +371,23 @@ class SonarConfig:
         self.half_elevation_rad = self.elevation_fov_rad / 2  # ±10 degrees
         
         # Precompute azimuth angles for each column
-        # Center column (128) = 0 degrees
-        # Left (col 0) = +60 degrees (positive azimuth), Right (col 255) = -60 degrees (negative azimuth)
-        # Convention: +X direction in world/sonar frame = negative azimuth
+        # Bin centres span the full aperture: left-positive azimuth.
+        # For even widths boresight lies between the two central columns.
         cols = torch.arange(image_width, dtype=torch.float32, device=device)
-        self.azimuth_grid = -(cols - image_width / 2) / (image_width / 2) * self.half_azimuth_rad
+        self.azimuth_grid = -(cols + self.pixel_center_offset - image_width / 2) / (image_width / 2) * self.half_azimuth_rad
         
         # Precompute range values for each row
-        # Top row (0) = range_min, Bottom row (199) = range_max
+        # RangeMin is the grid origin; centres lie half a bin inside the edges.
         rows = torch.arange(image_height, dtype=torch.float32, device=device)
-        self.range_grid = range_min + (rows / image_height) * (range_max - range_min)
+        self.range_grid = range_min + ((rows + self.pixel_center_offset) / image_height) * (range_max - range_min)
         
         # Create meshgrid for full image
         self.azimuth_mesh, self.range_mesh = torch.meshgrid(
             self.azimuth_grid, self.range_grid, indexing='xy'
         )
-        # Transpose to get shape [H, W] where H=rows (range), W=cols (azimuth)
-        self.azimuth_mesh = self.azimuth_mesh.T  # [H, W]
-        self.range_mesh = self.range_mesh.T      # [H, W]
+        # indexing="xy" already yields [H range rows, W azimuth columns].
     
-    def pixel_to_polar(self, col: torch.Tensor, row: torch.Tensor):
+    def pixel_to_polar(self, col: torch.Tensor, row: torch.Tensor, *, image_width=None, image_height=None):
         """
         Convert pixel coordinates to polar (azimuth, range).
         
@@ -364,11 +404,13 @@ class SonarConfig:
             range_val: Range values in meters
         """
         # Negate to flip azimuth direction: left = positive, right = negative
-        azimuth = -(col - self.image_width / 2) / (self.image_width / 2) * self.half_azimuth_rad
-        range_val = self.range_min + (row / self.image_height) * (self.range_max - self.range_min)
+        W = self.image_width if image_width is None else image_width
+        H = self.image_height if image_height is None else image_height
+        azimuth = -(col + self.pixel_center_offset - W / 2) / (W / 2) * self.half_azimuth_rad
+        range_val = self.range_min + ((row + self.pixel_center_offset) / H) * (self.range_max - self.range_min)
         return azimuth, range_val
     
-    def polar_to_pixel(self, azimuth: torch.Tensor, range_val: torch.Tensor):
+    def polar_to_pixel(self, azimuth: torch.Tensor, range_val: torch.Tensor, *, image_width=None, image_height=None):
         """
         Convert polar (azimuth, range) to pixel coordinates.
         
@@ -385,48 +427,77 @@ class SonarConfig:
             row: Row indices (float)
         """
         # Negate azimuth to flip direction: positive azimuth → left (lower col)
-        col = (-azimuth / self.half_azimuth_rad + 1) * (self.image_width / 2)
-        row = (range_val - self.range_min) / (self.range_max - self.range_min) * self.image_height
+        W = self.image_width if image_width is None else image_width
+        H = self.image_height if image_height is None else image_height
+        col = (-azimuth / self.half_azimuth_rad + 1) * (W / 2) - self.pixel_center_offset
+        row = (range_val - self.range_min) / (self.range_max - self.range_min) * H - self.pixel_center_offset
         return col, row
     
-    def is_in_fov(self, azimuth: torch.Tensor, elevation: torch.Tensor, range_val: torch.Tensor):
-        """
-        Check if points are within sonar field of view.
-        
-        Args:
-            azimuth: Azimuth angles in radians
-            elevation: Elevation angles in radians
-            range_val: Range values in meters
-            
-        Returns:
-            Boolean mask of valid points
-        """
-        valid_azimuth = torch.abs(azimuth) <= self.half_azimuth_rad
-        valid_elevation = torch.abs(elevation) <= self.half_elevation_rad
+    # Membership uses a fixed angular lattice, independent of dtype and dataset.
+    # Signed clearance is rounded to nearest-even ticks; tick zero is the CLOSED
+    # boundary. This resolves float32 transform/atan2 noise on nominal endpoints.
+    # Raw angles/pixels are never rounded: this policy changes only membership.
+    aperture_quantum_rad = APERTURE_QUANTUM_RAD
+
+    def aperture_masks(self, azimuth, elevation):
+        return sonar_aperture_masks(azimuth, elevation, self.half_azimuth_rad, self.half_elevation_rad)
+
+    def is_in_fov(self, azimuth, elevation, range_val):
+        """Closed quantized angular aperture, closed metric range interval."""
+        valid_azimuth, valid_elevation = self.aperture_masks(azimuth, elevation)
         valid_range = (range_val >= self.range_min) & (range_val <= self.range_max)
         return valid_azimuth & valid_elevation & valid_range
 
 
-def build_sonar_config(args) -> SonarConfig:
+def resolve_sonar_extrinsic(sonar_config, sonar_extrinsic=None):
+    """Route pose mode once at every geometry entry point.
+
+    Low-level legacy configs (pose_mode=None) retain explicit-extrinsic behavior.
+    Native entry points always select a mode. Already-sonar poses forbid a mount.
     """
-    Build SonarConfig from command-line arguments.
-    
-    Args:
-        args: Parsed arguments containing sonar parameters
-        
-    Returns:
-        SonarConfig instance
-    """
+    mode = getattr(sonar_config, "pose_mode", None)
+    if mode == "poses_are_sonar":
+        if sonar_extrinsic is not None:
+            raise ValueError("Already-sonar poses must not receive a camera mount")
+        return None
+    if mode == "poses_are_camera" and sonar_extrinsic is None:
+        return sonar_config.sonar_extrinsic
+    return sonar_extrinsic
+
+
+def build_sonar_config(args, *, image_width=256, image_height=200, device="cuda") -> SonarConfig:
+    """Shared native CLI/debug factory. Explicit origin/span override old min/max aliases."""
+    origin = getattr(args, "sonar_range_origin", float("nan"))
+    span = getattr(args, "sonar_range_span", float("nan"))
+    if origin is None or math.isnan(origin):
+        origin = getattr(args, "sonar_range_min", 0.2)
+    if span is None or math.isnan(span):
+        span = getattr(args, "sonar_range_max", 3.0) - origin
     return SonarConfig(
-        image_width=256,   # Sonoptix Echo default
-        image_height=200,  # Sonoptix Echo default
+        image_width=image_width, image_height=image_height,
         azimuth_fov=args.sonar_azimuth_fov,
         elevation_fov=args.sonar_elevation_fov,
-        range_min=args.sonar_range_min,
-        range_max=args.sonar_range_max,
+        range_origin=origin, range_span=span,
+        pixel_center_offset=getattr(args, "sonar_pixel_center_offset", 0.5),
+        pose_mode=getattr(args, "sonar_pose_mode", "poses_are_sonar"),
         intensity_threshold=args.sonar_intensity_threshold,
-        device="cuda"
+        device=device,
     )
+
+
+def build_debug_sonar_config(environ, *, image_width=256, image_height=200, device="cuda"):
+    """Debug environment uses precisely the same routing as train.py."""
+    from types import SimpleNamespace
+    args = SimpleNamespace(
+        sonar_azimuth_fov=float(environ.get("SONAR_AZIMUTH_FOV", "120")),
+        sonar_elevation_fov=float(environ.get("SONAR_ELEVATION_FOV", "20")),
+        sonar_range_origin=float(environ.get("SONAR_RANGE_ORIGIN", "0.2")),
+        sonar_range_span=float(environ.get("SONAR_RANGE_SPAN", "2.8")),
+        sonar_pixel_center_offset=float(environ.get("SONAR_PIXEL_CENTER_OFFSET", "0.5")),
+        sonar_pose_mode=environ.get("SONAR_POSE_MODE", "poses_are_sonar"),
+        sonar_intensity_threshold=0.01,
+    )
+    return build_sonar_config(args, image_width=image_width, image_height=image_height, device=device)
 
 
 # =============================================================================
@@ -439,7 +510,8 @@ def get_camera_to_sonar_transform(device="cuda"):
 
     Contract:
       - Translation is stored in row 3 (T[3, :3]).
-      - Intended for row-vector transforms: p_out = p_in @ R.T + t.
+      - Stores E.T for row-vector transforms: p_out_h = p_in_h @ E.T.
+      - Defaults are historical provisional assumptions, not measured calibration.
       - Mount tuple in camera frame is SONAR_MOUNT_TRANSLATION_CAM.
 
     Returns:
@@ -471,7 +543,7 @@ def get_camera_to_sonar_transform(device="cuda"):
     
     # Build row-major homogeneous transform (translation in row 3).
     T_cam_to_sonar = torch.eye(4, device=device, dtype=dtype)
-    T_cam_to_sonar[:3, :3] = R_cam_to_sonar
+    T_cam_to_sonar[:3, :3] = R_cam_to_sonar.T
     T_cam_to_sonar[3, :3] = t_cam_to_sonar
     
     return T_cam_to_sonar
@@ -504,10 +576,24 @@ class SonarExtrinsic(nn.Module):
     This module stores the fixed extrinsic transform and can apply it to camera poses.
     """
     
-    def __init__(self, device="cuda"):
+    def __init__(self, device="cuda", camera_to_sonar=None):
         super().__init__()
-        # Register as buffer (not trainable, but moves with model)
-        T_c2s = get_camera_to_sonar_transform(device)
+        # Supplied matrix is conventional E=sonar_T_camera, translation in column 3,
+        # in metres. Historical defaults are provisional and must be recorded.
+        if camera_to_sonar is None:
+            T_c2s = get_camera_to_sonar_transform(device)
+        else:
+            E = torch.as_tensor(camera_to_sonar, device=device)
+            if not E.is_floating_point():
+                E = E.float()
+            if E.shape != (4, 4):
+                raise ValueError("camera_to_sonar must be a conventional rigid 4x4 matrix")
+            R = E[:3, :3]
+            if not (torch.allclose(E[3], E.new_tensor([0, 0, 0, 1]), atol=1e-6)
+                    and torch.allclose(R.T @ R, torch.eye(3, device=R.device, dtype=R.dtype), atol=1e-5)
+                    and torch.allclose(torch.det(R), R.new_tensor(1), atol=1e-5)):
+                raise ValueError("camera_to_sonar must be a proper rigid transform")
+            T_c2s = E.T.contiguous()
         self.register_buffer('T_cam_to_sonar', T_c2s)
     
     def forward(self, camera_pose_w2c):
@@ -520,7 +606,7 @@ class SonarExtrinsic(nn.Module):
         Returns:
             [4, 4] world-to-sonar transformation
         """
-        return camera_pose_w2c @ self.T_cam_to_sonar
+        return camera_pose_w2c @ self.T_cam_to_sonar.to(camera_pose_w2c)
     
     def inverse_transform(self, sonar_pose_w2s):
         """
@@ -549,6 +635,7 @@ def sonar_frame_to_points(
     elevation_mode="random",
     rng=None,
     return_debug=False,
+    sonar_extrinsic=None,
 ):
     """
     Generate 3D points from a single sonar frame via backward projection.
@@ -624,10 +711,10 @@ def sonar_frame_to_points(
     # Convert pixel coords to polar (azimuth, range)
     # Azimuth: center column = 0, left = positive, right = negative
     half_az_rad = math.radians(sonar_config.azimuth_fov / 2)
-    azimuth = -(cols - W / 2) / (W / 2) * half_az_rad  # radians
+    azimuth, range_vals_metric = sonar_config.pixel_to_polar(cols, rows, image_width=W, image_height=H)  # radians
     
     # Range: top row = range_min, bottom row = range_max (metric)
-    range_vals_metric = sonar_config.range_min + (rows / H) * (sonar_config.range_max - sonar_config.range_min)
+    # Range grid origin and acoustic near-field exclusion are separate settings.
     
     # Convert to 3D in sonar/camera frame (metric)
     # Camera frame: +Z forward, +X right, +Y down
@@ -647,20 +734,17 @@ def sonar_frame_to_points(
     
     points_cam_metric = np.stack([x_cam, y_cam, z_cam], axis=1)  # [N, 3] metric
     
-    # Transform to world coordinates.
-    # In this codebase, camera.R stores the camera-to-world rotation (R_c2w), while
-    # camera.T stores the world-to-camera translation (t_w2c).
-    # point_world = R_c2w @ point_cam + camera_center, where camera_center = -R_c2w @ t_w2c.
+    # Use the actual stored camera transform (includes Camera scene offsets).
+    sonar_extrinsic = resolve_sonar_extrinsic(sonar_config, sonar_extrinsic)
+    w2v = get_scaled_world_to_view_transform(
+        camera, scale_factor=type("Scale", (), {"scale": scale_factor})(),
+        sonar_extrinsic=sonar_extrinsic,
+    )
+    local = torch.as_tensor(points_cam_metric, device=w2v.device, dtype=w2v.dtype)
+    points_world = view_points_to_world(
+        local, w2v, scale_factor=type("Scale", (), {"scale": scale_factor})(),
+    ).detach().cpu().numpy()
 
-    R_c2w = camera.R  # [3, 3]
-    T_w2c = camera.T  # [3]
-    camera_center_colmap = -R_c2w @ T_w2c
-    camera_center_metric = camera_center_colmap * scale_factor
-    
-    # Transform points: point_world_metric = R_c2w @ point_cam_metric + camera_center_metric
-    points_world_metric = (R_c2w @ points_cam_metric.T).T + camera_center_metric  # [N, 3] metric
-    points_world = points_world_metric / scale_factor  # back to COLMAP scale
-    
     # Get colors from intensity (grayscale -> RGB)
     intensities = intensity[rows, cols]
     colors = np.stack([intensities, intensities, intensities], axis=1)  # [N, 3]
@@ -692,6 +776,7 @@ def sonar_frames_to_point_cloud(
     scale_factor=1.0,
     elevation_mode="random",
     rng=None,
+    sonar_extrinsic=None,
 ):
     """
     Generate combined 3D point cloud from multiple sonar frames.
@@ -724,6 +809,7 @@ def sonar_frames_to_point_cloud(
             elevation_mode=elevation_mode,
             rng=rng,
             return_debug=False,
+            sonar_extrinsic=sonar_extrinsic,
         )
         points, colors = frame_result[0], frame_result[1]
         
@@ -732,7 +818,8 @@ def sonar_frames_to_point_cloud(
         
         # Optionally limit points per frame
         if max_points_per_frame is not None and len(points) > max_points_per_frame:
-            indices = np.random.choice(len(points), max_points_per_frame, replace=False)
+            sampler = np.random if rng is None else rng
+            indices = sampler.choice(len(points), max_points_per_frame, replace=False)
             points = points[indices]
             colors = colors[indices]
         
