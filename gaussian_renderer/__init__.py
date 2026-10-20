@@ -449,8 +449,7 @@ def _covariance_cholesky_2x2(sigma):
     _condition_sigma_2d owns the variance and condition-number policy.
     Elementwise operations preserve dtype/device/autograd and need no solver
     workspace. Invalid conditioned matrices fail instead of changing policy.
-    This retains the Python decoder/normal factor convention; it does not
-    correct the separate inherited native interpretation of the packed rows.
+    The precomputed transform stores this lower factor as native pixel rows.
     """
     if sigma.shape[-2:] != (2, 2) or not torch.isfinite(sigma).all():
         raise ValueError("Expected finite conditioned 2x2 covariance")
@@ -471,6 +470,11 @@ def _covariance_cholesky_2x2(sigma):
 
 
 def sigma2d_to_transmat_precomp(mu_2d, sigma_2d):
+    """Row-major affine H=[L, mu; 0, 1], with conditioned Sigma=L L^T.
+
+    Native ray-plane equations read consecutive triples as pixel rows.
+    Store the lower factor itself, not its transpose (see PACKED_FACTOR.md).
+    """
     if not torch.isfinite(sigma_2d).all():
         raise ValueError("Expected finite covariance before conditioning")
     sigma_conditioned = _condition_sigma_2d(sigma_2d)
@@ -481,21 +485,16 @@ def sigma2d_to_transmat_precomp(mu_2d, sigma_2d):
 
     zero = sigma_2d.new_tensor(0.0)
     one = sigma_2d.new_tensor(1.0)
-    row0 = torch.stack([chol[0, 0], chol[1, 0], mu_2d[0]])
-    row1 = torch.stack([zero, chol[1, 1], mu_2d[1]])
+    row0 = torch.stack([chol[0, 0], zero, mu_2d[0]])
+    row1 = torch.stack([chol[1, 0], chol[1, 1], mu_2d[1]])
     row2 = torch.stack([zero, zero, one])
     return torch.stack([row0, row1, row2], dim=0)
 
 
 def transmat_precomp_to_sigma2d(transmat_precomp):
-    l = torch.stack(
-        [
-            torch.stack([transmat_precomp[0, 0], transmat_precomp[1, 0]]),
-            torch.stack([transmat_precomp[0, 1], transmat_precomp[1, 1]]),
-        ],
-        dim=0,
-    )
-    sigma_2d = l @ l.T
+    """Decode affine pixel-row storage, including nontriangular affine blocks."""
+    a = transmat_precomp[:2, :2]
+    sigma_2d = a @ a.T
     return 0.5 * (sigma_2d + sigma_2d.T)
 
 
@@ -1004,6 +1003,7 @@ def marginalize_elevation_bins(returns_aer, elev_weights=None):
 
 
 def _sigma2d_to_transmat_precomp_batch(mu_2d, sigma_2d):
+    """Batched row-major lower-factor contract; identical to the scalar caller."""
     if not torch.isfinite(sigma_2d).all():
         raise ValueError("Expected finite covariance before conditioning")
     sigma_conditioned = _condition_sigma_2d(sigma_2d)
@@ -1014,8 +1014,8 @@ def _sigma2d_to_transmat_precomp_batch(mu_2d, sigma_2d):
 
     zero = mu_2d.new_zeros(mu_2d.shape[0])
     one = mu_2d.new_ones(mu_2d.shape[0])
-    row0 = torch.stack([chol[:, 0, 0], chol[:, 1, 0], mu_2d[:, 0]], dim=-1)
-    row1 = torch.stack([zero, chol[:, 1, 1], mu_2d[:, 1]], dim=-1)
+    row0 = torch.stack([chol[:, 0, 0], zero, mu_2d[:, 0]], dim=-1)
+    row1 = torch.stack([chol[:, 1, 0], chol[:, 1, 1], mu_2d[:, 1]], dim=-1)
     row2 = torch.stack([zero, zero, one], dim=-1)
     return torch.stack([row0, row1, row2], dim=1)
 

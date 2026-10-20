@@ -42,13 +42,10 @@ def fail_cholesky(matrix):
 
 
 def packed_covariance(t):
-    # Existing Python decoder regards the packed upper block as L^T.
-    # Read the actual nine stored entries, independently of the decoder.
-    # IMPORTANT: native forward consumes these as rows instead. Its separate
-    # inherited normal-path mismatch is measured by the experiment audit;
-    # this scoped correction must not change that packing convention.
+    # Contract v2: contiguous native pixel rows contain the LOWER factor.
+    # Same covariance target and tolerances as before; only storage changed.
     flat = t.reshape(*t.shape[:-2], 9)
-    a,b,c = flat[...,0], flat[...,1], flat[...,4]
+    a,b,c = flat[...,0], flat[...,3], flat[...,4]
     return torch.stack([torch.stack([a*a,a*b],-1),
                         torch.stack([a*b,b*b+c*c],-1)],-2)
 
@@ -190,8 +187,7 @@ def test_conditioned_helper_shape_and_no_hidden_floor():
 
 @pytest.mark.parametrize('dtype',[torch.float32,torch.float64])
 def test_fallback_preserves_native_normal_representation(dtype):
-    # Preserve the native convention per scope; do not claim this is the
-    # conditioned covariance. The retained audit reports that unmet criterion.
+    # Both paths must share the corrected native representation.
     ns=load_renderer();sigma=rotated_spd(dtype);mu=torch.zeros(len(sigma),2,dtype=dtype)
     normal=caller(ns,True)(mu,sigma)
     with patch.object(torch.linalg,'cholesky',fail_cholesky):actual=caller(ns,True)(mu,sigma)
