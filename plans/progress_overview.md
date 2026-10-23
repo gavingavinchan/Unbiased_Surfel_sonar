@@ -590,3 +590,11 @@ No renderer, objective, submodule pointer or previous experiment was changed.
 ## 2026-10-17 — Bounded covariance solver workspace (Codex)
 
 Native 12,000-point fixed-density jobs stopped on their first update at a 6 GiB allocation limit; the 512-point acceptance case passed. Bound independent covariance eigvalsh/Cholesky/eigh calls to batches of 512, retaining autograd and covariance values. Allocation failures now propagate instead of being mistaken for non-positive covariance. CPU 12,000-matrix value/gradient agreement is tested against unsplit PyTorch. Native full-size training confirmation is pending; the solver-workspace diagnosis remains provisional until the actual repaired job runs. No scientific loss, initialization, pose, frame selection, scale or point count changes.
+
+## 2026-10-22 — Directional sonar surface reference (Codex)
+Experiment241 retains PR6 and adds a CPU/CUDA PyTorch ray-plane reference.
+Visibility is per elevation/azimuth subray before native range integration;
+multiple true returns in one bearing survive. CPU fixture/gradient/restore
+checks run in the experiment. Fixed1000-step CPU diagnostic outputs and guarded
+native registration boundary are reported there. No merge/pointer change or
+new native acceptance is claimed. See DIRECTIONAL_SONAR.md for scope/limits.

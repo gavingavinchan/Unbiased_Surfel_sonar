@@ -1047,3 +1047,12 @@ an exhaustive state audit and the independent 100/exit/resume/200 acceptance tes
 ## 2026-10-17 — Bounded covariance solver workspace (Codex)
 
 Native 12,000-point fixed-density jobs stopped on their first update at a 6 GiB allocation limit; the 512-point acceptance case passed. Bound independent covariance eigvalsh/Cholesky/eigh calls to batches of 512, retaining autograd and covariance values. Allocation failures now propagate instead of being mistaken for non-positive covariance. CPU 12,000-matrix value/gradient agreement is tested against unsplit PyTorch. Native full-size training confirmation is pending; the solver-workspace diagnosis remains provisional until the actual repaired job runs. No scientific loss, initialization, pose, frame selection, scale or point count changes.
+
+## 2026-10-22 — Directional elevation-integrating Gaussian model
+For a ray d and planar surfel(c,n), t=n·(c-o)/(n·d). Tangent coordinates of
+(o+td-c) define rho²=(u/su)²+(v/sv)²; alpha=opacity exp(-rho²/2) inside rho<=3.
+Each complete3D direction uses T_i=prod_{j nearer on same ray}(1-alpha_j).
+Native-bin energy sums T_i alpha_i colour_i |n_i·d| exp(-.24t_i), with fixed
+angular/range PSFs. No observed bright-row censor enters this equation.
+This reference retains transparent/acoustic-normal/quadrature limitations;
+compiled covariance acceptance and scientific geometry acceptance are separate.
