@@ -43,7 +43,7 @@ class Session:
         m=self.model
         return render(m['xyz'],m['rotation'],m['scaling'].exp(),m['opacity'].sigmoid(),SH2RGB(m['f_dc']).clamp(0,1),
             torch.tensor(self.poses[i],device=self.device,dtype=torch.float32),
-            elevations=self.cfg['elevation_samples'],azimuth_subsamples=2,background=self.background if background else None)
+            elevations=self.cfg['elevation_samples'],azimuth_subsamples=2,response=self.cfg.get('response','original'),background=self.background if background else None)
 
     def step(self):
         if not self.remaining:self.remaining=list(self.cfg['frame_indices'])

@@ -598,3 +598,8 @@ multiple true returns in one bearing survive. CPU fixture/gradient/restore
 checks run in the experiment. Fixed1000-step CPU diagnostic outputs and guarded
 native registration boundary are reported there. No merge/pointer change or
 new native acceptance is claimed. See DIRECTIONAL_SONAR.md for scope/limits.
+
+## 244: controlled image response comparison (Codex)
+Six paired original/native-response fits use identical 241 inference inputs,
+initializers and optimization. Only range deposition, image blur/mask and clean
+clipping vary; transparent alpha transport remains unchanged. CPU execution only.

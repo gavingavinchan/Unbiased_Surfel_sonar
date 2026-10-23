@@ -1056,3 +1056,13 @@ Native-bin energy sums T_i alpha_i colour_i |n_i·d| exp(-.24t_i), with fixed
 angular/range PSFs. No observed bright-row censor enters this equation.
 This reference retains transparent/acoustic-normal/quadrature limitations;
 compiled covariance acceptance and scientific geometry acceptance are separate.
+
+## 244 native image response (Codex)
+Range coordinate r/0.015-0.5 deposits linearly into adjacent bins. Separable
+Gaussian filtering uses sigma 0.5 range bins and sigma 1.5/2.354820045/(120/256)
+azimuth columns, constant boundaries, scipy default four-sigma rounded radius.
+Mask range centres below 0.1 m, clip clean image to [0,1], then add the unchanged
+TRAIN background. Intersections still require r>=0.2 m; two-sided incidence,
+Gaussian alpha and per-ray transparency remain. Tiled evaluation accumulates raw
+deposits before a single global blur/mask/clip, avoiding tilewise clipping errors.
+The original response defaults and arithmetic are retained for refitted controls.
