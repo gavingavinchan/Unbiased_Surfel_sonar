@@ -4,6 +4,8 @@ Uses the fork's actual GaussianModel, optimizer schedule and sonar renderer.
 No Scene camera loader, GUI, tensorboard, densification or learned metric scale.
 Those strategies must get their own state audit before this class admits them.
 Every step includes its optimizer update, including the last budgeted step.
+cfg['loss'] (optional, default plain 0.8 L1 + 0.2 SSIM): {'name': 'return_weighted', 'threshold': t, 'dilate': 1}
+weights return and background pixels equally (utils.loss_utils.return_weighted_loss).
 """
 from argparse import ArgumentParser
 from types import SimpleNamespace
@@ -17,7 +19,7 @@ from scene.gaussian_model import GaussianModel
 from gaussian_renderer import render_sonar, quaternion_to_normal
 from utils.sonar_utils import build_debug_sonar_config
 from utils.sh_utils import RGB2SH
-from utils.loss_utils import l1_loss, ssim
+from utils.loss_utils import l1_loss, ssim, return_weighted_loss
 from utils import atomic_training as atomic
 
 
@@ -76,7 +78,13 @@ class Session:
         self.model.update_learning_rate(self.step_number)
         pkg = render_sonar(camera, self.model, torch.zeros(3, device='cuda'), self.sonar)
         prediction = pkg['render']
-        loss = .8*l1_loss(prediction,target) + .2*(1-ssim(prediction,target))
+        spec = self.cfg.get('loss', {'name': 'plain'})
+        if spec['name'] == 'plain':
+            loss = .8*l1_loss(prediction,target) + .2*(1-ssim(prediction,target))
+        elif spec['name'] == 'return_weighted':
+            loss, _ = return_weighted_loss(prediction, target, spec['threshold'], spec.get('dilate', 1))
+        else:
+            raise ValueError(f"unknown loss {spec['name']}")
         if not bool(torch.isfinite(loss)): raise ValueError('nonfinite training loss')
         loss.backward()
         for group in self.model.optimizer.param_groups:

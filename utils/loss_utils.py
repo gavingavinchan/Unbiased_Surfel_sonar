@@ -72,3 +72,42 @@ def _ssim(img1, img2, window, window_size, channel, size_average=True):
     else:
         return ssim_map.mean(1).mean(1).mean(1)
 
+
+
+def return_mask(target, threshold, dilate=1):
+    """Pixels at or near a bright return: channel-0 >= threshold, dilated by `dilate` bins in range and azimuth."""
+    m = (target[:1] >= threshold).float()
+    if dilate > 0:
+        k = 2 * dilate + 1
+        m = F.max_pool2d(m[None], k, stride=1, padding=dilate)[0]
+    return m[0] > 0
+
+
+def return_weighted_loss(prediction, target, threshold, dilate=1, l1_weight=.8):
+    """0.8 L1 + 0.2 (1 - SSIM), each averaged so return pixels and background pixels carry equal weight.
+
+    Return pixels = return_mask(target). A frame with no return pixels (or no background) falls back to the plain
+    image average. Returns (loss, number of return pixels).
+    """
+    fg = return_mask(target, threshold, dilate)
+    n_fg = int(fg.sum()); n_bg = fg.numel() - n_fg
+    channel = prediction.size(-3)
+    window = create_window(11, channel).to(prediction.device).type_as(prediction)
+    smap = _ssim_map(prediction, target, window, 11, channel).mean(0)
+    err = (prediction - target).abs().mean(0)
+    if n_fg == 0 or n_bg == 0:
+        return l1_weight * err.mean() + (1 - l1_weight) * (1 - smap.mean()), n_fg
+    w = torch.where(fg, .5 / n_fg, .5 / n_bg)
+    return l1_weight * (w * err).sum() + (1 - l1_weight) * (1 - (w * smap).sum()), n_fg
+
+
+def _ssim_map(img1, img2, window, window_size, channel):
+    mu1 = F.conv2d(img1, window, padding=window_size // 2, groups=channel)
+    mu2 = F.conv2d(img2, window, padding=window_size // 2, groups=channel)
+    mu1_sq, mu2_sq, mu1_mu2 = mu1.pow(2), mu2.pow(2), mu1 * mu2
+    sigma1_sq = F.conv2d(img1 * img1, window, padding=window_size // 2, groups=channel) - mu1_sq
+    sigma2_sq = F.conv2d(img2 * img2, window, padding=window_size // 2, groups=channel) - mu2_sq
+    sigma12 = F.conv2d(img1 * img2, window, padding=window_size // 2, groups=channel) - mu1_mu2
+    C1 = 0.01 ** 2
+    C2 = 0.03 ** 2
+    return ((2 * mu1_mu2 + C1) * (2 * sigma12 + C2)) / ((mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2))
