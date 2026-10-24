@@ -37,7 +37,8 @@ class Session:
         self.opt.densify_until_iter = 0
         self.model = GaussianModel(0)
         init = np.load(cfg['init_file'], allow_pickle=False)
-        n = cfg['point_limit']
+        # point_limit is an upper bound; size every per-point buffer to the actual init.
+        n = min(cfg['point_limit'], len(init['xyz']))
         xyz = torch.as_tensor(init['xyz'][:n], device='cuda').float()
         q = torch.as_tensor(init['quat'][:n], device='cuda').float()
         scales = torch.as_tensor(init['scale'][:n], device='cuda').float()
