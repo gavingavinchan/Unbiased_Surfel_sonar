@@ -100,6 +100,9 @@ class Session:
     def snapshot(self):
         capture = list(self.model.capture())
         optimizer = capture.pop(10)
+        # The xyz schedule returns numpy.float64; weights_only checkpoint loading rejects numpy scalars.
+        for group in optimizer['param_groups']:
+            group['lr'] = float(group['lr'])
         fallback = {str(i): c._sonar_sigma_fallback_state for i,c in self.cameras.items()
                     if hasattr(c,'_sonar_sigma_fallback_state')}
         return {'step':self.step_number, 'model':capture, 'optimizers':{'gaussians':optimizer},
