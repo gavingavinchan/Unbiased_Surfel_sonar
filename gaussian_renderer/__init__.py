@@ -1049,6 +1049,49 @@ def _make_sonar_rasterizer_settings(image_height, image_width, device, dtype):
     )
 
 
+def _sonar_footprint_pixel_mass(vis_mu, vis_sigma, image_width, image_height, linear_opacity, chunk=128):
+    """In-image pixel sum of the forward kernel's peak-1 footprint for each surfel (269).
+
+    Mirrors forward.cu: G = exp(-0.5 * min(d^T S^-1 d, 2 |d|^2)) at integer pixel coordinates,
+    zero where min(0.99, linear_opacity * G) < 1/255; S is the conditioned covariance passed as
+    the packed lower factor. Differentiable; chunks are recomputed in backward (checkpoint).
+    """
+    from torch.utils.checkpoint import checkpoint
+    device, dtype = vis_mu.device, vis_mu.dtype
+    yy, xx = torch.meshgrid(
+        torch.arange(int(image_height), device=device, dtype=dtype),
+        torch.arange(int(image_width), device=device, dtype=dtype),
+        indexing="ij",
+    )
+    sigma = _condition_sigma_2d(vis_sigma)
+    det = sigma[:, 0, 0] * sigma[:, 1, 1] - sigma[:, 0, 1] * sigma[:, 1, 0]
+    inv00 = sigma[:, 1, 1] / det
+    inv11 = sigma[:, 0, 0] / det
+    inv01 = -sigma[:, 0, 1] / det
+    threshold = 1.0 / 255.0
+
+    def part(mu, i00, i01, i11):
+        dx = xx.unsqueeze(0) - mu[:, 0, None, None]
+        dy = yy.unsqueeze(0) - mu[:, 1, None, None]
+        rho3d = i00[:, None, None] * dx * dx + 2.0 * i01[:, None, None] * dx * dy + i11[:, None, None] * dy * dy
+        rho2d = 2.0 * (dx * dx + dy * dy)
+        g = torch.exp(-0.5 * torch.minimum(rho3d, rho2d))
+        g = torch.where(torch.clamp(linear_opacity * g, max=0.99) >= threshold, g, torch.zeros_like(g))
+        return g.sum(dim=(1, 2))
+
+    parts = []
+    for start in range(0, int(vis_mu.shape[0]), chunk):
+        sl = slice(start, start + chunk)
+        args = (vis_mu[sl], inv00[sl], inv01[sl], inv11[sl])
+        if torch.is_grad_enabled() and any(a.requires_grad for a in args):
+            parts.append(checkpoint(part, *args, use_reentrant=False))
+        else:
+            parts.append(part(*args))
+    if not parts:
+        return vis_mu.new_zeros((0,))
+    return torch.cat(parts, dim=0)
+
+
 def _rasterize_sonar_event_volume(
     vis_mu,
     vis_sigma,
@@ -1073,6 +1116,16 @@ def _rasterize_sonar_event_volume(
     raster_settings = _make_sonar_rasterizer_settings(image_height, image_width, device, dtype)
     rasterizer = GaussianRasterizer(raster_settings=raster_settings)
     zero_plane = torch.zeros(image_width, image_height, device=device, dtype=dtype)
+    # SONAR_RASTER_FOOTPRINT_NORM=mass (269): divide each event's footprint by the surfel's in-image
+    # kernel mass so a surfel deposits sum_k w_k * return, the event-share contract the scatter path
+    # implements. Default none keeps the historical peak-1 footprint (energy grows with footprint area).
+    footprint_norm = os.getenv("SONAR_RASTER_FOOTPRINT_NORM", "none").strip().lower()
+    if footprint_norm not in {"none", "mass"}:
+        raise ValueError(f"Unsupported SONAR_RASTER_FOOTPRINT_NORM '{footprint_norm}'.")
+    inv_mass = None
+    if footprint_norm == "mass":
+        mass = _sonar_footprint_pixel_mass(vis_mu, vis_sigma, image_width, image_height, linear_opacity)
+        inv_mass = torch.where(mass > 0, 1.0 / mass.clamp_min(1e-12), torch.zeros_like(mass))
     returns_bins = []
     range_bins = []
     support_bins = []
@@ -1105,6 +1158,8 @@ def _rasterize_sonar_event_volume(
             ],
             dim=-1,
         ) / linear_opacity
+        if inv_mass is not None:
+            cur_color = cur_color * inv_mass[cur_surfel_idx].unsqueeze(-1)
 
         color, event_radii, _, _ = rasterizer(
             means3D=cur_means3d,
