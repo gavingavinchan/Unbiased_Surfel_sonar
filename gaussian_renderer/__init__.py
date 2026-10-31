@@ -342,6 +342,16 @@ def resolve_sonar_render_contract():
     if elev_weight_mode not in {"uniform", "beam_pattern"}:
         raise ValueError(f"Unsupported SONAR_ELEV_WEIGHT_MODE '{elev_weight_mode}'.")
 
+    # SONAR_ELEV_MODEL (274): gaussian_mean (historical) = per-patch Gaussian of width half_el/bins over bins centred on
+    # linspace(-h, h, bins), image = mean over bins; overlap_sum = each patch's Gaussian elevation extent integrated
+    # over an equal partition of the aperture (shares sum to the in-aperture coverage), image = sum over bins.
+    elev_model = os.getenv("SONAR_ELEV_MODEL", "gaussian_mean").strip().lower()
+    if elev_model not in {"gaussian_mean", "overlap_sum"}:
+        raise ValueError(f"Unsupported SONAR_ELEV_MODEL '{elev_model}'.")
+    intensity_gain = float(os.getenv("SONAR_INTENSITY_GAIN", "1.0"))
+    if not math.isfinite(intensity_gain) or intensity_gain <= 0:
+        raise ValueError(f"Unsupported SONAR_INTENSITY_GAIN '{intensity_gain}'.")
+
     occl_k_sigma = float(os.getenv("SONAR_OCCL_KSIGMA", "2.5"))
     occl_weight_floor_rel = float(os.getenv("SONAR_OCCL_WEIGHT_FLOOR_REL", "1e-3"))
     occl_topk = max(int(os.getenv("SONAR_OCCL_TOPK", "16")), 1)
@@ -351,6 +361,8 @@ def resolve_sonar_render_contract():
         "occlusion_mode": occlusion_mode,
         "elev_bins": elev_bins,
         "elev_weight_mode": elev_weight_mode,
+        "elev_model": elev_model,
+        "intensity_gain": intensity_gain,
         "occl_k_sigma": occl_k_sigma,
         "occl_weight_floor_rel": occl_weight_floor_rel,
         "occl_topk": occl_topk,
@@ -605,6 +617,36 @@ def _jacobian_sigma_footprint_batch(mean_3d, scale_xy, quat_wxyz, sonar_config, 
     return _condition_sigma_2d(sigma_2d)
 
 
+def _elevation_sigma_batch(mean_3d, scale_xy, quat_wxyz, world_to_view_rotation=None, min_sigma=1e-3):
+    """Std-dev (rad) of a surfel's elevation angle under its 2DGS tangent covariance (274, SONAR_ELEV_MODEL=overlap_sum).
+
+    elevation = atan2(down, sqrt(right^2 + forward^2)) in the sonar frame; sigma_e^2 = J_e Sigma3D J_e^T with
+    Sigma3D = s1^2 t1 t1^T + s2^2 t2 t2^T (the same covariance the footprint Jacobian uses).
+    """
+    x = mean_3d[:, 0]
+    y = mean_3d[:, 1]
+    z = mean_3d[:, 2]
+    h2 = (x * x + z * z).clamp_min(1e-12)
+    h = torch.sqrt(h2)
+    r2 = (h2 + y * y).clamp_min(1e-12)
+    j = torch.stack([-y * x / (h * r2), h / r2, -y * z / (h * r2)], dim=-1)
+    rot = _quat_to_rotation_matrices(quat_wxyz)
+    if world_to_view_rotation is not None:
+        rot = world_to_view_rotation @ rot
+    a1 = (j * rot[:, :, 0]).sum(dim=-1) * scale_xy[:, 0]
+    a2 = (j * rot[:, :, 1]).sum(dim=-1) * scale_xy[:, 1]
+    return torch.sqrt(a1 * a1 + a2 * a2 + float(min_sigma) ** 2)
+
+
+def _elevation_overlap_weights(center_elev, elev_sigma, half_el, elev_bins):
+    """Gaussian elevation mass of each surfel inside each of `elev_bins` equal bins partitioning [-half_el, half_el]."""
+    edges = torch.linspace(-float(half_el), float(half_el), steps=int(elev_bins) + 1,
+                           device=center_elev.device, dtype=center_elev.dtype).unsqueeze(0)
+    z = (edges - center_elev.unsqueeze(1)) / elev_sigma.unsqueeze(1).clamp_min(1e-8)
+    cdf = 0.5 * (1.0 + torch.erf(z * (1.0 / math.sqrt(2.0))))
+    return (cdf[:, 1:] - cdf[:, :-1]).clamp_min(0.0)
+
+
 def _build_range_profiles_batch(row_centers, sigma_rows, num_rows, k_sigma=2.5):
     if row_centers.numel() == 0:
         return row_centers.new_zeros((0, int(num_rows)))
@@ -660,6 +702,8 @@ def _build_multibin_support_weights_batch(
     topk,
     floor_rel,
     k_sigma,
+    elev_model="gaussian_mean",
+    elev_sigma=None,
 ):
     if center_col.numel() == 0:
         empty = center_col.new_zeros((0, int(round(_sonar_config_values(sonar_config)["image_width"])) * max(int(elev_bins), 1)))
@@ -675,6 +719,16 @@ def _build_multibin_support_weights_batch(
     col_weights = torch.exp(-0.5 * (col_dist / col_sigma) ** 2)
     col_weights = col_weights * (col_dist.abs() <= (float(k_sigma) * col_sigma)).to(center_col.dtype)
 
+    if elev_model == "overlap_sum":
+        if elev_sigma is None:
+            raise ValueError("SONAR_ELEV_MODEL=overlap_sum needs per-surfel elev_sigma")
+        overlap = _elevation_overlap_weights(center_elev, elev_sigma, cfg["half_elevation_rad"], elev_bins)
+        coverage = overlap.sum(dim=1)
+        elev_shape = overlap / coverage.unsqueeze(1).clamp_min(1e-12)
+        flat_weights = (col_weights.unsqueeze(-1) * elev_shape.unsqueeze(1)).reshape(center_col.shape[0], width * elev_bins)
+        capped = _cap_support_weights_batched(flat_weights, topk=topk, floor_rel=floor_rel)
+        capped["weights"] = capped["weights"] * coverage.unsqueeze(1)
+        return capped
     if elev_bins <= 1:
         elev_weights = center_col.new_ones((center_col.shape[0], 1))
     else:
@@ -1378,6 +1432,9 @@ def render_sonar(
         range_atten_auto_gain=range_atten_auto_gain,
     )
     intensity = base_intensity * attenuation
+    if runtime_contract["intensity_gain"] != 1.0:
+        # SONAR_INTENSITY_GAIN (274): one declared global gain on the event value (never on occlusion alpha).
+        intensity = intensity * float(runtime_contract["intensity_gain"])
 
     returns_aer = torch.zeros(W, int(runtime_contract["elev_bins"]), H, device=device, dtype=viewspace_points.dtype)
     range_aer = torch.zeros_like(returns_aer)
@@ -1427,6 +1484,14 @@ def render_sonar(
 
     visible_mask = in_fov & (~footprints["skipped"])
     visible_idx = torch.where(visible_mask)[0]
+    elev_sigma_all = None
+    if runtime_contract["elev_model"] == "overlap_sum":
+        elev_sigma_all = _elevation_sigma_batch(
+            points_sonar,
+            scaling_xy if scale_factor is None else scaling_xy * scale_factor.scale,
+            rotations,
+            world_to_view_rotation=w2v[:3, :3].T,
+        )
     mass_loss_tensor = viewspace_points.new_zeros((0,))
 
     if visible_idx.numel() > 0:
@@ -1436,6 +1501,7 @@ def render_sonar(
         vis_range = range_vals[visible_idx]
         vis_intensity = intensity[visible_idx]
         vis_opacity = opacity[visible_idx]
+        vis_elev_sigma = None if elev_sigma_all is None else elev_sigma_all[visible_idx]
 
         surfel_batch_size = 2048
         num_ray_bins = W * int(runtime_contract["elev_bins"])
@@ -1465,6 +1531,8 @@ def render_sonar(
                 topk=int(runtime_contract["occl_topk"]),
                 floor_rel=float(runtime_contract["occl_weight_floor_rel"]),
                 k_sigma=float(runtime_contract["occl_k_sigma"]),
+                elev_model=runtime_contract["elev_model"],
+                elev_sigma=None if vis_elev_sigma is None else vis_elev_sigma[start:end],
             )
             mass_loss_parts.append(support["mass_lost"])
 
@@ -1708,9 +1776,13 @@ def render_sonar(
         device=device,
         dtype=viewspace_points.dtype,
     )
-    rendered_ar = marginalize_elevation_bins(returns_aer, elev_weights=elev_weights)
-    range_num_ar = marginalize_elevation_bins(range_aer, elev_weights=elev_weights)
-    support_ar = marginalize_elevation_bins(support_aer, elev_weights=elev_weights)
+    # overlap_sum (274): a pixel integrates the whole vertical aperture, so image-forming buffers SUM the bins.
+    image_elev_weights = elev_weights
+    if runtime_contract["elev_model"] == "overlap_sum":
+        image_elev_weights = torch.ones_like(elev_weights)
+    rendered_ar = marginalize_elevation_bins(returns_aer, elev_weights=image_elev_weights)
+    range_num_ar = marginalize_elevation_bins(range_aer, elev_weights=image_elev_weights)
+    support_ar = marginalize_elevation_bins(support_aer, elev_weights=image_elev_weights)
     reg_alpha_ar = marginalize_elevation_bins(reg_alpha_aer, elev_weights=elev_weights)
     reg_depth_num_ar = marginalize_elevation_bins(reg_depth_num_aer, elev_weights=elev_weights)
     reg_dist_num_ar = marginalize_elevation_bins(reg_dist_num_aer, elev_weights=elev_weights)
@@ -1853,6 +1925,8 @@ def render_sonar(
         "sonar_occlusion_mode": runtime_contract["occlusion_mode"],
         "elevation_bin_count": int(runtime_contract["elev_bins"]),
         "elevation_weight_mode": runtime_contract["elev_weight_mode"],
+        "elevation_model": runtime_contract["elev_model"],
+        "intensity_gain": float(runtime_contract["intensity_gain"]),
         "surfel_size_stats_schema_version": "v1",
         "surfel_size_stats_world": {
             "s1": _summary_stats(world_s1),
