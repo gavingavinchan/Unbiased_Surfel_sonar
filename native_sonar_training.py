@@ -6,6 +6,11 @@ Those strategies must get their own state audit before this class admits them.
 Every step includes its optimizer update, including the last budgeted step.
 cfg['loss'] (optional, default plain 0.8 L1 + 0.2 SSIM): {'name': 'return_weighted', 'threshold': t, 'dilate': 1}
 weights return and background pixels equally (utils.loss_utils.return_weighted_loss).
+cfg['strategy'] (optional, default 'fixed-density-v1'). 'opacity-prune-v1' (312) adds the fork train.py opacity
+cull without densification: after the optimizer update of every step s > opt.densify_from_iter with
+s % opt.densification_interval == 0, patches with opacity < opt.opacity_cull are pruned. The opacity reset of
+train.py (opt.opacity_reset_interval) is also applied when a step hits it. No size/screen prune (train.py only
+applies it after the first opacity reset) and no clone/split.
 """
 from argparse import ArgumentParser
 from types import SimpleNamespace
@@ -66,6 +71,24 @@ class Session:
         self.remaining = []
         self.step_number = 0
         self.last_loss = None
+        self.strategy = cfg.get('strategy', 'fixed-density-v1')
+        if self.strategy not in ('fixed-density-v1', 'opacity-prune-v1'):
+            raise ValueError(f'unsupported strategy {self.strategy}')
+        self.pruned = 0
+
+    def _strategy_step(self):
+        if self.strategy != 'opacity-prune-v1': return
+        s, o = self.step_number, self.opt
+        if s > o.densify_from_iter and s % o.densification_interval == 0:
+            with torch.no_grad():
+                mask = (self.model.get_opacity < o.opacity_cull).squeeze(1)
+            if bool(mask.any()):
+                self.pruned += int(mask.sum()); self.model.prune_points(mask)
+                for c in self.cameras.values():
+                    f = getattr(c, '_sonar_sigma_fallback_state', None)
+                    if f is not None and f.shape == mask.shape: c._sonar_sigma_fallback_state = f[~mask]
+        if s % o.opacity_reset_interval == 0:
+            self.model.reset_opacity()
 
     def step(self):
         if not self.remaining: self.remaining = list(self.cfg['frame_indices'])
@@ -96,6 +119,7 @@ class Session:
         self.last_loss = float(loss.detach())
         # Diagnostics are not an RNG/strategy input, but per-camera sigma fallback is.
         del pkg, prediction, loss
+        self._strategy_step()
 
     def snapshot(self):
         capture = list(self.model.capture())
@@ -108,11 +132,11 @@ class Session:
         return {'step':self.step_number, 'model':capture, 'optimizers':{'gaussians':optimizer},
             'schedulers':{'xyz_max_steps':self.opt.position_lr_max_steps},
             'sampler':{'remaining':self.remaining, 'fallback':fallback},
-            'strategy':{'name':'fixed-density-v1','last_loss':self.last_loss},
+            'strategy':{'name':self.strategy,'last_loss':self.last_loss,'pruned':self.pruned},
             'scale':{'metric':1.,'learned':False}, 'rng':atomic.rng_state()}
 
     def restore(self, state):
-        if state['strategy']['name'] != 'fixed-density-v1' or state['scale'] != {'metric':1.,'learned':False}:
+        if state['strategy']['name'] != self.strategy or state['scale'] != {'metric':1.,'learned':False}:
             raise ValueError('unsupported strategy or metric scale')
         if state['schedulers'] != {'xyz_max_steps':self.cfg['steps']}:
             raise ValueError('schedule differs')
@@ -126,6 +150,7 @@ class Session:
         for i,v in state['sampler']['fallback'].items():
             self.cameras[int(i)]._sonar_sigma_fallback_state = v.to('cuda')
         self.last_loss = state['strategy']['last_loss']
+        self.pruned = state['strategy'].get('pruned', 0)
         atomic.restore_rng(state['rng'])
 
     def export(self, path):
