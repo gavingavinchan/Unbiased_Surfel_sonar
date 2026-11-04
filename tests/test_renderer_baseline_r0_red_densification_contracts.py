@@ -45,7 +45,9 @@ class _DummyPointCloud:
             requires_grad=True,
         )
         self._rotation = torch.tensor(
-            [[1.0, 0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0]],
+            # Face the sonar at the origin: +z identity normals face away and
+            # clamp0 correctly gives a black image with zero position gradient.
+            [[0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 1.0, 0.0]],
             dtype=torch.float32,
             requires_grad=True,
         )
