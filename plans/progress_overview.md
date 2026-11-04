@@ -546,3 +546,12 @@ retaining event/output dtype before exponentiation. Designed CPU regressions
 check 262,144 preceding events, ray relabelling, return/final transmission and
 opacity gradients. No training, GPU speed/precision proof, physical calibration,
 shared submodule update or renderer acceptance is claimed.
+
+## 2026-11-03 — Empty sonar views retain zero derivatives (Codex)
+
+A synthetic CPU diagnostic found that all-culled/empty patch frames return
+constant images whose training loss crashes backward. Candidate connects constant
+maps with empty parameter reductions only when the image lacks a gradient graph.
+58 new checks and 327 CPU tests pass (14 existing skips). 48 parent/candidate
+comparisons preserve all outputs and visible derivatives exactly. This extends
+the metric/frame candidate; native GPU and reconstruction effects remain untested.

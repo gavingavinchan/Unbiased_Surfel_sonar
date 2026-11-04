@@ -1001,3 +1001,15 @@ scan/subtraction preserves these fixtures while retaining existing 1e-8 clamp,
 sorting, output dtype and ordinary gradients. This finite stress diagnostic
 does not measure actual training event populations or reconstruction benefit;
 GPU memory/throughput and full renderer comparison remain unmeasured.
+
+## 2026-11-03 — Constant empty-view derivative (Codex)
+
+Hard visibility rejection gives a locally constant black image I(theta)=0, so
+its photometric derivative is zero, not an undefined backward operation. Empty
+reductions over renderer inputs supply a graph-connected exact zero without
+changing values or visibility. Tests cover empty arrays, azimuth/elevation/range/
+behind-sensor rejection, both CPU precisions and footprint/occlusion modes.
+48 comparisons: 40 original backward failures become zero; all output differences
+and all 8 visible-scene gradient differences equal zero. This is numerical
+training robustness, not acoustic validation or an invisible-geometry recovery
+mechanism. Actual geometry-derived normal output, CUDA and training are untested.

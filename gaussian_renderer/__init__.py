@@ -1770,6 +1770,25 @@ def render_sonar(
         },
     }
 
+    # A frame with no emitted events is a constant zero image, but training
+    # still calls backward on its loss. Empty reductions retain exact zero
+    # derivatives to every trainable parameter without reading their values.
+    # Leave the visible-event graph and inference/no_grad paths unchanged.
+    if torch.is_grad_enabled() and not rendered_image.requires_grad:
+        zero = viewspace_points.reshape(-1)[:0].sum()
+        for parameter in (rotations, pc.get_opacity, w2v):
+            zero = zero + parameter.reshape(-1)[:0].sum()
+        if hasattr(pc, "get_scaling"):
+            zero = zero + pc.get_scaling.reshape(-1)[:0].sum()
+        if scale_factor is not None:
+            zero = zero + scale_factor.scale.reshape(-1)[:0].sum()
+        rendered_image = rendered_image + zero
+        render_alpha = render_alpha + zero
+        render_normal = render_normal + zero
+        render_dist = render_dist + zero
+        surf_depth_image = surf_depth_image + zero
+        surf_normal = surf_normal + zero
+
     return {
         "render": rendered_image,
         "viewspace_points": viewspace_points,
