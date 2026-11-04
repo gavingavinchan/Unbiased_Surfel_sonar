@@ -15,8 +15,7 @@ def quaternion_product(a, b):
                         w*j-x*k+y*v+z*i, w*k+x*j-y*i+z*v), -1)
 
 
-def render_fixture(mode, occlusion, angle, axis=2):
-    dtype = torch.float64
+def render_fixture(mode, occlusion, angle, axis=2, dtype=torch.float64):
     q = torch.zeros(4, dtype=dtype)
     q[0] = math.cos(angle/2)
     q[axis+1] = math.sin(angle/2)
@@ -47,17 +46,19 @@ def render_fixture(mode, occlusion, angle, axis=2):
     return result['render'].detach(), grads[0] @ Q, grads[1], grads[2]
 
 
+@pytest.mark.parametrize('dtype', [torch.float32, torch.float64])
 @pytest.mark.parametrize('mode', ['2dgs','2dgs_nonlinear'])
 @pytest.mark.parametrize('occlusion', ['none','ray_binned'])
 @pytest.mark.parametrize('axis', [0,1,2])
-def test_complete_render_is_independent_of_world_axes(monkeypatch, mode, occlusion, axis):
+def test_complete_render_is_independent_of_world_axes(monkeypatch, mode, occlusion, axis, dtype):
     monkeypatch.setenv('SONAR_RENDER_MODE',mode)
     monkeypatch.setenv('SONAR_OCCLUSION_MODE',occlusion)
     monkeypatch.setenv('SONAR_LAMBERTIAN_MODE','clamp0')
     monkeypatch.setenv('SONAR_ELEV_BINS','3')
-    a = render_fixture(mode,occlusion,0.,axis)
-    b = render_fixture(mode,occlusion,.7,axis)
+    a = render_fixture(mode,occlusion,0.,axis,dtype)
+    b = render_fixture(mode,occlusion,.7,axis,dtype)
     assert a[0].sum() > 0
     for left,right in zip(a,b):
         assert torch.isfinite(right).all()
-        torch.testing.assert_close(left,right,atol=2e-8,rtol=2e-7)
+        torch.testing.assert_close(left,right,atol=2e-6 if dtype == torch.float32 else 2e-8,
+                                   rtol=2e-5 if dtype == torch.float32 else 2e-7)
