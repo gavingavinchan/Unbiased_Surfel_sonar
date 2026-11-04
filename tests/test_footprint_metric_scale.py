@@ -49,7 +49,7 @@ def render_units(unit_scale, dtype=torch.float64, log_shift=0., differentiate=Tr
 @pytest.mark.parametrize('dtype',[torch.float32,torch.float64])
 @pytest.mark.parametrize('mode',['2dgs','2dgs_nonlinear'])
 @pytest.mark.parametrize('occlusion',['none','ray_binned'])
-@pytest.mark.parametrize('unit_scale',[.5,2.,4.])
+@pytest.mark.parametrize('unit_scale',[.5,.7,1.3,2.,3.1,4.])
 def test_world_unit_change_preserves_complete_render(monkeypatch,dtype,mode,occlusion,unit_scale):
     monkeypatch.setenv('SONAR_RENDER_MODE',mode)
     monkeypatch.setenv('SONAR_OCCLUSION_MODE',occlusion)
