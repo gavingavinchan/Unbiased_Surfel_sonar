@@ -376,15 +376,37 @@ def _sonar_config_values(sonar_config):
 
 
 def _condition_sigma_2d(sigma_2d, min_var=0.1, max_var=400.0, cond_cap=100.0):
+    """Clip a symmetric 2x2 covariance without eigenvector derivatives.
+
+    A repeated eigenvalue has no unique eigenvectors. The spectral matrix
+    function still has a well-defined derivative away from clipping boundaries.
+    Its divided-difference form preserves that derivative at circular footprints.
+    """
     sym = 0.5 * (sigma_2d + sigma_2d.transpose(-1, -2))
-    eigvals, eigvecs = torch.linalg.eigh(sym)
-    eigvals = torch.clamp(eigvals, min=min_var, max=max_var)
+    raw = torch.linalg.eigvalsh(sym)
+    eigvals = torch.clamp(raw, min=min_var, max=max_var)
     if cond_cap is not None and cond_cap > 0:
         max_eval = eigvals.max(dim=-1, keepdim=True).values
         min_allowed = torch.clamp(max_eval / float(cond_cap), min=min_var)
         eigvals = torch.maximum(eigvals, min_allowed)
         eigvals = torch.clamp(eigvals, max=max_var)
-    return eigvecs @ torch.diag_embed(eigvals) @ eigvecs.transpose(-1, -2)
+
+    gap = raw[..., 1] - raw[..., 0]
+    distinct = gap > 0
+    safe_gap = torch.where(distinct, gap, torch.ones_like(gap))
+    slope = (eigvals[..., 1] - eigvals[..., 0]) / safe_gap
+    # At a repeated root, unclipped matrices pass through unchanged. Fully
+    # saturated matrices are locally constant. Clipping boundaries themselves
+    # are nonsmooth and do not have a unique mathematical derivative.
+    interior = (raw[..., 0] > min_var) & (raw[..., 1] < max_var)
+    if cond_cap is not None and 0 < cond_cap <= 1:
+        interior = torch.zeros_like(interior)
+    slope = torch.where(distinct, slope, interior.to(sym.dtype))
+    identity = torch.eye(2, device=sym.device, dtype=sym.dtype)
+    midpoint = raw.mean(dim=-1)
+    clipped_midpoint = eigvals.mean(dim=-1)
+    return (clipped_midpoint[..., None, None] * identity
+            + slope[..., None, None] * (sym - midpoint[..., None, None] * identity))
 
 
 def _elevation_bin_weights(num_bins, mode, device, dtype):
