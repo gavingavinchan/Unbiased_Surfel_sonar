@@ -19,7 +19,7 @@ def actual_scaled_transform():
     return ns[node.name]
 
 
-def render_units(unit_scale, dtype=torch.float64, log_shift=0.):
+def render_units(unit_scale, dtype=torch.float64, log_shift=0., differentiate=True, use_factor=True):
     # Same two physical patches, expressed in different arbitrary world units.
     # A translated sonar exercises the real translation-scaling helper too.
     xyz = (torch.tensor([[.04,.01,1.2],[.13,-.02,1.4]],dtype=dtype)/unit_scale).requires_grad_()
@@ -37,7 +37,9 @@ def render_units(unit_scale, dtype=torch.float64, log_shift=0.):
     })
     pc = SimpleNamespace(get_xyz=xyz,get_scaling=sizes,get_rotation=quat,get_opacity=opacity)
     cfg = SimpleNamespace(half_azimuth_rad=math.radians(60),half_elevation_rad=math.radians(10),range_min=.2,range_max=3.)
-    image = render(camera,pc,torch.zeros(3,dtype=dtype),cfg,scale_factor=SimpleNamespace(scale=log_scale.exp()))['render']
+    image = render(camera,pc,torch.zeros(3,dtype=dtype),cfg,scale_factor=SimpleNamespace(scale=log_scale.exp()) if use_factor else None)['render']
+    if not differentiate:
+        return image.detach()
     weights = torch.linspace(.5,1.5,48,dtype=dtype)
     loss = (image * weights).sum()
     grads = torch.autograd.grad(loss,(xyz,sizes,quat,opacity,log_scale))
@@ -73,3 +75,15 @@ def test_metric_scale_gradient_matches_finite_difference(monkeypatch,mode,occlus
     finite = (render_units(2.,log_shift=h)[-1]-render_units(2.,log_shift=-h)[-1])/(2*h)
     assert center[-2].abs() > 1e-5
     torch.testing.assert_close(center[-2],finite,atol=1e-6,rtol=2e-5)
+
+
+@pytest.mark.parametrize('mode',['2dgs','2dgs_nonlinear'])
+@pytest.mark.parametrize('occlusion',['none','ray_binned'])
+def test_unit_metric_scale_preserves_no_scale_forward_path(monkeypatch,mode,occlusion):
+    monkeypatch.setenv('SONAR_RENDER_MODE',mode)
+    monkeypatch.setenv('SONAR_OCCLUSION_MODE',occlusion)
+    monkeypatch.setenv('SONAR_LAMBERTIAN_MODE','clamp0')
+    monkeypatch.setenv('SONAR_ELEV_BINS','3')
+    a=render_units(1.,differentiate=False,use_factor=False)
+    b=render_units(1.,differentiate=False,use_factor=True)
+    torch.testing.assert_close(a,b,atol=0.,rtol=0.)
