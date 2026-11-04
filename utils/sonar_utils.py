@@ -52,7 +52,8 @@ def get_scaled_world_to_view_transform(viewpoint_camera, scale_factor=None, sona
     """
     w2v = viewpoint_camera.world_view_transform.clone()
     if scale_factor is not None:
-        w2v[3, :3] = scale_factor.scale * w2v[3, :3]
+        # Preserve the unscaled translation for autograd before updating its view.
+        w2v[3, :3] = scale_factor.scale * w2v[3, :3].clone()
     if sonar_extrinsic is not None:
         w2v = sonar_extrinsic(w2v)
     return w2v

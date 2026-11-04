@@ -1268,6 +1268,11 @@ def render_sonar(
     else:
         scaling_xy = torch.ones((N, 2), dtype=viewspace_points.dtype, device=device)
 
+    # Surfel tangent lengths use the same world units as their centres.
+    # Keep conversion differentiable for the learnable COLMAP-to-metric scale.
+    if scale_factor is not None:
+        scaling_xy = scale_factor.scale * scaling_xy
+
     sigma_point_config = {
         "kappa": float(os.getenv("SONAR_SIGMA_KAPPA", "0.0")),
         "alpha": float(os.getenv("SONAR_SIGMA_ALPHA", "1.0")),
