@@ -32,10 +32,19 @@ def _load_function_from_ast(path: Path, fn_name: str, extra_ns=None):
     if not found:
         return None
 
-    selected_nodes = []
-    for node in tree.body:
-        if isinstance(node, (ast.FunctionDef, ast.ClassDef)):
-            selected_nodes.append(copy.deepcopy(node))
+    # Load only the requested function and its local function dependencies.
+    # Unrelated training functions have CUDA annotations and global defaults;
+    # compiling all of them prevents these CPU contracts from reaching assertions.
+    functions = {node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)}
+    required = {fn_name}
+    pending = [fn_name]
+    while pending:
+        names = {node.id for node in ast.walk(functions[pending.pop()]) if isinstance(node, ast.Name)}
+        dependencies = names.intersection(functions).difference(required)
+        required.update(dependencies)
+        pending.extend(dependencies)
+    selected_nodes = [copy.deepcopy(node) for node in tree.body
+                      if isinstance(node, ast.FunctionDef) and node.name in required]
 
     mod = ast.Module(body=selected_nodes, type_ignores=[])
     ast.fix_missing_locations(mod)

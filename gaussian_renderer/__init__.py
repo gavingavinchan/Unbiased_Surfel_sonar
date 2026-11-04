@@ -1370,7 +1370,7 @@ def render_sonar(
                 event_returns = event_value
                 composed = {
                     "final_transmittance": event_value.new_ones(num_ray_bins),
-                    "transmittance_before_event": event_value.new_ones_like(event_value),
+                    "transmittance_before_event": torch.ones_like(event_value),
                     "alpha_sorted": torch.clamp(event_alpha, min=0.0, max=1.0),
                     "range_sorted": event_range,
                     "ray_ids_sorted": event_ray_ids,
