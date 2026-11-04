@@ -497,7 +497,7 @@ def _ukf_sigma_point_weights(alpha, beta, kappa, device, dtype):
     return lam, mean_weights, cov_weights
 
 
-def _jacobian_sigma_footprint_batch(mean_3d, scale_xy, quat_wxyz, sonar_config):
+def _jacobian_sigma_footprint_batch(mean_3d, scale_xy, quat_wxyz, sonar_config, rotation_to_sonar=None):
     cfg = _sonar_config_values(sonar_config)
     x = mean_3d[:, 0]
     y = mean_3d[:, 1]
@@ -523,6 +523,8 @@ def _jacobian_sigma_footprint_batch(mean_3d, scale_xy, quat_wxyz, sonar_config):
     j[:, 1, 2] = drow_scale * (z / range_val)
 
     rot = _quat_to_rotation_matrices(quat_wxyz)
+    if rotation_to_sonar is not None:
+        rot = rotation_to_sonar @ rot
     t1 = rot[:, :, 0] * scale_xy[:, 0:1]
     t2 = rot[:, :, 1] * scale_xy[:, 1:2]
     sigma_3d = t1.unsqueeze(-1) * t1.unsqueeze(-2) + t2.unsqueeze(-1) * t2.unsqueeze(-2)
@@ -622,6 +624,7 @@ def _project_sonar_footprints_batch(
     sigma_point_config=None,
     sonar_config=None,
     previous_fallback_used=None,
+    rotation_to_sonar=None,
 ):
     if sonar_config is None:
         raise ValueError("sonar_config is required")
@@ -635,7 +638,9 @@ def _project_sonar_footprints_batch(
     center_in_bounds = center_proj["in_bounds"]
 
     mu_2d = torch.stack([center_proj["col"], center_proj["row"]], dim=-1)
-    jac_sigma = _jacobian_sigma_footprint_batch(mean_3d, scale_xy, quat_wxyz, sonar_config)
+    jac_sigma = _jacobian_sigma_footprint_batch(
+        mean_3d, scale_xy, quat_wxyz, sonar_config, rotation_to_sonar=rotation_to_sonar
+    )
 
     skipped = ~center_hard_valid
     fallback_used = torch.zeros_like(skipped)
@@ -659,6 +664,8 @@ def _project_sonar_footprints_batch(
         spread = math.sqrt(max(2.0 + lam, 1e-8))
 
         rot = _quat_to_rotation_matrices(quat_wxyz)
+        if rotation_to_sonar is not None:
+            rot = rotation_to_sonar @ rot
         t1 = rot[:, :, 0] * scale_xy[:, 0:1]
         t2 = rot[:, :, 1] * scale_xy[:, 1:2]
         sigma_points = torch.stack(
@@ -1280,6 +1287,8 @@ def render_sonar(
         sigma_point_config=sigma_point_config,
         sonar_config=footprint_config,
         previous_fallback_used=previous_fallback_used,
+        # Centres and tangent axes must use the same sonar coordinate frame.
+        rotation_to_sonar=R_w2v,
     )
     setattr(viewpoint_camera, "_sonar_sigma_fallback_state", footprints["fallback_used"].detach())
     radii = footprints["radii"]
