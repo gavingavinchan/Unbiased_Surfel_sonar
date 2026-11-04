@@ -552,6 +552,9 @@ shared submodule update or renderer acceptance is claimed.
 A synthetic CPU diagnostic found that all-culled/empty patch frames return
 constant images whose training loss crashes backward. Candidate connects constant
 maps with empty parameter reductions only when the image lacks a gradient graph.
-58 new checks and 327 CPU tests pass (14 existing skips). 48 parent/candidate
+66 new checks and 335 CPU tests pass (14 existing skips). 48 parent/candidate
 comparisons preserve all outputs and visible derivatives exactly. This extends
 the metric/frame candidate; native GPU and reconstruction effects remain untested.
+
+Eight additional empty-view checks use the real point/normal helpers and auxiliary
+loss alone, with and without metric scaling; zero derivatives remain finite.

@@ -1012,4 +1012,5 @@ behind-sensor rejection, both CPU precisions and footprint/occlusion modes.
 48 comparisons: 40 original backward failures become zero; all output differences
 and all 8 visible-scene gradient differences equal zero. This is numerical
 training robustness, not acoustic validation or an invisible-geometry recovery
-mechanism. Actual geometry-derived normal output, CUDA and training are untested.
+mechanism. Eight further checks validate the actual geometry-derived empty normal output
+with and without metric scaling. Visible normal output, CUDA and training are untested.

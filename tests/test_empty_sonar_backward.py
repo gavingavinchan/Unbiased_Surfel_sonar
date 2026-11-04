@@ -1,5 +1,7 @@
 """Hard-culling all patches leaves a constant objective with zero derivatives."""
 import math
+import ast
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -12,7 +14,7 @@ from test_renderer_baseline_r0_red_densification_contracts import (
 OUTPUTS = ('render', 'rend_alpha', 'rend_normal', 'rend_dist', 'surf_depth', 'surf_normal')
 
 
-def render_case(case, dtype=torch.float64, trainable='all', grad_enabled=True):
+def render_case(case, dtype=torch.float64, trainable='all', grad_enabled=True, actual_normals=False, use_scale=True):
     xyzs = {
         'empty': [],
         'behind': [[.1, .02, -1.2], [-.1, -.02, -1.5]],
@@ -38,14 +40,23 @@ def render_case(case, dtype=torch.float64, trainable='all', grad_enabled=True):
                           half_elevation_rad=math.radians(10), range_min=.2, range_max=3.)
     pc = SimpleNamespace(get_xyz=tensors['xyz'], get_scaling=tensors['size'],
                          get_rotation=tensors['quat'], get_opacity=tensors['opacity'])
+    cfg.azimuth_grid = torch.linspace(cfg.half_azimuth_rad, -cfg.half_azimuth_rad, camera.image_width, dtype=dtype)
+    ranges_fn, normals_fn = _fake_ranges_to_points, _fake_points_to_normals
+    if actual_normals:
+        path = Path(__file__).resolve().parents[1] / 'utils/point_utils.py'
+        nodes = [n for n in ast.parse(path.read_text()).body
+                 if isinstance(n, ast.FunctionDef) and n.name in ('sonar_ranges_to_points', 'sonar_points_to_normals')]
+        namespace = {'torch': torch, 'F': torch.nn.functional}
+        exec(compile(ast.Module(body=nodes, type_ignores=[]), str(path), 'exec'), namespace)
+        ranges_fn, normals_fn = namespace['sonar_ranges_to_points'], namespace['sonar_points_to_normals']
     render = _load_renderer_fn('render_sonar', {
         'get_scaled_world_to_view_transform': actual_scaled_transform(),
-        'sonar_ranges_to_points': _fake_ranges_to_points,
-        'sonar_points_to_normals': _fake_points_to_normals,
+        'sonar_ranges_to_points': ranges_fn,
+        'sonar_points_to_normals': normals_fn,
     })
     with torch.set_grad_enabled(grad_enabled):
         output = render(camera, pc, torch.zeros(3, dtype=dtype), cfg,
-                        scale_factor=SimpleNamespace(scale=tensors['log_scale'].exp()))
+                        scale_factor=SimpleNamespace(scale=tensors['log_scale'].exp()) if use_scale else None)
     return output, tensors
 
 
@@ -99,3 +110,23 @@ def test_inference_has_no_created_gradient_graph(monkeypatch, grad_enabled, case
     for key in OUTPUTS:
         assert not output[key].requires_grad
         assert torch.isfinite(output[key]).all()
+
+
+@pytest.mark.parametrize('mode', ['2dgs', '2dgs_nonlinear'])
+@pytest.mark.parametrize('case', ['empty', 'behind'])
+@pytest.mark.parametrize('use_scale', [True, False])
+def test_empty_auxiliary_maps_with_real_normal_helpers(monkeypatch, mode, case, use_scale):
+    monkeypatch.setenv('SONAR_RENDER_MODE', mode)
+    monkeypatch.setenv('SONAR_OCCLUSION_MODE', 'ray_binned')
+    monkeypatch.setenv('SONAR_ELEV_BINS', '3')
+    output, tensors = render_case(case, actual_normals=True, use_scale=use_scale)
+    # Include only auxiliary maps to exercise their actual backprojection and
+    # finite-difference normal calculation, independent of the brightness loss.
+    sum((output[key] - .1).square().sum() for key in OUTPUTS[1:]).backward()
+    for key, tensor in tensors.items():
+        if key == 'log_scale' and not use_scale:
+            assert tensor.grad is None
+        else:
+            assert tensor.grad is not None, key
+            assert torch.isfinite(tensor.grad).all(), key
+            assert torch.count_nonzero(tensor.grad) == 0, key
