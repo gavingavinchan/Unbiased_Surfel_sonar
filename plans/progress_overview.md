@@ -537,3 +537,12 @@ flowchart TB
 - Ran controlled diagnostic rerun `output/chunk5_5_diag_cube20_short_active_v1/` on `synthetic_cube_C_azimuth45_fixedpos` with the same 20-frame subset and early active-normal schedule.
 - The rerun confirms the current collapse happens primarily at `support -> center confidence`, then again at neighbor-confidence closure; finite-normal formation and surfel matching were not the dominant blocker once an anchor survived to those steps.
 - Plan `PLAN_ELEVATION_AWARE_CHUNK5_5_EXECUTION_2026-03-30.md` was reorganized into a plan section plus progress log, with an explicit Phase-A next step: remove the sonar 4-neighbor finite-difference stencil, rerun a few controlled diagnostics, and only then decide whether any replacement geometry path is justified.
+
+## 2026-11-03 — Independent-ray prefix precision (Codex)
+The range-sorted attenuation helper subtracts a global log prefix per ray.
+Float32 rounding lets unrelated earlier rays change later returns. Branch
+`exp/050-ray-scan-precision` promotes only the scan/subtraction to float64,
+retaining event/output dtype before exponentiation. Designed CPU regressions
+check 262,144 preceding events, ray relabelling, return/final transmission and
+opacity gradients. No training, GPU speed/precision proof, physical calibration,
+shared submodule update or renderer acceptance is claimed.

@@ -884,12 +884,15 @@ def compose_ray_binned_occlusion(ray_ids, range_vals, alpha_vals, value_vals, nu
     segment_ids = torch.cumsum(new_ray.to(torch.long), dim=0) - 1
     segment_starts = torch.nonzero(new_ray, as_tuple=False).squeeze(-1)
 
-    inclusive_log = torch.cumsum(log_one_minus_alpha, dim=0)
-    segment_prefix_log = value_sorted.new_zeros(int(segment_ids[-1].item()) + 1)
+    # A global float32 prefix loses small within-ray increments after many
+    # unrelated rays. Promote the scan and segment subtraction, then return
+    # to the event dtype before exp to avoid float64 transcendental work.
+    inclusive_log = torch.cumsum(log_one_minus_alpha.to(torch.float64), dim=0)
+    segment_prefix_log = inclusive_log.new_zeros(int(segment_ids[-1].item()) + 1)
     if segment_starts.numel() > 1:
         segment_prefix_log[1:] = inclusive_log[segment_starts[1:] - 1]
     exclusive_log = (inclusive_log - log_one_minus_alpha) - segment_prefix_log[segment_ids]
-    trans_before = torch.exp(exclusive_log)
+    trans_before = torch.exp(exclusive_log.to(value_vals.dtype))
     event_sorted = trans_before * value_sorted
 
     event_returns = torch.zeros_like(value_vals).scatter(0, order, event_sorted)
@@ -901,7 +904,7 @@ def compose_ray_binned_occlusion(ray_ids, range_vals, alpha_vals, value_vals, nu
         segment_ends[:-1] = segment_starts[1:] - 1
     segment_ends[-1] = ray_sorted.numel() - 1
     final_log = inclusive_log[segment_ends] - segment_prefix_log
-    final_transmittance[ray_sorted[segment_starts]] = torch.exp(final_log)
+    final_transmittance[ray_sorted[segment_starts]] = torch.exp(final_log.to(value_vals.dtype))
 
     return {
         "event_returns": event_returns,

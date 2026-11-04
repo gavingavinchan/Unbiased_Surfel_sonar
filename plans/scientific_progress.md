@@ -988,3 +988,16 @@ with observed center-entropy means approximately `1.77` to `1.91` and queried-ne
 The practical conclusion from this rerun is that the current Chunk-5 path is blocked primarily by confidence collapse, not by finite-normal construction or surfel matching once a rare anchor survives the earlier gates.
 
 This result motivated the current Chunk-5.5 Phase-A execution direction: remove the sonar 4-neighbor pixel finite-difference stencil from the active path, preserve the diagnostics, rerun a few controlled tests, and only then decide whether any replacement local-geometry construction is justified.
+
+## 2026-11-03 — Numerical independence of image rays (Codex)
+For sorted events, T_i=exp(sum_{j<i,same ray} log(1-alpha_j)). The current
+implementation obtains this by subtracting a per-ray baseline from one global
+prefix sum. That algebra is correct but float32 cancellation can erase small
+within-ray increments. A synthetic target alpha=(.01,.2,.5) has exclusive
+transmissions (1,.99,.792), terminal .396, and gradient of their sum with
+respect to alpha=(-1.8,-.99,0), regardless of other rays. Tests cover up to
+262,144 preceding events in disjoint rays and opacities .01/.5/.9/1. Float64
+scan/subtraction preserves these fixtures while retaining existing 1e-8 clamp,
+sorting, output dtype and ordinary gradients. This finite stress diagnostic
+does not measure actual training event populations or reconstruction benefit;
+GPU memory/throughput and full renderer comparison remain unmeasured.
