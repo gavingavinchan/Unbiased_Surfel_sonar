@@ -334,7 +334,8 @@ def resolve_sonar_render_contract():
         raise ValueError(f"Unsupported SONAR_RENDER_MODE '{render_mode}'.")
 
     occlusion_mode = os.getenv("SONAR_OCCLUSION_MODE", "ray_binned").strip().lower()
-    if occlusion_mode not in {"none", "ray_binned"}:
+    # coplanar_union (335): opt-in layer visibility over coplanar groups; ray_binned stays the default.
+    if occlusion_mode not in {"none", "ray_binned", "coplanar_union"}:
         raise ValueError(f"Unsupported SONAR_OCCLUSION_MODE '{occlusion_mode}'.")
 
     elev_bins = max(int(os.getenv("SONAR_ELEV_BINS", "1")), 1)
@@ -1054,6 +1055,207 @@ def compose_ray_binned_occlusion(ray_ids, range_vals, alpha_vals, value_vals, nu
     }
 
 
+# --- 335: opt-in SONAR_OCCLUSION_MODE=coplanar_union (frozen rule; see experiments/335 MODEL.md) ---------------
+COPLANAR_THETA_TOL = 1e-4  # rad; ~2.5 orders above float32 normal rounding, 2 orders below any physical bend we model
+COPLANAR_D_TOL = 1e-4  # m; ~2.5 orders above float32 rounding at 3 m, ~2 orders below a 15 mm range bin
+COPLANAR_S_TOL = 1e-6  # m; in-plane edge snapping only (~4 float32 ulps at 3 m)
+COPLANAR_QUAD = 64  # midpoint quadrature per cell axis when cells in a group are not axis-aligned
+COPLANAR_MAX_GROUP = 4096  # larger groups are reported unavailable (weights left at 1) rather than approximated
+
+
+def coplanar_groups(centers, normals, theta_tol=COPLANAR_THETA_TOL, d_tol=COPLANAR_D_TOL, chunk=2048):
+    """Connected components of the coplanar relation. Uses positions and unit normals only (float64).
+
+    i~j iff |n_i.n_j| >= cos(theta_tol) and both point-to-plane distances <= d_tol. A straight ray crosses a plane
+    once, so members of one group cannot occlude each other. Returns labels = smallest member index per group.
+    """
+    x = centers.detach().to(torch.float64)
+    n = torch.nn.functional.normalize(normals.detach().to(torch.float64), dim=-1)
+    num = x.shape[0]
+    labels = torch.arange(num, device=x.device, dtype=torch.long)
+    if num <= 1:
+        return labels
+    cos_tol = math.cos(float(theta_tol))
+    big = torch.full((), num, device=x.device, dtype=torch.long)
+    while True:
+        new_labels = labels.clone()
+        for start in range(0, num, chunk):
+            end = min(start + chunk, num)
+            dots = (n[start:end] @ n.T).abs()
+            diff = x.unsqueeze(0) - x[start:end].unsqueeze(1)
+            d_ij = (diff * n[start:end].unsqueeze(1)).sum(-1).abs()
+            d_ji = (diff * n.unsqueeze(0)).sum(-1).abs()
+            adj = (dots >= cos_tol) & (d_ij <= d_tol) & (d_ji <= d_tol)
+            cand = torch.where(adj, labels.unsqueeze(0).expand(end - start, -1), big).amin(dim=1)
+            new_labels[start:end] = torch.minimum(new_labels[start:end], cand)
+        # pointer jumping keeps label propagation short on long chains
+        new_labels = new_labels[new_labels]
+        if torch.equal(new_labels, labels):
+            return labels
+        labels = new_labels
+
+
+def _snap_edges(edges, s_tol):
+    e, _ = torch.sort(edges)
+    if e.numel() <= 1:
+        return e
+    gap = e[1:] - e[:-1]
+    start = torch.ones_like(e, dtype=torch.bool)
+    start[1:] = gap > s_tol
+    cluster = torch.cumsum(start.to(torch.long), dim=0) - 1
+    sums = e.new_zeros(int(cluster[-1].item()) + 1).scatter_add(0, cluster, e)
+    counts = e.new_zeros(sums.shape).scatter_add(0, cluster, torch.ones_like(e))
+    return sums / counts
+
+
+def coplanar_union_weights(centers, normals, axes_u, axes_v, scales, labels,
+                           theta_tol=COPLANAR_THETA_TOL, s_tol=COPLANAR_S_TOL, quad=COPLANAR_QUAD,
+                           max_group=COPLANAR_MAX_GROUP):
+    """w_i = (1/A_i) * integral over cell_i of 1/N(x); cell = sqrt(2*pi)*s1 x sqrt(2*pi)*s2 tangent rectangle.
+
+    Returns (weights float64 [N], info dict). Exact coordinate compression for axis-aligned groups, midpoint
+    quadrature otherwise. Disjoint cells keep 1, k exact duplicates get 1/k, overlaps are shared symmetrically.
+    """
+    x = centers.detach().to(torch.float64)
+    u_all = torch.nn.functional.normalize(axes_u.detach().to(torch.float64), dim=-1)
+    v_all = torch.nn.functional.normalize(axes_v.detach().to(torch.float64), dim=-1)
+    half = scales.detach().to(torch.float64) * (math.sqrt(2.0 * math.pi) / 2.0)
+    weights = torch.ones(x.shape[0], device=x.device, dtype=torch.float64)
+    info = {"groups": 0, "multi_member_groups": 0, "largest_group": 0, "exact_groups": 0,
+            "quadrature_groups": 0, "unavailable_large_groups": 0}
+    if x.shape[0] == 0:
+        return weights, info
+    uniq, counts = torch.unique(labels, return_counts=True)
+    info["groups"] = int(uniq.numel())
+    info["largest_group"] = int(counts.max().item())
+    cos_tol = math.cos(float(theta_tol))
+    for lab in uniq[counts > 1].tolist():
+        idx = torch.nonzero(labels == lab, as_tuple=False).squeeze(-1)
+        m = int(idx.numel())
+        info["multi_member_groups"] += 1
+        if m > max_group:
+            info["unavailable_large_groups"] += 1
+            continue
+        a = int(idx[0].item())
+        ua, va, xa = u_all[a], v_all[a], x[a]
+        gu, gv, gx, gh = u_all[idx], v_all[idx], x[idx], half[idx]
+        cu = (gu * ua).sum(-1).abs()
+        cv = (gu * va).sum(-1).abs()
+        along_u = cu >= cos_tol
+        along_v = cv >= cos_tol
+        if bool((along_u | along_v).all().item()):
+            hu = torch.where(along_u, gh[:, 0], gh[:, 1])
+            hv = torch.where(along_u, gh[:, 1], gh[:, 0])
+            du = ((gx - xa) * ua).sum(-1)
+            dv = ((gx - xa) * va).sum(-1)
+            lo_u, hi_u, lo_v, hi_v = du - hu, du + hu, dv - hv, dv + hv
+            eu = _snap_edges(torch.cat([lo_u, hi_u]), s_tol)
+            ev = _snap_edges(torch.cat([lo_v, hi_v]), s_tol)
+            mu_, lu = 0.5 * (eu[1:] + eu[:-1]), eu[1:] - eu[:-1]
+            mv_, lv = 0.5 * (ev[1:] + ev[:-1]), ev[1:] - ev[:-1]
+            iu = ((mu_.unsqueeze(0) >= lo_u.unsqueeze(1)) & (mu_.unsqueeze(0) <= hi_u.unsqueeze(1))).to(torch.float64)
+            iv = ((mv_.unsqueeze(0) >= lo_v.unsqueeze(1)) & (mv_.unsqueeze(0) <= hi_v.unsqueeze(1))).to(torch.float64)
+            count = iu.T @ iv
+            inv = torch.where(count > 0, 1.0 / count.clamp_min(1.0), torch.zeros_like(count))
+            credit = (((iu * lu) @ inv) * (iv * lv)).sum(-1)
+            area = 4.0 * hu * hv
+            weights[idx] = torch.where(area > 0, credit / area.clamp_min(1e-300), torch.ones_like(area))
+            info["exact_groups"] += 1
+        else:
+            g = (torch.arange(quad, device=x.device, dtype=torch.float64) + 0.5) / quad * 2.0 - 1.0
+            su, sv = torch.meshgrid(g, g, indexing="ij")
+            su, sv = su.reshape(-1), sv.reshape(-1)
+            for k in range(m):
+                pts = gx[k] + su.unsqueeze(-1) * gh[k, 0] * gu[k] + sv.unsqueeze(-1) * gh[k, 1] * gv[k]
+                rel = pts.unsqueeze(1) - gx.unsqueeze(0)
+                pu = (rel * gu.unsqueeze(0)).sum(-1).abs()
+                pv = (rel * gv.unsqueeze(0)).sum(-1).abs()
+                inside = (pu <= gh[:, 0].unsqueeze(0) + s_tol) & (pv <= gh[:, 1].unsqueeze(0) + s_tol)
+                cnt = inside.sum(-1).clamp_min(1).to(torch.float64)
+                weights[idx[k]] = (1.0 / cnt).mean()
+            info["quadrature_groups"] += 1
+    return weights, info
+
+
+def compose_coplanar_union_occlusion(ray_ids, range_vals, value_vals, coverage_vals, range_weights, group_ids, group_key, num_rays):
+    """Layer compositing: events of one coplanar group in one ray bin form one layer (no mutual attenuation).
+
+    value_vals already carry the union weight. coverage_vals = per-event solid-angle coverage of its ray bin.
+    Layers are ordered by range_weights (share * union weight) mean range, tie by group_key.
+    Returns the compose_ray_binned_occlusion keys so downstream surface maps keep working.
+    """
+    if range_vals.numel() == 0:
+        out = compose_ray_binned_occlusion(ray_ids, range_vals, coverage_vals, value_vals, num_rays)
+        out.update(layer_count=0, layer_alpha=value_vals.new_zeros((0,)))
+        return out
+    num_groups = int(group_ids.max().item()) + 1
+    layer_key = ray_ids.to(torch.long) * num_groups + group_ids.to(torch.long)
+    uniq, layer_of_event = torch.unique(layer_key, return_inverse=True)
+    num_layers = int(uniq.numel())
+    layer_ray = torch.div(uniq, num_groups, rounding_mode="floor")
+    layer_group = uniq - layer_ray * num_groups
+    wsum = value_vals.new_zeros(num_layers).scatter_add(0, layer_of_event, coverage_vals)
+    rw = value_vals.new_zeros(num_layers).scatter_add(0, layer_of_event, range_weights)
+    rsum = value_vals.new_zeros(num_layers).scatter_add(0, layer_of_event, range_weights * range_vals)
+    cnt = value_vals.new_zeros(num_layers).scatter_add(0, layer_of_event, torch.ones_like(range_vals))
+    rplain = value_vals.new_zeros(num_layers).scatter_add(0, layer_of_event, range_vals)
+    layer_range = torch.where(rw > 0, rsum / rw.clamp_min(1e-300), rplain / cnt.clamp_min(1.0))
+    layer_alpha = wsum.clamp(0.0, 1.0)
+    tie = group_key[layer_group]
+    # lexicographic (ray, range, tie) by successive stable sorts
+    order = torch.argsort(tie, stable=True)
+    order = order[torch.argsort(layer_range[order], stable=True)]
+    order = order[torch.argsort(layer_ray[order], stable=True)]
+    ray_sorted_l = layer_ray[order]
+    log_keep = torch.log((1.0 - layer_alpha[order]).clamp_min(1e-8))
+    new_ray = torch.ones_like(ray_sorted_l, dtype=torch.bool)
+    new_ray[1:] = ray_sorted_l[1:] != ray_sorted_l[:-1]
+    seg = torch.cumsum(new_ray.to(torch.long), dim=0) - 1
+    starts = torch.nonzero(new_ray, as_tuple=False).squeeze(-1)
+    incl = torch.cumsum(log_keep, dim=0)
+    prefix = log_keep.new_zeros(int(seg[-1].item()) + 1)
+    if starts.numel() > 1:
+        prefix[1:] = incl[starts[1:] - 1]
+    excl = (incl - log_keep) - prefix[seg]
+    trans_layer = torch.empty_like(layer_alpha)
+    trans_layer[order] = torch.exp(excl)
+    ends = torch.empty_like(starts)
+    if starts.numel() > 1:
+        ends[:-1] = starts[1:] - 1
+    ends[-1] = ray_sorted_l.numel() - 1
+    final_transmittance = value_vals.new_ones(int(num_rays))
+    final_transmittance[ray_sorted_l[starts]] = torch.exp(incl[ends] - prefix)
+
+    event_trans = trans_layer[layer_of_event]
+    event_returns = event_trans * value_vals
+    ray_returns = value_vals.new_zeros(int(num_rays)).scatter_add(0, ray_ids.to(torch.long), event_returns)
+    # per-event bookkeeping for downstream maps: event alpha = its share of its layer's coverage
+    event_alpha = torch.where(wsum[layer_of_event] > 0,
+                              layer_alpha[layer_of_event] * coverage_vals / wsum[layer_of_event].clamp_min(1e-300),
+                              torch.zeros_like(coverage_vals))
+    rank_of_layer = torch.empty_like(order)
+    rank_of_layer[order] = torch.arange(num_layers, device=order.device)
+    ev_order = torch.argsort(rank_of_layer[layer_of_event] * 1, stable=True)
+    ray_ev = ray_ids.to(torch.long)[ev_order]
+    ev_new = torch.ones_like(ray_ev, dtype=torch.bool)
+    ev_new[1:] = ray_ev[1:] != ray_ev[:-1]
+    ev_seg = torch.cumsum(ev_new.to(torch.long), dim=0) - 1
+    return {
+        "event_returns": event_returns,
+        "ray_returns": ray_returns,
+        "final_transmittance": final_transmittance,
+        "transmittance_before_event": event_trans[ev_order],
+        "alpha_sorted": event_alpha[ev_order],
+        "range_sorted": range_vals[ev_order],
+        "ray_ids_sorted": ray_ev,
+        "segment_starts": torch.nonzero(ev_new, as_tuple=False).squeeze(-1),
+        "event_sort_order": ev_order,
+        "segment_ids": ev_seg,
+        "layer_count": num_layers,
+        "layer_alpha": layer_alpha,
+    }
+
+
 def marginalize_elevation_bins(returns_aer, elev_weights=None):
     if elev_weights is None:
         num_elev = returns_aer.shape[1]
@@ -1515,6 +1717,29 @@ def render_sonar(
             world_to_view_rotation=w2v[:3, :3].T,
         )
     mass_loss_tensor = viewspace_points.new_zeros((0,))
+    union_diag = None
+    if runtime_contract["occlusion_mode"] == "coplanar_union":
+        union_rot = _quat_to_rotation_matrices(rotations)
+        union_scale = scaling_xy if scale_factor is None else scaling_xy * scale_factor.scale
+        union_labels = coplanar_groups(means3D_scaled, normals_world)
+        union_w64, union_info = coplanar_union_weights(
+            means3D_scaled, normals_world, union_rot[:, :, 0], union_rot[:, :, 1], union_scale, union_labels
+        )
+        union_weight = union_w64.to(viewspace_points.dtype)
+        _, union_gid = torch.unique(union_labels, return_inverse=True)
+        union_gkey = range_vals.detach().new_full((int(union_gid.max().item()) + 1 if N > 0 else 0,), float("inf"))
+        if N > 0:
+            union_gkey.scatter_reduce_(0, union_gid, range_vals.detach(), reduce="amin", include_self=True)
+        # projected solid angle of each patch's physical area, |mu| so a backface still blocks
+        union_solid = (2.0 * math.pi) * union_scale[:, 0] * union_scale[:, 1] * dot_val.abs() / range_vals.clamp_min(1e-8).square()
+        union_diag = dict(union_info)
+        union_diag.update(
+            weight_min=float(union_w64.min().item()) if N > 0 else 1.0,
+            weight_sum=float(union_w64.sum().item()),
+            theta_tol_rad=COPLANAR_THETA_TOL,
+            d_tol_m=COPLANAR_D_TOL,
+            s_tol_m=COPLANAR_S_TOL,
+        )
 
     if visible_idx.numel() > 0:
         vis_mu = footprints["mu_2d"][visible_idx]
@@ -1592,6 +1817,33 @@ def render_sonar(
                     num_rays=num_ray_bins,
                 )
                 event_returns = composed["event_returns"]
+            elif runtime_contract["occlusion_mode"] == "coplanar_union":
+                ev_patch = visible_idx[event_surfel_idx]
+                ev_w = union_weight[ev_patch]
+                e_bins = int(runtime_contract["elev_bins"])
+                half_el = float(sonar_config.half_elevation_rad)
+                el_edges = torch.linspace(-half_el, half_el, e_bins + 1, device=device, dtype=torch.float64)
+                bin_solid = (2.0 * float(sonar_config.half_azimuth_rad) / W) * (torch.sin(el_edges[1:]) - torch.sin(el_edges[:-1]))
+                ev_bin_solid = bin_solid.to(event_value.dtype)[torch.remainder(event_ray_ids, e_bins)]
+                ev_cov = ev_w * opacity[ev_patch] * event_share * union_solid[ev_patch] / ev_bin_solid
+                composed = compose_coplanar_union_occlusion(
+                    ray_ids=event_ray_ids,
+                    range_vals=event_range,
+                    value_vals=event_value * ev_w,
+                    coverage_vals=ev_cov,
+                    range_weights=event_share * ev_w,
+                    group_ids=union_gid[ev_patch],
+                    group_key=union_gkey,
+                    num_rays=num_ray_bins,
+                )
+                event_returns = composed["event_returns"]
+                union_diag.update(
+                    layers=int(composed["layer_count"]),
+                    union_input=float((event_value * ev_w).detach().double().sum().item()),
+                    duplicate_credit_removed=float((event_value * (1.0 - ev_w)).detach().double().sum().item()),
+                    layer_alpha_max=float(composed["layer_alpha"].max().item()),
+                    layers_saturated=int((composed["layer_alpha"] >= 1.0).sum().item()),
+                )
             else:
                 event_returns = event_value
                 composed = {
@@ -1945,6 +2197,7 @@ def render_sonar(
         "lambertian_negative_fraction": float((dot_val < 0).float().mean().item()) if N > 0 else 0.0,
         "sonar_render_mode": runtime_contract["render_mode"],
         "sonar_occlusion_mode": runtime_contract["occlusion_mode"],
+        "coplanar_union": union_diag,
         "elevation_bin_count": int(runtime_contract["elev_bins"]),
         "elevation_weight_mode": runtime_contract["elev_weight_mode"],
         "elevation_model": runtime_contract["elev_model"],
