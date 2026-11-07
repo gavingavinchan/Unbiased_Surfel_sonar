@@ -356,6 +356,10 @@ def resolve_sonar_render_contract():
     if return_model not in {"legacy", "area_r4"}:
         raise ValueError(f"Unsupported SONAR_RETURN_MODEL '{return_model}'.")
 
+    visibility_rule = os.getenv("SONAR_VISIBILITY_RULE", "legacy").strip().lower()
+    if visibility_rule not in {"legacy", "ray_depth_layers"}:
+        raise ValueError(f"Unsupported SONAR_VISIBILITY_RULE '{visibility_rule}'.")
+
     occl_k_sigma = float(os.getenv("SONAR_OCCL_KSIGMA", "2.5"))
     occl_weight_floor_rel = float(os.getenv("SONAR_OCCL_WEIGHT_FLOOR_REL", "1e-3"))
     occl_topk = max(int(os.getenv("SONAR_OCCL_TOPK", "16")), 1)
@@ -368,6 +372,7 @@ def resolve_sonar_render_contract():
         "elev_model": elev_model,
         "intensity_gain": intensity_gain,
         "return_model": return_model,
+        "visibility_rule": visibility_rule,
         "occl_k_sigma": occl_k_sigma,
         "occl_weight_floor_rel": occl_weight_floor_rel,
         "occl_topk": occl_topk,
@@ -1515,6 +1520,18 @@ def render_sonar(
             world_to_view_rotation=w2v[:3, :3].T,
         )
     mass_loss_tensor = viewspace_points.new_zeros((0,))
+    ray_depth_diagnostics = None
+    ray_depth_fraction = None
+    if runtime_contract["visibility_rule"] == "ray_depth_layers" and runtime_contract["occlusion_mode"] != "none":
+        from .ray_depth_layers import quaternion_tangents, ray_depth_visibility
+        tang_u, tang_v = quaternion_tangents(rotations[visible_idx])
+        rotation_to_sonar = w2v[:3, :3].T.to(torch.float64)
+        local_u = tang_u @ rotation_to_sonar.T
+        local_v = tang_v @ rotation_to_sonar.T
+        physical_scales = scaling_xy if scale_factor is None else scaling_xy * scale_factor.scale
+        ray_depth_fraction, ray_depth_diagnostics = ray_depth_visibility(
+            points_sonar[visible_idx], local_u, local_v,
+            physical_scales[visible_idx], opacity[visible_idx])
 
     if visible_idx.numel() > 0:
         vis_mu = footprints["mu_2d"][visible_idx]
@@ -1583,7 +1600,17 @@ def render_sonar(
             event_range = torch.cat(event_range_parts, dim=0)
             event_share = torch.cat(event_share_parts, dim=0)
 
-            if runtime_contract["occlusion_mode"] == "ray_binned":
+            if ray_depth_fraction is not None:
+                # Reuse legacy event ordering only for ancillary array layout.
+                # Zero alpha explicitly leaves unsupported alpha/depth maps empty.
+                # Centre ranges DO NOT participate in ray-depth visibility.
+                composed = compose_ray_binned_occlusion(
+                    event_ray_ids, event_range, torch.zeros_like(event_alpha),
+                    event_value, num_ray_bins)
+                event_returns = event_value * ray_depth_fraction[event_surfel_idx]
+                composed["event_returns"] = event_returns
+                composed["ray_returns"] = event_value.new_zeros(num_ray_bins).scatter_add(0, event_ray_ids, event_returns)
+            elif runtime_contract["occlusion_mode"] == "ray_binned":
                 composed = compose_ray_binned_occlusion(
                     ray_ids=event_ray_ids,
                     range_vals=event_range,
@@ -1995,6 +2022,7 @@ def render_sonar(
     return {
         "render": rendered_image,
         "viewspace_points": viewspace_points,
+        "ray_depth_diagnostics": ray_depth_diagnostics,
         "visibility_filter": in_fov,
         "radii": radii,
         "converge": torch.tensor(0.0, device=device),
