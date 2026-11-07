@@ -8,10 +8,9 @@ import torch
 
 source = Path(__file__).resolve().parents[1] / 'gaussian_renderer/__init__.py'
 tree = ast.parse(source.read_text())
-names = {'coplanar_groups', '_snap_edges', 'coplanar_union_weights', 'compose_coplanar_union_occlusion',
+names = {'coplanar_union_tolerances', 'coplanar_groups', '_snap_edges', 'coplanar_union_weights', 'compose_coplanar_union_occlusion',
          'compose_ray_binned_occlusion', 'resolve_sonar_render_contract'}
-body = [node for node in tree.body if (isinstance(node, ast.FunctionDef) and node.name in names)
-        or (isinstance(node, ast.Assign) and any(getattr(t, 'id', '').startswith('COPLANAR_') for t in node.targets))]
+body = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in names]
 assert {n.name for n in body if isinstance(n, ast.FunctionDef)} == names
 ns = {'torch': torch, 'math': math, 'os': os}
 exec(compile(ast.Module(body=body, type_ignores=[]), str(source), 'exec'), ns)

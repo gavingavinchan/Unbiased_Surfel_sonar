@@ -1056,19 +1056,25 @@ def compose_ray_binned_occlusion(ray_ids, range_vals, alpha_vals, value_vals, nu
 
 
 # --- 335: opt-in SONAR_OCCLUSION_MODE=coplanar_union (frozen rule; see experiments/335 MODEL.md) ---------------
-COPLANAR_THETA_TOL = 1e-4  # rad; ~2.5 orders above float32 normal rounding, 2 orders below any physical bend we model
-COPLANAR_D_TOL = 1e-4  # m; ~2.5 orders above float32 rounding at 3 m, ~2 orders below a 15 mm range bin
-COPLANAR_S_TOL = 1e-6  # m; in-plane edge snapping only (~4 float32 ulps at 3 m)
-COPLANAR_QUAD = 64  # midpoint quadrature per cell axis when cells in a group are not axis-aligned
-COPLANAR_MAX_GROUP = 4096  # larger groups are reported unavailable (weights left at 1) rather than approximated
+def coplanar_union_tolerances():
+    """Frozen 335 tolerances (a function, not module constants, so AST-loaded CPU tests can execute helpers).
+
+    theta_tol rad / d_tol m: ~2.5 orders above float32 rounding of a 3 m scene, ~2 orders below a 15 mm range bin.
+    s_tol m: in-plane edge snapping only (~4 float32 ulps at 3 m). quad: midpoint quadrature per cell axis for
+    non-axis-aligned groups. max_group: larger groups are reported unavailable (weights left at 1).
+    """
+    return {"theta_tol": 1e-4, "d_tol": 1e-4, "s_tol": 1e-6, "quad": 64, "max_group": 4096}
 
 
-def coplanar_groups(centers, normals, theta_tol=COPLANAR_THETA_TOL, d_tol=COPLANAR_D_TOL, chunk=2048):
+def coplanar_groups(centers, normals, theta_tol=None, d_tol=None, chunk=2048):
     """Connected components of the coplanar relation. Uses positions and unit normals only (float64).
 
     i~j iff |n_i.n_j| >= cos(theta_tol) and both point-to-plane distances <= d_tol. A straight ray crosses a plane
     once, so members of one group cannot occlude each other. Returns labels = smallest member index per group.
     """
+    tol = coplanar_union_tolerances()
+    theta_tol = tol["theta_tol"] if theta_tol is None else theta_tol
+    d_tol = tol["d_tol"] if d_tol is None else d_tol
     x = centers.detach().to(torch.float64)
     n = torch.nn.functional.normalize(normals.detach().to(torch.float64), dim=-1)
     num = x.shape[0]
@@ -1109,13 +1115,17 @@ def _snap_edges(edges, s_tol):
 
 
 def coplanar_union_weights(centers, normals, axes_u, axes_v, scales, labels,
-                           theta_tol=COPLANAR_THETA_TOL, s_tol=COPLANAR_S_TOL, quad=COPLANAR_QUAD,
-                           max_group=COPLANAR_MAX_GROUP):
+                           theta_tol=None, s_tol=None, quad=None, max_group=None):
     """w_i = (1/A_i) * integral over cell_i of 1/N(x); cell = sqrt(2*pi)*s1 x sqrt(2*pi)*s2 tangent rectangle.
 
     Returns (weights float64 [N], info dict). Exact coordinate compression for axis-aligned groups, midpoint
     quadrature otherwise. Disjoint cells keep 1, k exact duplicates get 1/k, overlaps are shared symmetrically.
     """
+    tol = coplanar_union_tolerances()
+    theta_tol = tol["theta_tol"] if theta_tol is None else theta_tol
+    s_tol = tol["s_tol"] if s_tol is None else s_tol
+    quad = tol["quad"] if quad is None else quad
+    max_group = tol["max_group"] if max_group is None else max_group
     x = centers.detach().to(torch.float64)
     u_all = torch.nn.functional.normalize(axes_u.detach().to(torch.float64), dim=-1)
     v_all = torch.nn.functional.normalize(axes_v.detach().to(torch.float64), dim=-1)
@@ -1736,9 +1746,7 @@ def render_sonar(
         union_diag.update(
             weight_min=float(union_w64.min().item()) if N > 0 else 1.0,
             weight_sum=float(union_w64.sum().item()),
-            theta_tol_rad=COPLANAR_THETA_TOL,
-            d_tol_m=COPLANAR_D_TOL,
-            s_tol_m=COPLANAR_S_TOL,
+            tolerances=coplanar_union_tolerances(),
         )
 
     if visible_idx.numel() > 0:
