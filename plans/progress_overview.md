@@ -590,3 +590,6 @@ No renderer, objective, submodule pointer or previous experiment was changed.
 ## 2026-10-17 — Bounded covariance solver workspace (Codex)
 
 Native 12,000-point fixed-density jobs stopped on their first update at a 6 GiB allocation limit; the 512-point acceptance case passed. Bound independent covariance eigvalsh/Cholesky/eigh calls to batches of 512, retaining autograd and covariance values. Allocation failures now propagate instead of being mistaken for non-positive covariance. CPU 12,000-matrix value/gradient agreement is tested against unsplit PyTorch. Native full-size training confirmation is pending; the solver-workspace diagnosis remains provisional until the actual repaired job runs. No scientific loss, initialization, pose, frame selection, scale or point count changes.
+
+## 2026-11-07 — 333 bounded conservation fixture
+Unchanged 312 compiled splats increase front return about 49 times under 64-way equal-area subdivision. Add one opt-in `SONAR_RETURN_MODEL=area_r4` centre return weight; legacy remains default. Gaussian area, squared front incidence and inverse fourth-power range feed the same existing splat path. Alpha visibility, footprint, aperture and response are unchanged; opaque first-hit/duplicate semantics remain incompatible. Fixture testing only, no training or deployment claim.

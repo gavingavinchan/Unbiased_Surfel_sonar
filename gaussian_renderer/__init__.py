@@ -352,6 +352,10 @@ def resolve_sonar_render_contract():
     if not math.isfinite(intensity_gain) or intensity_gain <= 0:
         raise ValueError(f"Unsupported SONAR_INTENSITY_GAIN '{intensity_gain}'.")
 
+    return_model = os.getenv("SONAR_RETURN_MODEL", "legacy").strip().lower()
+    if return_model not in {"legacy", "area_r4"}:
+        raise ValueError(f"Unsupported SONAR_RETURN_MODEL '{return_model}'.")
+
     occl_k_sigma = float(os.getenv("SONAR_OCCL_KSIGMA", "2.5"))
     occl_weight_floor_rel = float(os.getenv("SONAR_OCCL_WEIGHT_FLOOR_REL", "1e-3"))
     occl_topk = max(int(os.getenv("SONAR_OCCL_TOPK", "16")), 1)
@@ -363,6 +367,7 @@ def resolve_sonar_render_contract():
         "elev_weight_mode": elev_weight_mode,
         "elev_model": elev_model,
         "intensity_gain": intensity_gain,
+        "return_model": return_model,
         "occl_k_sigma": occl_k_sigma,
         "occl_weight_floor_rel": occl_weight_floor_rel,
         "occl_topk": occl_topk,
@@ -1296,6 +1301,18 @@ def compute_fov_margin(range_vals, azimuth, elevation, sonar_config):
     return margin
 
 
+def sonar_area_received_power(scale_xy, incidence, ranges, reflectance):
+    """Opt-in 333 centre quadrature of rho * mu^2 * dA / r^4.
+
+    A peak-one tangent Gaussian integrates to 2*pi*s1*s2 square metres.
+    This changes return weights only: the existing alpha visibility, aperture
+    checks and splat response remain approximate and are NOT an opaque
+    first-hit surface model. It is not a conservation certification.
+    """
+    area = (2.0 * math.pi) * scale_xy[:, 0] * scale_xy[:, 1]
+    return reflectance * area * incidence.clamp_min(0.0).square() / ranges.clamp_min(1e-8).pow(4)
+
+
 def render_sonar(
     viewpoint_camera,
     pc: GaussianModel,
@@ -1432,6 +1449,11 @@ def render_sonar(
         range_atten_auto_gain=range_atten_auto_gain,
     )
     intensity = base_intensity * attenuation
+    if runtime_contract["return_model"] == "area_r4":
+        physical_scale = pc.get_scaling * float(scaling_modifier)
+        if scale_factor is not None:
+            physical_scale = physical_scale * scale_factor.scale
+        intensity = sonar_area_received_power(physical_scale, dot_val, range_vals, opacity)
     if runtime_contract["intensity_gain"] != 1.0:
         # SONAR_INTENSITY_GAIN (274): one declared global gain on the event value (never on occlusion alpha).
         intensity = intensity * float(runtime_contract["intensity_gain"])
@@ -1927,6 +1949,7 @@ def render_sonar(
         "elevation_weight_mode": runtime_contract["elev_weight_mode"],
         "elevation_model": runtime_contract["elev_model"],
         "intensity_gain": float(runtime_contract["intensity_gain"]),
+        "return_model": runtime_contract["return_model"],
         "surfel_size_stats_schema_version": "v1",
         "surfel_size_stats_world": {
             "s1": _summary_stats(world_s1),
