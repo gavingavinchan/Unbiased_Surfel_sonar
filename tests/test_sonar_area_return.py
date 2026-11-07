@@ -1,8 +1,22 @@
 """Return-law checks; deliberately make no claim of opaque splat conservation."""
 import math
+import ast
+import os
+from pathlib import Path
 import pytest
 import torch
-from gaussian_renderer import sonar_area_received_power, resolve_sonar_render_contract
+
+# As in test_sonar_bounded_linalg: execute the exact source helpers without
+# requiring an unavailable compiled CUDA module on the CPU CI runner.
+source = Path(__file__).resolve().parents[1] / 'gaussian_renderer/__init__.py'
+names = {'sonar_area_received_power', 'resolve_sonar_render_contract'}
+functions = [node for node in ast.parse(source.read_text()).body
+             if isinstance(node, ast.FunctionDef) and node.name in names]
+assert {node.name for node in functions} == names
+namespace = {'torch': torch, 'math': math, 'os': os}
+exec(compile(ast.Module(body=functions, type_ignores=[]), str(source), 'exec'), namespace)
+sonar_area_received_power = namespace['sonar_area_received_power']
+resolve_sonar_render_contract = namespace['resolve_sonar_render_contract']
 
 def test_area_subdivision_range_and_backface():
     s=torch.tensor([[.1,.2]],dtype=torch.float64)

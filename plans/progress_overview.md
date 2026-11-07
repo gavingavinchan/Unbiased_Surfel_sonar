@@ -593,3 +593,4 @@ Native 12,000-point fixed-density jobs stopped on their first update at a 6 GiB 
 
 ## 2026-11-07 — 333 bounded conservation fixture
 Unchanged 312 compiled splats increase front return about 49 times under 64-way equal-area subdivision. Add one opt-in `SONAR_RETURN_MODEL=area_r4` centre return weight; legacy remains default. Gaussian area, squared front incidence and inverse fourth-power range feed the same existing splat path. Alpha visibility, footprint, aperture and response are unchanged; opaque first-hit/duplicate semantics remain incompatible. Fixture testing only, no training or deployment claim.
+CPU CI initially failed collection because the new test imported the CUDA extension. Corrected the test to execute the exact two source helpers via the repository's established AST-loading pattern; no renderer equation or fixture changed. The actual compiled path is exercised separately by experiment333's full before/after suite.
