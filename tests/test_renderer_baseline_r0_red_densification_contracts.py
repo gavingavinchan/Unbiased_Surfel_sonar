@@ -92,6 +92,9 @@ def test_rb_t08_render_sonar_emits_meaningful_densification_signals_for_both_mod
     monkeypatch.setenv("SONAR_RENDER_MODE", render_mode)
     monkeypatch.setenv("SONAR_OCCLUSION_MODE", "none")
     monkeypatch.setenv("SONAR_LAMBERTIAN_MODE", "clamp0")
+    # 409: this fixture renders an all-zero image; its densification signal came only from
+    # the zero-forward weight_sum surrogate, now opt-in legacy (SONAR_LEGACY_WEIGHT_SURROGATE=1).
+    monkeypatch.setenv("SONAR_LEGACY_WEIGHT_SURROGATE", "1")
 
     viewpoint = SimpleNamespace(image_height=32, image_width=48)
     sonar_cfg = SimpleNamespace(
@@ -126,3 +129,29 @@ def test_rb_t08_render_sonar_emits_meaningful_densification_signals_for_both_mod
     assert (
         viewspace_points.grad.abs().sum().item() > 0.0
     ), "RB-T08: viewspace_points must carry non-zero densification gradient signal"
+
+
+@pytest.mark.parametrize("render_mode", ["2dgs", "2dgs_nonlinear"])
+def test_409_default_path_has_no_zero_forward_gradient(monkeypatch, render_mode):
+    """409: without the legacy surrogate an all-zero image carries no position gradient."""
+    render_sonar = _load_renderer_fn(
+        "render_sonar",
+        extra_globals={
+            "get_scaled_world_to_view_transform": _identity_world_to_view,
+            "sonar_ranges_to_points": _fake_ranges_to_points,
+            "sonar_points_to_normals": _fake_points_to_normals,
+        },
+    )
+    monkeypatch.setenv("SONAR_RENDER_MODE", render_mode)
+    monkeypatch.setenv("SONAR_OCCLUSION_MODE", "none")
+    monkeypatch.setenv("SONAR_LAMBERTIAN_MODE", "clamp0")
+    monkeypatch.delenv("SONAR_LEGACY_WEIGHT_SURROGATE", raising=False)
+    pc = _DummyPointCloud()
+    out = render_sonar(viewpoint_camera=SimpleNamespace(image_height=32, image_width=48), pc=pc,
+        bg_color=torch.zeros(3, dtype=torch.float32),
+        sonar_config=SimpleNamespace(half_azimuth_rad=math.radians(60.0), half_elevation_rad=math.radians(10.0), range_min=0.2, range_max=3.0),
+        scale_factor=None, sonar_extrinsic=None)
+    assert float(out["render"].abs().sum()) == 0.0
+    out["render"].sum().backward()
+    g = out["viewspace_points"].grad
+    assert g is None or float(g.abs().sum()) == 0.0

@@ -31,3 +31,9 @@ It is now off by default; `SONAR_LEGACY_WEIGHT_SURROGATE=1` reproduces the old p
 * All other predicates (half-open support, exact rational fallback) are 371's.
 * Visibility remains under no_grad: image derivatives certify emission /
   projection / footprint only, never the moving-shadow boundary.
+
+## Densification consequence
+The removed surrogate was the ONLY position-gradient signal on fixtures whose image is
+all zero (test RB-T08). Default-path densification statistics now come only from real
+image gradients; RB-T08 pins the legacy flag and a new test asserts the default path
+injects no gradient into an empty image. 409 training keeps densification off.
