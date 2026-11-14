@@ -16,11 +16,11 @@ def test_duplicate_and_hidden():
     torch.testing.assert_close(f,torch.tensor([.5,.5,0.]))
     assert d['invalid_source_samples']==0
 
-def test_close_resolved_and_unresolved():
+def test_distinct_stored_layers_are_resolved():
     f,_=run([[1.,0.,0.],[1.005,0.,0.]])
     torch.testing.assert_close(f,torch.tensor([1.,0.]))
     f,_=run([[1.,0.,0.],[1.000001,0.,0.]])
-    torch.testing.assert_close(f,torch.tensor([.5,.5]))
+    torch.testing.assert_close(f,torch.tensor([1.,0.]))
 
 def test_disjoint_same_ray_bin_not_merged():
     f,_=run([[1.,-.2,0.],[1.,.2,0.]])
@@ -31,3 +31,19 @@ def test_zero_reflectance_does_not_block():
     u=torch.tensor([[0.,1.,0.]]*2);v=torch.tensor([[0.,0.,-1.]]*2)
     f,_=mod.ray_depth_visibility(c,u,v,torch.full((2,2),.1),torch.tensor([0.,1.]))
     assert f[1]==1
+
+
+def test_thin_subdivision_and_no_boundary_gradient():
+    c=torch.tensor([[1.,0.,0.],[1.,0.,1.25e-5]],requires_grad=True)
+    u=torch.tensor([[0.,1.,0.]]*2);v=torch.tensor([[0.,0.,1.]]*2)
+    scales=torch.tensor([[.01,1.25e-5/(2*torch.pi)**.5]]*2)
+    f,d=mod.ray_depth_visibility(c,u,v,scales,torch.ones(2))
+    torch.testing.assert_close(f,torch.ones(2))
+    assert not f.requires_grad
+    assert d['max_source_depth_tolerance_m']==0
+
+
+def test_source_plane_at_origin_is_unavailable():
+    f,d=run([[0.,1.,0.]])
+    assert d['invalid_source_samples']==256
+    assert f.item()==0
