@@ -1156,6 +1156,70 @@ def _sonar_footprint_pixel_mass(vis_mu, vis_sigma, image_width, image_height, li
     return torch.cat(parts, dim=0)
 
 
+def _sonar_deposition_contract():
+    """337 opt-in spatial law; legacy defaults and compiled path stay unchanged."""
+    mode = os.getenv("SONAR_DEPOSITION_CONTRACT", "legacy").strip().lower()
+    if mode not in {"legacy", "intrinsic_screen_mass_v1"}:
+        raise ValueError(f"Unsupported SONAR_DEPOSITION_CONTRACT '{mode}'.")
+    if mode == "intrinsic_screen_mass_v1":
+        if os.getenv("SONAR_RASTER_FOOTPRINT_NORM", "none").strip().lower() != "mass":
+            raise ValueError("intrinsic_screen_mass_v1 requires mass footprint normalization")
+        if float(os.getenv("SONAR_RASTER_LINEAR_OPACITY", "0.0625")) != 0.0625:
+            raise ValueError("intrinsic_screen_mass_v1 requires linear opacity 0.0625")
+    return mode
+
+
+def _rasterize_sonar_event_volume_matched_fallback(
+    vis_mu, vis_sigma, vis_range, event_surfel_idx, event_ray_ids,
+    event_returns, event_share, image_width, image_height, elev_bins, chunk=32,
+):
+    """337 full affine/screen mass footprint on CPU or Torch CUDA.
+
+    Finite conditioned Sigma, integer pixel centres, max(intrinsic Gaussian,
+    variance-.5 screen Gaussian), opacity cutoff >=1/255, image-cropped mass
+    normalization. Events keep their elevation but do not confine deposition to
+    their upstream azimuth column. This chooses the compiled spatial law, not a
+    measured acoustic model. No visibility/emission/input-event change.
+    """
+    if _sonar_deposition_contract() != "intrinsic_screen_mass_v1":
+        raise ValueError("Matched fallback requires its explicit opt-in contract")
+    if int(chunk) < 1:
+        raise ValueError("chunk must be positive")
+    for tensor in (vis_mu, vis_sigma, vis_range, event_returns, event_share):
+        if not bool(torch.isfinite(tensor).all()):
+            raise ValueError("Matched deposition requires finite inputs")
+    w, h, b = int(image_width), int(image_height), int(elev_bins)
+    n = int(vis_mu.shape[0])
+    out = vis_mu.new_zeros((3, w, b, h))
+    if event_returns.numel() == 0:
+        return out[0], out[1], out[2], vis_mu.new_zeros(n)
+    ids = event_surfel_idx * b + torch.remainder(event_ray_ids, b)
+    values = torch.stack((event_returns,
+                          event_returns * vis_range[event_surfel_idx].clamp_min(.21),
+                          event_share), dim=-1)
+    totals = vis_mu.new_zeros((n * b, 3)).scatter_add(
+        0, ids[:, None].expand(-1, 3), values).reshape(n, b, 3)
+    sigma = _condition_sigma_2d(vis_sigma)
+    yy, xx = torch.meshgrid(torch.arange(h, device=vis_mu.device, dtype=vis_mu.dtype),
+                            torch.arange(w, device=vis_mu.device, dtype=vis_mu.dtype), indexing="ij")
+    for start in range(0, n, int(chunk)):
+        s = sigma[start:start + int(chunk)]
+        mu = vis_mu[start:start + int(chunk)]
+        det = s[:, 0, 0] * s[:, 1, 1] - s[:, 0, 1] * s[:, 1, 0]
+        dx = xx[None] - mu[:, 0, None, None]
+        dy = yy[None] - mu[:, 1, None, None]
+        rho = (s[:, 1, 1, None, None] * dx.square()
+               - 2 * s[:, 0, 1, None, None] * dx * dy
+               + s[:, 0, 0, None, None] * dy.square()) / det[:, None, None]
+        g = torch.exp(-.5 * torch.minimum(rho, 2 * (dx.square() + dy.square())))
+        g = torch.where(.0625 * g >= 1 / 255, g, torch.zeros_like(g))
+        mass = g.sum(dim=(1, 2), keepdim=True)
+        kernel = g / mass.clamp_min(1e-12)
+        out = out + torch.einsum("nec,nhw->cweh", totals[start:start + int(chunk)], kernel)
+    # Radius is only diagnostic here; the caller retains projection radii.
+    return out[0], out[1], out[2], vis_mu.new_zeros(n)
+
+
 def _rasterize_sonar_event_volume(
     vis_mu,
     vis_sigma,
@@ -1368,6 +1432,7 @@ def render_sonar(
     sonar_extrinsic = resolve_sonar_extrinsic(sonar_config, sonar_extrinsic)
     device = pc.get_xyz.device
     runtime_contract = resolve_sonar_render_contract()
+    deposition_contract = _sonar_deposition_contract()
 
     means3D = pc.get_xyz
     viewspace_points = means3D + 0.0
@@ -1785,6 +1850,11 @@ def render_sonar(
                 support_aer = raster_support
                 if bool((raster_radii > 0).any().item()):
                     radii[visible_idx] = torch.maximum(radii[visible_idx], raster_radii)
+            elif deposition_contract == "intrinsic_screen_mass_v1":
+                returns_aer, range_aer, support_aer, _ = _rasterize_sonar_event_volume_matched_fallback(
+                    vis_mu, vis_sigma, vis_range, event_surfel_idx, event_ray_ids,
+                    event_returns, event_share, W, H, int(runtime_contract["elev_bins"]),
+                )
             else:
                 row_profiles = _build_range_profiles_batch(
                     row_centers=vis_mu[:, 1],
