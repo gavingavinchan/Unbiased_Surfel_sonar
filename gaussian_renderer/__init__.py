@@ -1590,13 +1590,45 @@ def render_sonar(
     if runtime_contract["visibility_rule"] == "ray_depth_layers" and runtime_contract["occlusion_mode"] != "none":
         from .ray_depth_layers import quaternion_tangents, ray_depth_visibility
         tang_u, tang_v = quaternion_tangents(rotations[visible_idx])
-        rotation_to_sonar = w2v[:3, :3].T.to(torch.float64)
-        local_u = tang_u @ rotation_to_sonar.T
-        local_v = tang_v @ rotation_to_sonar.T
         physical_scales = scaling_xy if scale_factor is None else scaling_xy * scale_factor.scale
-        ray_depth_fraction, ray_depth_diagnostics = ray_depth_visibility(
-            points_sonar[visible_idx], local_u, local_v,
-            physical_scales[visible_idx], opacity[visible_idx])
+        precision = os.environ.get("SONAR_VISIBILITY_PRECISION", "shared64_409").strip().lower()
+        if precision == "stored32_371":
+            # Historical 371 path: float32 sonar-frame re-encoding, exact predicates only.
+            rotation_to_sonar = w2v[:3, :3].T.to(torch.float64)
+            local_u = tang_u @ rotation_to_sonar.T
+            local_v = tang_v @ rotation_to_sonar.T
+            ray_depth_fraction, ray_depth_diagnostics = ray_depth_visibility(
+                points_sonar[visible_idx], local_u, local_v,
+                physical_scales[visible_idx], opacity[visible_idx])
+        elif precision == "shared64_409":
+            # 409: one shared float64 world->sonar evaluation of the STORED float32
+            # parameters (no second lossy re-encoding), plus a declared float32
+            # representation-error bound for plane coincidence. See SONAR_RAY_DEPTH_409.md.
+            w2v64 = get_scaled_world_to_view_transform(
+                viewpoint_camera, scale_factor=scale_factor,
+                sonar_extrinsic=sonar_extrinsic, dtype=torch.float64)
+            xyz64 = means3D.detach()[visible_idx].to(torch.float64)
+            if scale_factor is not None:
+                xyz64 = float(scale_factor.scale) * xyz64
+            R64 = w2v64[:3, :3]
+            centres64 = xyz64 @ R64 + w2v64[3, :3]
+            local_u = tang_u @ R64
+            local_v = tang_v @ R64
+            u32 = 2.0 ** -24
+            rnorm = float(torch.linalg.matrix_norm(R64, ord=2))
+            # Centre: each stored coordinate rounds with relative error <= u32;
+            # mapped by the (near-rigid) shared transform.
+            delta_c = u32 * xyz64.norm(dim=-1) * rnorm * 1.01
+            # Orientation: re-encoding + float32 getter normalization give
+            # |dq|/|q| <= 4 u32; induced rotation angle <= 2|dq|/|q|; x2 margin.
+            eps_dir = torch.full_like(delta_c, 16.0 * u32 * max(1.0, rnorm))
+            ray_depth_fraction, ray_depth_diagnostics = ray_depth_visibility(
+                centres64, local_u, local_v,
+                physical_scales[visible_idx].to(torch.float64), opacity[visible_idx],
+                representation_error=(delta_c, eps_dir), out_dtype=points_sonar.dtype)
+            ray_depth_diagnostics["visibility_precision"] = "shared64_409"
+        else:
+            raise ValueError(f"SONAR_VISIBILITY_PRECISION={precision!r} unsupported")
 
     if visible_idx.numel() > 0:
         vis_mu = footprints["mu_2d"][visible_idx]
@@ -1959,11 +1991,11 @@ def render_sonar(
     render_dist = torch.nan_to_num(render_dist, nan=0.0, posinf=0.0, neginf=0.0)
     render_normal = torch.nan_to_num(render_normal, nan=0.0, posinf=0.0, neginf=0.0)
 
-    rendered_image = torch.clamp(
-        rendered_image + 1e-6 * (weight_sum.unsqueeze(0) - weight_sum.detach().unsqueeze(0)),
-        0,
-        1,
-    )
+    if os.environ.get("SONAR_LEGACY_WEIGHT_SURROGATE", "0").strip() == "1":
+        # Pre-409 zero-forward surrogate: biases image gradients (371: 2.07%
+        # xyz error). Opt-in legacy reproduction only; off on the tested path.
+        rendered_image = rendered_image + 1e-6 * (weight_sum.unsqueeze(0) - weight_sum.detach().unsqueeze(0))
+    rendered_image = torch.clamp(rendered_image, 0, 1)
     mask_top_rows = 10
     if mask_top_rows > 0:
         mask = torch.ones_like(rendered_image)

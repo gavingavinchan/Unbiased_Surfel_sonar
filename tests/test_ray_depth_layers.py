@@ -47,3 +47,40 @@ def test_source_plane_at_origin_is_unavailable():
     f,d=run([[0.,1.,0.]])
     assert d['invalid_source_samples']==256
     assert f.item()==0
+
+
+# --- 409 representation-coincidence rule -------------------------------------
+def run_rep(c, rep_scale=1.0):
+    c=torch.tensor(c,dtype=torch.float64)
+    u=torch.tensor([[0.,1.,0.]]*len(c),dtype=torch.float64)
+    v=torch.tensor([[0.,0.,-1.]]*len(c),dtype=torch.float64)
+    u32=2.0**-24
+    delta=u32*c.norm(dim=-1)*1.01*rep_scale
+    eps=torch.full((len(c),),16*u32)
+    return mod.ray_depth_visibility(c,u,v,torch.full((len(c),2),.1,dtype=torch.float64),torch.ones(len(c)),
+        representation_error=(delta,eps),out_dtype=torch.float32)
+
+def test_rep_exact_duplicate_ties():
+    f,d=run_rep([[1.,0.,0.],[1.,0.,0.]])
+    torch.testing.assert_close(f,torch.tensor([.5,.5]))
+    assert d['representation_coincident_pairs']==2
+
+def test_rep_reencoded_coplanar_offset_ties():
+    # 1e-10 m offset is far below float32 representation error at 1 m.
+    f,d=run_rep([[1.,0.,0.],[1.+1e-10,0.,0.]])
+    torch.testing.assert_close(f,torch.tensor([.5,.5]))
+    assert d['representation_inexact_coincident_pairs']==2
+
+def test_rep_10um_layers_stay_ordered_both_signs():
+    f,_=run_rep([[1.,0.,0.],[1.00001,0.,0.]])
+    torch.testing.assert_close(f,torch.tensor([1.,0.]))
+    f,_=run_rep([[1.00001,0.,0.],[1.,0.,0.]])
+    torch.testing.assert_close(f,torch.tensor([0.,1.]))
+
+def test_rep_bound_is_far_below_10um_at_metre_scale():
+    _,d=run_rep([[1.3,0.,0.],[1.3,0.,1e-11]])
+    assert 0<d['max_representation_bound_m']<2e-6
+
+def test_rep_disjoint_coplanar_not_hidden():
+    f,_=run_rep([[1.,-.2,0.],[1.,.2,0.]])
+    torch.testing.assert_close(f,torch.ones(2))

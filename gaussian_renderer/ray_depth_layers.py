@@ -26,14 +26,39 @@ def _cross(a, b):
 
 
 @torch.no_grad()
-def ray_depth_visibility(centres, tangent_u, tangent_v, scales, reflectance):
+def representation_coincidence(c, n_unit, half, delta_c, eps_dir, i):
+    """Plane-level coincidence of source i with every stored blocker (409).
+
+    Declared input-precision rule, not an acoustic merge width: planes i and j are
+    one stored surface when their unit normals are parallel and each centre lies on
+    the other's plane within the propagated float32 representation error of the
+    stored parameters (delta_c: centre error in metres, eps_dir: normal direction
+    error in radians, both computed from the stored world values by the caller).
+    Symmetric in i,j and independent of sample index, so a pair is resolved the
+    same way for every quadrature point. Separations above the bound are ordered
+    by the exact 371 predicates; separations below it are not representable.
+    """
+    ni = n_unit[i]; d = c - c[i]
+    eps = eps_dir + eps_dir[i]
+    par = torch.linalg.cross(n_unit, ni.expand_as(n_unit), dim=-1).norm(dim=-1)
+    lever = d.norm(dim=-1) + half.norm(dim=-1).clamp_min(half[i].norm())
+    bound = delta_c + delta_c[i] + eps*lever
+    # 4 float64 roundings per dot product on metre-scale values are far below bound.
+    bound = bound*(1+1e-9) + 64*torch.finfo(torch.float64).eps*(c.abs().sum(-1)+c[i].abs().sum())
+    off_on_j = (n_unit*d).sum(-1).abs()        # c_i relative to each plane j
+    off_on_i = (ni[None,:]*d).sum(-1).abs()     # each c_j relative to plane i
+    same = (par <= eps*(1+1e-9)+1e-15) & (off_on_j <= bound) & (off_on_i <= bound)
+    return same, bound
+
+
+def ray_depth_visibility(centres, tangent_u, tangent_v, scales, reflectance, representation_error=None, out_dtype=None):
     """16x16 midpoint mean. Exact predicates on ambiguous float64 evaluations.
 
     No scene identities or parent-plane labels. Each stored c/u/v/halfwidth is an
     exact binary number; cross(u,v) defines its plane without normalizing/dividing.
     Local tangent support is [-h0,h0) x [-h1,h1), with no support inflation.
     """
-    dtype = centres.dtype
+    dtype = centres.dtype if out_dtype is None else out_dtype
     c, u, v, s, rho = [a.detach().to(torch.float64) for a in
                        (centres, tangent_u, tangent_v, scales, reflectance)]
     n = torch.linalg.cross(u, v, dim=-1)
@@ -63,6 +88,11 @@ def ray_depth_visibility(centres, tangent_u, tangent_v, scales, reflectance):
     # Lazily transferred exact inputs. CPU fallback is bounded by one render;
     # it does not retain a CUDA allocation or detach any emission parameter path.
     exact = {}; coplanar = {}; exact_calls=0; coplanar_calls=0
+    n_unit = n/n.norm(dim=-1,keepdim=True).clamp_min(1e-300)
+    rep = None
+    if representation_error is not None:
+        rep = [torch.as_tensor(a,device=c.device,dtype=torch.float64).reshape(-1) for a in representation_error]
+    rep_pairs=0; rep_inexact_pairs=0; max_rep_bound=0.; min_rep_gap=math.inf
     def cell(i):
         if i not in exact:
             cv,uv,vv,hv=[tuple(F(float(x)) for x in a[i].cpu().tolist()) for a in (c,u,v,half)]
@@ -117,6 +147,32 @@ def ray_depth_visibility(centres, tangent_u, tangent_v, scales, reflectance):
         # equivalence class; all other candidates are tested geometrically.
         row=torch.arange(len(p),device=c.device)
         uncertain_support[row,src]=False; ambiguous_depth[row,src]=False
+        coinc=None
+        if rep is not None:
+            i0=int(src[0]); assert bool((src==i0).all())
+            same,bnd=representation_coincidence(c,n_unit,half,rep[0],rep[1],i0)
+            same[i0]=False
+            coinc=same[None,:].expand_as(cover)
+            if bool(same.any()):
+                js=torch.nonzero(same).flatten()
+                rep_pairs+=int(js.numel())
+                offs=(n_unit[js]*(c[js]-c[i0])).sum(-1).abs()
+                rep_inexact_pairs+=int((offs>0).sum())
+                max_rep_bound=max(max_rep_bound,float(bnd[js].max()))
+            nots=~same; nots[i0]=False
+            if bool(nots.any()):
+                # smallest separation ordered by exact predicates among parallel pairs
+                par=torch.linalg.cross(n_unit,n_unit[i0].expand_as(n_unit),dim=-1).norm(dim=-1)<=1e-12
+                cand=nots&par
+                if bool(cand.any()):
+                    g=(n_unit[cand]*(c[cand]-c[i0])).sum(-1).abs()
+                    g=g[g>0]
+                    if g.numel():min_rep_gap=min(min_rep_gap,float(g.min()))
+            # Coincident stored surfaces never occlude each other: covered samples tie.
+            tie=cover&coinc; near=near&~coinc; ambiguous_depth=ambiguous_depth&~coinc
+            for rr,jj in torch.nonzero(uncertain_support&coinc,as_tuple=False).cpu().tolist():
+                h,_,_=exact_hit(int(src[rr]),jj,(start+rr)%256); cover[rr,jj]=h; tie[rr,jj]=h
+            uncertain_support=uncertain_support&~coinc
         for rr,jj in torch.nonzero(uncertain_support|ambiguous_depth,as_tuple=False).cpu().tolist():
             i=int(src[rr]); k=(start+rr)%256
             if not bool(uncertain_support[rr,jj]) and same_plane(i,jj):
@@ -138,5 +194,7 @@ def ray_depth_visibility(centres, tangent_u, tangent_v, scales, reflectance):
         coincident_front_samples=tie_count,eta_m=0.,max_source_depth_tolerance_m=0.,
         max_residual_filter_m=max_filter,exact_point_predicates=exact_calls,exact_plane_pairs=coplanar_calls,
         support='half_open_opaque_area_equivalent_rectangle',quadrature='16x16_midpoint',
-        numerical_rule='filtered_homogeneous_exact_371',visibility_boundary_gradient=False,
+        numerical_rule='filtered_homogeneous_exact_371' if rep is None else 'filtered_homogeneous_exact_371+representation_coincidence_409',
+        representation_coincident_pairs=rep_pairs,representation_inexact_coincident_pairs=rep_inexact_pairs,
+        max_representation_bound_m=max_rep_bound,min_ordered_parallel_gap_m=(None if min_rep_gap==math.inf else min_rep_gap),visibility_boundary_gradient=False,
         ancillary_alpha_depth_available=False,training_validity=False)
