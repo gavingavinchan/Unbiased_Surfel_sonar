@@ -1,8 +1,13 @@
 """Forward geometry tests loaded without CUDA-extension imports on CPU CI."""
 import importlib.util
+import sys
+import types
 from pathlib import Path
 import torch
-spec=importlib.util.spec_from_file_location('ray_layers',Path(__file__).parents[1]/'gaussian_renderer/ray_depth_layers.py')
+package=types.ModuleType('_visibility416')
+package.__path__=[str(Path(__file__).parents[1]/'gaussian_renderer')]
+sys.modules.setdefault('_visibility416',package)
+spec=importlib.util.spec_from_file_location('_visibility416.ray_depth_layers',Path(__file__).parents[1]/'gaussian_renderer/ray_depth_layers.py')
 mod=importlib.util.module_from_spec(spec);spec.loader.exec_module(mod)
 
 def run(c, u=None):
