@@ -133,18 +133,6 @@ def _predicates(cj, uj, vj, nj, nabj, hj, aa, ae, p, pe, rho, gamma):
     uncertain=possible&((B.abs()<=gamma*be)|(pos.abs()<=gamma*ae[:,None])|((U+HB[:,:,0]).abs()<=ue)|((HB[:,:,0]-U).abs()<=ue)|((V+HB[:,:,1]).abs()<=ve)|((HB[:,:,1]-V).abs()<=ve))
     return cover,cover&(dep>de),uncertain,cover&(dep.abs()<=de),de.max()
 
-_compiled=None
-
-def _kernel():
-    global _compiled
-    mode=os.environ.get('SONAR_VISIBILITY_KERNEL','torch')
-    if mode == 'torch':return _predicates
-    if mode == 'compiled':
-        if _compiled is None:
-            _compiled=torch.compile(_predicates,fullgraph=True,dynamic=True)
-        return _compiled
-    raise ValueError('SONAR_VISIBILITY_KERNEL must be torch or compiled')
-
 
 @torch.no_grad()
 def ray_depth_visibility(centres,tangent_u,tangent_v,scales,reflectance,representation_error=None,out_dtype=None):
@@ -199,8 +187,8 @@ def ray_depth_visibility(centres,tangent_u,tangent_v,scales,reflectance,represen
         return hit,hit and A==B,hit and (B-A)*B>0
     n_unit=n/n.norm(dim=-1,keepdim=True).clamp_min(1e-300)
     rep=None if representation_error is None else [torch.as_tensor(a,device=c.device,dtype=torch.float64).reshape(-1) for a in representation_error]
-    rep_pairs=0;rep_inexact=0;max_rep_bound=0.;max_filter=0.;max_chunk_s=0.;sample_ids=torch.arange(256,device=c.device)
-    predicate=_kernel()
+    rep_pairs=0;rep_inexact=0;max_rep_bound=0.;max_filter=0.;max_chunk_s=0.
+    predicate=_predicates
     for lo in range(0,len(pairs),pair_chunk):
         checkpoint_guard();tc=time.monotonic()
         ii,jj=pairs[lo:lo+pair_chunk].unbind(-1)
@@ -231,7 +219,8 @@ def ray_depth_visibility(centres,tangent_u,tangent_v,scales,reflectance,represen
         hidden.index_add_(0,ii,near.to(torch.int32));mult.index_add_(0,ii,tie.to(torch.int32))
         max_filter=max(max_filter,float(de));_sync(c.device);max_chunk_s=max(max_chunk_s,time.monotonic()-tc)
     bad=aa.abs()<=gamma*aenv
-    for i in bad.nonzero().flatten().cpu().tolist():
+    for position,i in enumerate(bad.nonzero().flatten().cpu().tolist()):
+        if position%64==0:checkpoint_guard()
         ci,_,_,_,ni=cell(i);bad[i]=_dot(ni,ci)==0
     ok=(mult>0)&~bad[:,None];hidden=hidden>0
     weights=torch.where(ok&~hidden,1/mult.clamp_min(1).double(),0.)

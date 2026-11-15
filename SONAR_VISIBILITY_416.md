@@ -39,8 +39,10 @@ arithmetic grouping may differ from the oracle's GEMM; uncertain signs use the
 same Fraction construction, exact support/depth and exact plane test. Integer
 sums count ties/near hits before averaging weights, avoiding reduction-order
 changes. SONAR_VISIBILITY_ACCEL=oracle executes the preserved implementation.
-SONAR_VISIBILITY_KERNEL=compiled additionally fuses only the floating filter with
-torch.compile; this is optional and separately compared, never the acoustic depositor.
+The batch filter uses eager Torch operations; no runtime compiler is required.
+CPU, matched CUDA and compiled CUDA in validation refer to the actual acoustic
+deposition paths, with unchanged visibility. An experiment-only CPU fusion
+comparison is recorded separately and supplies no performance claim.
 
 Diagnostics for coincidence pairs refer only to retained candidates and are not
 identical to the oracle's global all-pairs diagnostic count. Unrelated nonoverlap
