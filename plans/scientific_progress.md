@@ -1051,3 +1051,11 @@ Native 12,000-point fixed-density jobs stopped on their first update at a 6 GiB 
 ## 2026-11-07 — 333 single opt-in area return
 `area_r4` evaluates q = rho (2 pi s1 s2) max(mu,0)^2 / r^4 at each patch centre; scaling_modifier and optional world scale enter s1/s2. Existing opacity is rho for emission but retains its separate old role in alpha transmittance. The legacy path and its attenuation arguments remain default; area_r4 intentionally supersedes those attenuation arguments. A single gain still applies after q. This is Gaussian-area quadrature, not a proof that finite Gaussian mixtures equal uniform rectangles. Visibility and response incompatibilities prevent claiming agreement with reference 284; no second redesign is authorized.
 333 results reject this one correction: front 1-to-64 tile return falls 23.7%, and duplicate material still adds 93.8% at one tile. CPU helper tests now run without an installed CUDA extension; this is not a substitute for recorded GPU fixtures. No further renderer correction or training follows.
+
+## 2026-11-15 — Experiment 456 isolated numerical candidate (Codex)
+Opt-in `intrinsic_screen_mass_c1_456_v1` replaces only hard deposition support with
+`g*u^2*(3-2*u)`, `u=clamp((g-3c/4)/(c/2),0,1)`, `c=16/255`. Original minimum,
+cropped mass normalization, event accumulation and elevation marginalization stay.
+The contract rejects compiled-rasterizer mode before dispatch. Native defaults are
+unchanged. This is a bounded numerical approximation, not a measured acoustic law;
+acceptance/rejection and retained failures belong to experiment 456 RESULTS.md.

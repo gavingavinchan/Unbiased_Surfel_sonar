@@ -1159,13 +1159,17 @@ def _sonar_footprint_pixel_mass(vis_mu, vis_sigma, image_width, image_height, li
 def _sonar_deposition_contract():
     """337 opt-in spatial law; legacy defaults and compiled path stay unchanged."""
     mode = os.getenv("SONAR_DEPOSITION_CONTRACT", "legacy").strip().lower()
-    if mode not in {"legacy", "intrinsic_screen_mass_v1"}:
+    if mode not in {"legacy", "intrinsic_screen_mass_v1", "intrinsic_screen_mass_c1_456_v1"}:
         raise ValueError(f"Unsupported SONAR_DEPOSITION_CONTRACT '{mode}'.")
-    if mode == "intrinsic_screen_mass_v1":
+    if mode in {"intrinsic_screen_mass_v1", "intrinsic_screen_mass_c1_456_v1"}:
         if os.getenv("SONAR_RASTER_FOOTPRINT_NORM", "none").strip().lower() != "mass":
             raise ValueError("intrinsic_screen_mass_v1 requires mass footprint normalization")
         if float(os.getenv("SONAR_RASTER_LINEAR_OPACITY", "0.0625")) != 0.0625:
             raise ValueError("intrinsic_screen_mass_v1 requires linear opacity 0.0625")
+    if mode == "intrinsic_screen_mass_c1_456_v1" and os.getenv(
+        "SONAR_USE_CUDA_RASTERIZER", "1"
+    ).strip().lower() not in {"0", "false", "no"}:
+        raise ValueError("intrinsic_screen_mass_c1_456_v1 requires SONAR_USE_CUDA_RASTERIZER=0; compiled deposition is unsupported")
     return mode
 
 
@@ -1181,7 +1185,8 @@ def _rasterize_sonar_event_volume_matched_fallback(
     their upstream azimuth column. This chooses the compiled spatial law, not a
     measured acoustic model. No visibility/emission/input-event change.
     """
-    if _sonar_deposition_contract() != "intrinsic_screen_mass_v1":
+    contract = _sonar_deposition_contract()
+    if contract not in {"intrinsic_screen_mass_v1", "intrinsic_screen_mass_c1_456_v1"}:
         raise ValueError("Matched fallback requires its explicit opt-in contract")
     if int(chunk) < 1:
         raise ValueError("chunk must be positive")
@@ -1212,7 +1217,14 @@ def _rasterize_sonar_event_volume_matched_fallback(
                - 2 * s[:, 0, 1, None, None] * dx * dy
                + s[:, 0, 0, None, None] * dy.square()) / det[:, None, None]
         g = torch.exp(-.5 * torch.minimum(rho, 2 * (dx.square() + dy.square())))
-        g = torch.where(.0625 * g >= 1 / 255, g, torch.zeros_like(g))
+        if contract == "intrinsic_screen_mass_c1_456_v1":
+            # One stateless numerical approximation, not an acoustic law.
+            c = 16 / 255
+            taper_a, taper_b = 3 * c / 4, 5 * c / 4
+            u = ((g - taper_a) / (taper_b - taper_a)).clamp(0, 1)
+            g = g * u * u * (3 - 2 * u)
+        else:
+            g = torch.where(.0625 * g >= 1 / 255, g, torch.zeros_like(g))
         mass = g.sum(dim=(1, 2), keepdim=True)
         kernel = g / mass.clamp_min(1e-12)
         out = out + torch.einsum("nec,nhw->cweh", totals[start:start + int(chunk)], kernel)
@@ -1882,7 +1894,7 @@ def render_sonar(
                 support_aer = raster_support
                 if bool((raster_radii > 0).any().item()):
                     radii[visible_idx] = torch.maximum(radii[visible_idx], raster_radii)
-            elif deposition_contract == "intrinsic_screen_mass_v1":
+            elif deposition_contract in {"intrinsic_screen_mass_v1", "intrinsic_screen_mass_c1_456_v1"}:
                 returns_aer, range_aer, support_aer, _ = _rasterize_sonar_event_volume_matched_fallback(
                     vis_mu, vis_sigma, vis_range, event_surfel_idx, event_ray_ids,
                     event_returns, event_share, W, H, int(runtime_contract["elev_bins"]),
