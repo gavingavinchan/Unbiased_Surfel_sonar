@@ -6,7 +6,7 @@ import torch
 p=Path(__file__).resolve().parents[1]/'gaussian_renderer/__init__.py'
 names={'_condition_sigma_2d','_sonar_deposition_contract','_rasterize_sonar_event_volume_matched_fallback'}
 nodes=[x for x in ast.parse(p.read_text()).body if isinstance(x,ast.FunctionDef) and x.name in names]
-ns={'torch':torch,'math':math,'os':os};exec(compile(ast.Module(body=nodes,type_ignores=[]),str(p),'exec'),ns)
+ns={'torch':torch,'math':math,'os':os,'_sonar_chunk_guard_509':None};exec(compile(ast.Module(body=nodes,type_ignores=[]),str(p),'exec'),ns)
 
 def args():
     return dict(vis_mu=torch.tensor([[4.,4.]],dtype=torch.float64),vis_sigma=torch.tensor([[[.1,0],[0,.1]]],dtype=torch.float64),vis_range=torch.tensor([1.3],dtype=torch.float64),event_surfel_idx=torch.tensor([0]),event_ray_ids=torch.tensor([3]),event_returns=torch.tensor([.7],dtype=torch.float64),event_share=torch.tensor([.3],dtype=torch.float64),image_width=9,image_height=9,elev_bins=2)
