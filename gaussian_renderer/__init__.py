@@ -1173,6 +1173,9 @@ def _sonar_deposition_contract():
     return mode
 
 
+_sonar_chunk_guard_509 = None
+
+
 def _rasterize_sonar_event_volume_matched_fallback(
     vis_mu, vis_sigma, vis_range, event_surfel_idx, event_ray_ids,
     event_returns, event_share, image_width, image_height, elev_bins, chunk=32,
@@ -1207,9 +1210,10 @@ def _rasterize_sonar_event_volume_matched_fallback(
     sigma = _condition_sigma_2d(vis_sigma)
     yy, xx = torch.meshgrid(torch.arange(h, device=vis_mu.device, dtype=vis_mu.dtype),
                             torch.arange(w, device=vis_mu.device, dtype=vis_mu.dtype), indexing="ij")
-    for start in range(0, n, int(chunk)):
-        s = sigma[start:start + int(chunk)]
-        mu = vis_mu[start:start + int(chunk)]
+    checkpoint_chunks = os.getenv("SONAR_C1_CHUNK_CHECKPOINT", "0") == "1"
+    def part(s, mu, total, xx, yy):
+        if _sonar_chunk_guard_509 is not None:
+            _sonar_chunk_guard_509()
         det = s[:, 0, 0] * s[:, 1, 1] - s[:, 0, 1] * s[:, 1, 0]
         dx = xx[None] - mu[:, 0, None, None]
         dy = yy[None] - mu[:, 1, None, None]
@@ -1227,7 +1231,18 @@ def _rasterize_sonar_event_volume_matched_fallback(
             g = torch.where(.0625 * g >= 1 / 255, g, torch.zeros_like(g))
         mass = g.sum(dim=(1, 2), keepdim=True)
         kernel = g / mass.clamp_min(1e-12)
-        out = out + torch.einsum("nec,nhw->cweh", totals[start:start + int(chunk)], kernel)
+        return torch.einsum("nec,nhw->cweh", total, kernel)
+    for start in range(0, n, int(chunk)):
+        if _sonar_chunk_guard_509 is not None:
+            _sonar_chunk_guard_509()
+        args = (sigma[start:start + int(chunk)], vis_mu[start:start + int(chunk)],
+                totals[start:start + int(chunk)], xx, yy)
+        if checkpoint_chunks and torch.is_grad_enabled() and any(x.requires_grad for x in args):
+            from torch.utils.checkpoint import checkpoint
+            contribution = checkpoint(part, *args, use_reentrant=False)
+        else:
+            contribution = part(*args)
+        out = out + contribution
     # Radius is only diagnostic here; the caller retains projection radii.
     return out[0], out[1], out[2], vis_mu.new_zeros(n)
 
