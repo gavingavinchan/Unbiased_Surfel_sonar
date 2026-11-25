@@ -192,7 +192,12 @@ def ray_depth_visibility(centres,tangent_u,tangent_v,scales,reflectance,represen
     for lo in range(0,len(pairs),pair_chunk):
         checkpoint_guard();tc=time.monotonic()
         ii,jj=pairs[lo:lo+pair_chunk].unbind(-1)
-        cover,near,uncertain,ambiguous,de=predicate(c[jj],u[jj],v[jj],n[jj],nab[jj],half[jj],aa[jj],aenv[jj],points[ii],penv[ii],rho[jj],gamma)
+        if os.environ.get('SONAR_VISIBILITY_PREDICATE_FUSION_518', '0') == '1':
+            from .predicate_fusion_518 import predicates as fused_predicates
+            cover,near,uncertain,ambiguous,de_full,_,_=fused_predicates(c,u,v,n,nab,half,aa,aenv,points,penv,rho,ii,jj,gamma)
+            de=de_full.max()
+        else:
+            cover,near,uncertain,ambiguous,de=predicate(c[jj],u[jj],v[jj],n[jj],nab[jj],half[jj],aa[jj],aenv[jj],points[ii],penv[ii],rho[jj],gamma)
         self_pair=ii==jj;uncertain[self_pair]=False;ambiguous[self_pair]=False
         same=torch.zeros_like(ii,dtype=torch.bool)
         if rep is not None:
