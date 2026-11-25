@@ -14,6 +14,8 @@ from pathlib import Path
 import torch
 from .ray_depth_oracle_409 import _dot, _cross
 
+interval_observer = None
+
 _guard = ContextVar('visibility_guard', default=None)
 
 
@@ -156,6 +158,12 @@ def ray_depth_visibility(centres,tangent_u,tangent_v,scales,reflectance,represen
     pair_chunk=int(os.environ.get('SONAR_VISIBILITY_PAIR_CHUNK','2048'))
     if not 1<=pair_chunk<=8192:raise ValueError('pair chunk must be 1..8192')
     pairs,unsafe=candidate_pairs(c,u,v,half,rho)
+    interval_stats={};interval_s=0.
+    if os.environ.get('SONAR_RECTANGLE_INTERVAL_511','0')=='1':
+        from .rectangle_interval_511 import filter_pairs
+        _sync(c.device);ti=time.monotonic()
+        pairs,interval_stats=filter_pairs(c,u,v,n,nab,half,aa,aenv,rho,pairs,gamma,checkpoint_guard,interval_observer)
+        _sync(c.device);interval_s=time.monotonic()-ti
     _sync(c.device);construction_s=time.monotonic()-t0;t_eval=time.monotonic()
     hidden=torch.zeros((count,256),device=c.device,dtype=torch.int32)
     mult=torch.zeros_like(hidden)
@@ -234,4 +242,4 @@ def ray_depth_visibility(centres,tangent_u,tangent_v,scales,reflectance,represen
         min_ordered_parallel_gap_m=None,visibility_boundary_gradient=False,ancillary_alpha_depth_available=False,training_validity=False,
         acceleration='conservative_angular_416',candidate_pairs=len(pairs),possible_pairs=count*count,rejected_pairs=count*count-len(pairs),
         unsafe_supports=unsafe,candidate_construction_s=construction_s,blocker_evaluation_s=time.monotonic()-t_eval,largest_pair_chunk_s=max_chunk_s,pair_chunk=pair_chunk,
-        diagnostic_scope='coincidence diagnostics count retained angular candidates; min gap not evaluated')
+        interval_s=interval_s,interval_stats=interval_stats,diagnostic_scope='coincidence diagnostics count retained angular candidates; min gap not evaluated')
